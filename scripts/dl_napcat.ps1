@@ -38,7 +38,28 @@ try {
 }
 
 Write-Host "Extracting..."
-Expand-Archive -Path $outZip -DestinationPath $OutDir -Force
+# 验证下载完整性：文件大小应 >= 预期大小的 90%
+$actualSize = (Get-Item $outZip).Length
+$expectedSize = $asset.size
+if ($actualSize -lt $expectedSize * 0.9) {
+    Write-Host "WARNING: Downloaded file is smaller than expected ($actualSize vs $expectedSize bytes)"
+}
+
+# Expand-Archive 可能不兼容某些 zip 格式，用 tar 兜底
+try {
+    Expand-Archive -Path $outZip -DestinationPath $OutDir -Force -ErrorAction Stop
+    Write-Host "Extract OK (Expand-Archive)"
+} catch {
+    Write-Host "Expand-Archive failed, trying tar..."
+    & tar -xf $outZip -C $OutDir 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Both Expand-Archive and tar failed to extract"
+        Write-Host "You can manually extract: $outZip -> $OutDir"
+        exit 1
+    }
+    Write-Host "Extract OK (tar)"
+}
+
 Remove-Item $outZip -Force
 
 Write-Host "NapCatQQ ready: $OutDir"
