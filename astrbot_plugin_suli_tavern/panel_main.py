@@ -1,7 +1,7 @@
 """管理面板独立容器入口 — 不依赖 AstrBot 框架, 仅需 aiohttp + sqlite3。
 
 用法:
-    python panel_main.py --port 6190 --host 0.0.0.0
+    python panel_main.py --port 5190 --host 0.0.0.0
 
 依赖: aiohttp (Web 服务器), sqlite3 (标准库)
 DB:   data/shared_db/none_qqbot.db (需挂载)
@@ -32,7 +32,7 @@ logger = logging.getLogger("moon-panel")
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="暮恩管理面板 — 独立容器")
-    parser.add_argument("--port", type=int, default=6190, help="监听端口 (默认 6190)")
+    parser.add_argument("--port", type=int, default=5190, help="监听端口 (默认 5190)")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     args = parser.parse_args()
 

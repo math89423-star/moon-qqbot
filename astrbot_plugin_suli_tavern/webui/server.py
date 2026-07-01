@@ -5,11 +5,11 @@
   - 提供 Vue 3 SPA 静态文件 + /api/admin/* REST API
   - 保留 /api/config/* 向后兼容 (别名到 /api/admin/*)
   - 直接读写 BotConfigService / BotDatabase (none_qqbot.db)
-  - 端口可配置, 默认 6190
+  - 端口可配置, 默认 5190
 
 用法:
     from .webui.server import ConfigWebUI
-    webui = ConfigWebUI(config_service, port=6190)
+    webui = ConfigWebUI(config_service, port=5190)
     await webui.start()
     # ... bot running ...
     await webui.stop()
@@ -113,7 +113,7 @@ class ConfigWebUI:
 
     属性:
         config_service: BotConfigService 单例
-        port: 监听端口 (默认 6190)
+        port: 监听端口 (默认 5190)
         group_chat_handler: 可选的 GroupChatScheduler 引用 (用于白名单实时同步)
     """
 
@@ -165,7 +165,7 @@ class ConfigWebUI:
     def __init__(
         self,
         config_service: BotConfigService,
-        port: int = 6190,
+        port: int = 5190,
         host: str = "0.0.0.0",
         group_chat_handler=None,
     ):

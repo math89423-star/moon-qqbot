@@ -864,7 +864,7 @@ class Config(BaseModel):
 
     # 同群对照 bot () 的 QQ 号 — 其消息不应触发暮恩的管线
     peer_bot_qq: int = Field(
-        default=BOT_QQ_ALT,
+        default=0,
         description="同群对照 bot 的 QQ 号，其消息不会触发本 bot 回复",
     )
 

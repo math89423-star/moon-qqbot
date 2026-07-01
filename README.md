@@ -67,7 +67,7 @@ bash scripts/start.sh       # Linux / macOS
 scripts\start.bat           # Windows
 ```
 
-启动后访问 `http://localhost:6190` 进入管理面板。
+启动后访问 `http://localhost:5190` 进入管理面板。
 
 ### 配置 LLM
 
@@ -131,7 +131,7 @@ Model: gpt-4o
 
 ## 管理面板
 
-访问 `http://localhost:6190`：
+访问 `http://localhost:5190`：
 
 - **仪表盘** — 运行状态总览
 - **机器人配置** — LLM/VLM 槽位、温度、工具开关

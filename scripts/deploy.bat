@@ -164,7 +164,7 @@ echo   2. 启动 AstrBot: scripts\start.bat
 ) else (
 echo   1. 启动 AstrBot: scripts\start.bat
 )
-echo   3. 打开管理面板: http://localhost:6190
+echo   3. 打开管理面板: http://localhost:5190
 echo   4. 在面板中配置 LLM API (OpenAI 兼容接口)
 echo.
 pause

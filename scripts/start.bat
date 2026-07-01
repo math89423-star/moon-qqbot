@@ -20,7 +20,7 @@ if exist ".env" (
 cd AstrBot
 echo 正在启动 AstrBot...
 echo QQ: %BOT_QQ_MAIN%
-echo 管理面板: http://localhost:6190
+echo 管理面板: http://localhost:5190
 echo.
 python main.py
 pause

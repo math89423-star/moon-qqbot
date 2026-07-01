@@ -186,6 +186,6 @@ if [ "$NAPCAT_FOUND" -eq 0 ]; then
 else
     echo -e "  1. 启动 AstrBot: ${CYAN}bash scripts/start.sh${NC}"
 fi
-echo -e "  3. 打开管理面板: ${CYAN}http://localhost:6190${NC}"
+echo -e "  3. 打开管理面板: ${CYAN}http://localhost:5190${NC}"
 echo -e "  4. 在面板中配置 LLM API (OpenAI 兼容接口)"
 echo ""
