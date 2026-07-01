@@ -131,24 +131,66 @@ copy "characters\*.json" "%CHAR_DST%\" /Y >nul 2>&1
 echo   角色卡已就绪 ^^!
 echo.
 
-REM ── 检查 NapCat ──
-echo [5/5] NapCat (QQ 协议) ...
+REM ── NapCatWin ──
+echo [5/5] NapCatWin (QQ 协议) ...
 
-set NAPCAT_FOUND=0
-if exist "C:\NapCat" set NAPCAT_FOUND=1
-if exist "C:\NapCatWin" set NAPCAT_FOUND=1
-if exist "%USERPROFILE%\NapCat" set NAPCAT_FOUND=1
-if exist "D:\NapCat" set NAPCAT_FOUND=1
-tasklist /FI "IMAGENAME eq napcat.exe" 2>nul | find /I "napcat.exe" >nul && set NAPCAT_FOUND=1
-tasklist /FI "IMAGENAME eq qq.exe" 2>nul | find /I "qq.exe" >nul && set NAPCAT_FOUND=1
+set NAPCAT_DIR=%PROJECT_DIR%\NapCatWin
+set NAPCAT_CONFIG=%NAPCAT_DIR%\config
+set NAPCAT_EXE=%NAPCAT_DIR%\NapCatWin.exe
 
-if !NAPCAT_FOUND!==1 (
-    echo   NapCat 已安装，跳过
+if exist "%NAPCAT_EXE%" (
+    echo   NapCatWin 已安装，跳过
 ) else (
-    echo   NapCat 未检测到，请访问安装:
-    echo   https://napcat.napneko.icu/
-    echo   推荐使用 NapCatWin (Windows GUI 版本)
-    echo   安装后登录 QQ 号 !QQ_NUMBER!
+    echo   正在下载 NapCatWin...
+    if not exist "%NAPCAT_DIR%" mkdir "%NAPCAT_DIR%"
+
+    REM 从 GitHub 获取最新版本
+    powershell -Command ^
+        "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest' -Headers @{'User-Agent'='moon-qqbot'}; ^
+         $asset = $release.assets | Where-Object { $_.name -like 'NapCatWin*' -and $_.name -like '*.zip' } | Select-Object -First 1; ^
+         if ($asset) { ^
+             Write-Host \"下载: $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)\"; ^
+             Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%NAPCAT_DIR%\NapCatWin.zip' ^
+         } else { Write-Host '未找到 NapCatWin 发布包'; exit 1 }"
+
+    if errorlevel 1 (
+        echo   [警告] 自动下载失败，请手动下载 NapCatWin:
+        echo   https://github.com/NapNeko/NapCatQQ/releases
+        echo   解压到: %NAPCAT_DIR%
+    ) else (
+        echo   正在解压...
+        powershell -Command "Expand-Archive -Path '%NAPCAT_DIR%\NapCatWin.zip' -DestinationPath '%NAPCAT_DIR%' -Force"
+        del "%NAPCAT_DIR%\NapCatWin.zip" 2>nul
+        echo   NapCatWin 已就绪 ^^!
+    )
+)
+
+REM 配置 NapCat OneBot WebSocket → AstrBot
+if not exist "%NAPCAT_CONFIG%" mkdir "%NAPCAT_CONFIG%"
+set ONEBOT_CONFIG=%NAPCAT_CONFIG%\onebot11.json
+if not exist "%ONEBOT_CONFIG%" (
+    (
+    echo {
+    echo     "network": {
+    echo         "websocketClients": [
+    echo             {
+    echo                 "name": "AstrBot",
+    echo                 "url": "ws://localhost:6199/ws",
+    echo                 "messagePostFormat": "array",
+    echo                 "reportSelfMessage": false,
+    echo                 "reconnectInterval": 3000
+    echo             }
+    echo         ]
+    echo     },
+    echo     "webui": {
+    echo         "port": 6099,
+    echo         "token": ""
+    echo     }
+    echo }
+    ) > "%ONEBOT_CONFIG%"
+    echo   NapCat OneBot 配置已生成
+) else (
+    echo   NapCat 配置已存在，跳过
 )
 echo.
 
@@ -158,13 +200,9 @@ echo   安装完成！
 echo ========================================
 echo.
 echo 下一步:
-if !NAPCAT_FOUND!==0 (
-echo   1. 安装并启动 NapCat，登录 QQ 号 !QQ_NUMBER!
-echo   2. 启动: scripts\start.bat
-) else (
 echo   1. 启动: scripts\start.bat
-)
-echo   2. 管理面板自动打开: http://localhost:5190
-echo   3. 在面板中配置 LLM API (OpenAI 兼容接口)
+echo   2. NapCat 扫码登录 QQ 号 !QQ_NUMBER! (http://localhost:6099)
+echo   3. 管理面板: http://localhost:5190
+echo   4. 在面板中配置 LLM API (OpenAI 兼容接口)
 echo.
 pause
