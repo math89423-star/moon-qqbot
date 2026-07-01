@@ -402,6 +402,9 @@ def _auto_discover_db_path() -> str:
         "/AstrBot/data/shared_db/suli_qqbot.db",
         # 兼容旧路径: 单文件挂载 (WAL 文件不可见 → 分裂脑风险)
         "/AstrBot/data/suli_qqbot.db",
+        # Windows 裸机路径 (CWD = AstrBot/)
+        "data/shared_db/suli_qqbot.db",
+        "data/suli_qqbot.db",
         # 宿主机路径
         str(Path.home() / "suli_qqbot/runtime/shared/db/suli_qqbot.db"),
         str(Path.home() / "suli_qqbot/runtime/shared/suli_qqbot.db"),

@@ -895,6 +895,10 @@ class GroupChatScheduler:
         更新 bot 容器的内存缓存。此方法在每次白名单查询时检查文件
         mtime，发现变更即自动重载 —— 无需重启 bot。
         """
+        if not self._whitelist_loaded:
+            self._load_whitelist()
+            self._whitelist_loaded = True
+            return
         try:
             current_mtime = self._whitelist_path.stat().st_mtime
         except FileNotFoundError:
@@ -939,8 +943,12 @@ class GroupChatScheduler:
 
     # ── 公开接口 ──────────────────────────────────────
 
-    def is_group_enabled(self, group_id: int) -> bool:
+    def is_group_enabled(self, group_id: int, bot_id: str = "") -> bool:
         """检查群是否已启用 (basic 或 full 等级)。"""
+        # 首次启动时 _current_bot_id 可能尚未设置，从参数传入
+        if bot_id and bot_id != self._current_bot_id:
+            self._current_bot_id = bot_id
+            self._whitelist_loaded = False  # 强制重载
         self._maybe_reload_whitelist()
         return group_id in self._group_tiers
 

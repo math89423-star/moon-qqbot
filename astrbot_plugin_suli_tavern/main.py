@@ -704,8 +704,7 @@ class MoonTavernPlugin(Star):
         self.group_chat_ctl: Optional[GroupChatScheduler] = None
         if self.tavern is not None:
             WHITELIST_FILE = (
-                Path(__file__).resolve().parent.parent.parent.parent
-                / "data" / "shared_db" / "group_chat_whitelist.json"
+                Path("data") / "shared_db" / "group_chat_whitelist.json"
             )
             try:
                 self.group_chat_ctl = GroupChatScheduler(
@@ -1032,7 +1031,7 @@ class MoonTavernPlugin(Star):
         if not self_id or self_id not in get_bot_qq_set():
             return
 
-        if not group_id or not self.group_chat_ctl.is_group_enabled(int(group_id)):
+        if not group_id or not self.group_chat_ctl.is_group_enabled(int(group_id), bot_id=self_id):
             _txt_len = len(str(getattr(event, "message_str", "") or ""))
             logger.info("%s 白名单拦截: group=%s sender=%s msg_len=%d", _bot_tag(self_id), group_id, user_id[:8], _txt_len)
             event.stop_event()
