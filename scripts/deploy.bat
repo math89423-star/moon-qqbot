@@ -160,11 +160,11 @@ echo.
 echo 下一步:
 if !NAPCAT_FOUND!==0 (
 echo   1. 安装并启动 NapCat，登录 QQ 号 !QQ_NUMBER!
-echo   2. 启动 AstrBot: scripts\start.bat
+echo   2. 启动: scripts\start.bat
 ) else (
-echo   1. 启动 AstrBot: scripts\start.bat
+echo   1. 启动: scripts\start.bat
 )
-echo   3. 打开管理面板: http://localhost:5190
-echo   4. 在面板中配置 LLM API (OpenAI 兼容接口)
+echo   2. 管理面板自动打开: http://localhost:5190
+echo   3. 在面板中配置 LLM API (OpenAI 兼容接口)
 echo.
 pause
