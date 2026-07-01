@@ -23,8 +23,8 @@ if [ ! -d "$ASTRBOT_DIR" ]; then
 fi
 
 echo "正在启动管理面板: http://localhost:5190"
-cd "$PROJECT_DIR/astrbot_plugin_suli_tavern"
-python3 panel_main.py --port 5190 &
+cd "$ASTRBOT_DIR"
+python3 "$PROJECT_DIR/astrbot_plugin_suli_tavern/panel_main.py" --port 5190 &
 PANEL_PID=$!
 cd "$ASTRBOT_DIR"
 
