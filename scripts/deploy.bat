@@ -145,17 +145,27 @@ if exist "%NAPCAT_LAUNCHER%" (
     if not exist "%NAPCAT_DIR%" mkdir "%NAPCAT_DIR%"
 
     REM GitHub API 获取最新版本 → 国内镜像加速下载
-    powershell -Command ^
-        "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest' -Headers @{'User-Agent'='moon-qqbot'}; ^
-         $asset = $release.assets | Where-Object { $_.name -like 'NapCat.Shell.Windows.Node*' -and $_.name -like '*.zip' } | Select-Object -First 1; ^
-         if ($asset) { ^
-             $mirror = 'https://ghproxy.com/' + $asset.browser_download_url; ^
-             Write-Host \"下载: $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)\"; ^
-             Write-Host \"镜像: $mirror\"; ^
-             Invoke-WebRequest -Uri $mirror -OutFile '%NAPCAT_DIR%\NapCatQQ.zip'; ^
-             if (-not $?) { Write-Host '镜像失败，尝试直连...'; ^
-             Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%NAPCAT_DIR%\NapCatQQ.zip' } ^
-         } else { Write-Host '未找到 NapCatQQ Windows 发布包'; exit 1 }"
+    REM 生成临时 PS1 脚本避免 batch 转义问题
+    echo $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest' -Headers @{'User-Agent'='moon-qqbot'} > "%NAPCAT_DIR%\_dl.ps1"
+    echo $asset = $release.assets ^| Where-Object { $_.name -like 'NapCat.Shell.Windows.Node*' -and $_.name -like '*.zip' } ^| Select-Object -First 1 >> "%NAPCAT_DIR%\_dl.ps1"
+    echo if ^($asset^) { >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   $name = $asset.name >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   $sizeMB = [math]::Round($asset.size/1MB,1) >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   Write-Host "Download: $name ($sizeMB MB)" >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   $mirror = 'https://ghproxy.com/' + $asset.browser_download_url >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   Write-Host "Mirror: $mirror" >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   try { >> "%NAPCAT_DIR%\_dl.ps1"
+    echo     Invoke-WebRequest -Uri $mirror -OutFile '%NAPCAT_DIR%\NapCatQQ.zip' >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   } catch { >> "%NAPCAT_DIR%\_dl.ps1"
+    echo     Write-Host 'Mirror failed, trying direct...' >> "%NAPCAT_DIR%\_dl.ps1"
+    echo     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%NAPCAT_DIR%\NapCatQQ.zip' >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   } >> "%NAPCAT_DIR%\_dl.ps1"
+    echo } else { >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   Write-Host 'NapCatQQ Windows package not found' >> "%NAPCAT_DIR%\_dl.ps1"
+    echo   exit 1 >> "%NAPCAT_DIR%\_dl.ps1"
+    echo } >> "%NAPCAT_DIR%\_dl.ps1"
+    powershell -ExecutionPolicy Bypass -File "%NAPCAT_DIR%\_dl.ps1"
+    del "%NAPCAT_DIR%\_dl.ps1" 2>nul
 
     if errorlevel 1 (
         echo   [警告] 自动下载失败，请手动下载 NapCatQQ:
