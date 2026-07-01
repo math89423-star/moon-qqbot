@@ -62,7 +62,8 @@ if not exist ".venv" (
 )
 call .venv\Scripts\activate.bat
 if "!VENV_NEW!"=="1" (
-    pip install -r requirements.txt -q
+    echo   正在安装依赖...
+pip install -r requirements.txt
     echo   依赖已安装 ^^!
 ) else (
     echo   依赖跳过 (虚拟环境已存在)
@@ -75,7 +76,8 @@ if not exist "AstrBot" (
     git clone https://github.com/Soulter/AstrBot.git
     echo   AstrBot 已克隆 ^^!
     cd AstrBot
-    pip install -r requirements.txt -q
+    echo   正在安装依赖...
+pip install -r requirements.txt
     echo   AstrBot 依赖已安装 ^^!
     cd ..
 ) else (

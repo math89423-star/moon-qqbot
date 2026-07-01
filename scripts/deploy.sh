@@ -71,13 +71,16 @@ fi
 if [ "$USE_VENV" -eq 1 ]; then
     source "$VENV_DIR/bin/activate"
     if [ "$VENV_NEW" -eq 1 ]; then
-        pip install -r "$PROJECT_DIR/requirements.txt" -q
+        echo "  正在安装项目依赖..."
+pip install -r "$PROJECT_DIR/requirements.txt"
         echo -e "${GREEN}  依赖已安装 ✓${NC}"
     else
         echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
     fi
 else
-    pip3 install -r "$PROJECT_DIR/requirements.txt" -q 2>/dev/null || pip install -r "$PROJECT_DIR/requirements.txt" -q
+    echo "  正在安装项目依赖..."
+    pip3 install -r "$PROJECT_DIR/requirements.txt" 2>/dev/null || pip install -r "$PROJECT_DIR/requirements.txt"
+pip install -r "$PROJECT_DIR/requirements.txt"
     echo -e "${GREEN}  依赖已安装 (全局) ✓${NC}"
 fi
 
@@ -88,7 +91,8 @@ ASTRBOT_DIR="$PROJECT_DIR/AstrBot"
 if [ ! -d "$ASTRBOT_DIR" ]; then
     git clone https://github.com/Soulter/AstrBot.git "$ASTRBOT_DIR"
     cd "$ASTRBOT_DIR"
-    pip install -r requirements.txt -q
+    echo "  正在安装 AstrBot 依赖..."
+    pip install -r requirements.txt
     echo -e "${GREEN}  AstrBot 已克隆 + 依赖已安装 ✓${NC}"
 else
     echo -e "${GREEN}  AstrBot 已存在，跳过克隆和依赖安装${NC}"
