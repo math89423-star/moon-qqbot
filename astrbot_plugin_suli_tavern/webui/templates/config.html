@@ -324,56 +324,10 @@ let CURRENT_BOT = sessionStorage.getItem('selected_bot') || 'BOT_QQ_MAIN';
 
 // ── Auth ─────────────────────────────────────────────────
 
-let AUTH_TOKEN = sessionStorage.getItem('admin_token') || null;
-
-async function login(token) {
-  const r = await fetch(API + '/login', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({token}),
-  });
-  return r.ok;
-}
-
-function showLoginScreen() {
-  document.body.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;">
-      <article style="max-width:400px;width:100%;text-align:center;">
-        <h2>配置面板</h2>
-        <p style="color:var(--pico-muted-color)">admin_token 在 <code>suli_qqbot.db</code> 首次启动时自动生成。</p>
-        <form id="login-form">
-          <input name="token" type="password" placeholder="admin_token..." autofocus
-                 style="text-align:center">
-          <button type="submit" style="width:100%">验证</button>
-          <small class="login-error" style="color:var(--bot-);display:none">认证失败，请检查 token</small>
-        </form>
-      </article>
-    </div>`;
-  document.getElementById('login-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const token = e.target.elements.token.value.trim();
-    if (!token) return;
-    const ok = await login(token);
-    if (ok) {
-      sessionStorage.setItem('admin_token', token);
-      AUTH_TOKEN = token;
-      location.reload();
-    } else {
-      const el = document.querySelector('.login-error');
-      el.style.display = 'block';
-      e.target.elements.token.value = '';
-      e.target.elements.token.focus();
-    }
-  });
-}
-
-(function initAuth() {
-  if (!AUTH_TOKEN) { showLoginScreen(); return; }
-})();
-if (!AUTH_TOKEN) throw new Error('Not authenticated');
+let AUTH_TOKEN = sessionStorage.getItem('admin_token') || 'anonymous';
 
 function authHeaders() {
-  return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {};
+  return {};
 }
 
 // ── Helpers ───────────────────────────────────────────────

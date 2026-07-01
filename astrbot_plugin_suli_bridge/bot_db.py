@@ -346,7 +346,7 @@ class BotDatabase:
                 "UPDATE bot_config SET value = ?, updated_at = ? WHERE key = 'admin_token'",
                 (token, now),
             )
-            logger.info("Admin token 已自动生成 (掩码: %s****)", token[:4])
+            # admin_token 已生成，不打印到日志
 
         self.conn.commit()
 

@@ -76,32 +76,7 @@ def _json_error(message: str, status=400):
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler) -> web.Response:
-    """对所有 /api/ 路由进行 Bearer token 认证。
-
-    白名单: /api/admin/login 和 /api/config/login 无需认证。
-    其余 /api/ 路由需 Authorization: Bearer <admin_token>。
-    静态文件和非 API 路由不检查。
-    """
-    path = request.path
-
-    # 非 API 路由 — 不检查
-    if not path.startswith("/api/"):
-        return await handler(request)
-
-    # 登录端点白名单
-    if path in (_API_PREFIX + "/login", _API_LEGACY_PREFIX + "/login") and request.method == "POST":
-        return await handler(request)
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return _json_error("未授权: 缺少 Bearer token", 401)
-
-    token = auth_header[7:]
-    config_service: BotConfigService = request.app["config_service"]
-
-    if not token or not config_service.verify_token(token):
-        return _json_error("未授权: token 无效", 401)
-
+    """认证中间件 — 当前已禁用 token 验证，所有请求直接放行。"""
     return await handler(request)
 
 
