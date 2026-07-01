@@ -373,7 +373,7 @@ class ConfigWebUI:
         allowed_dir = (_STATIC_DIR / "assets").resolve()
         file_path = (allowed_dir / filename).resolve()
         # 确保解析后的路径在 allowed_dir 内
-        if not str(file_path).startswith(str(allowed_dir) + "/") and str(file_path) != str(allowed_dir):
+        if str(file_path).replace("\\", "/") != str(allowed_dir).replace("\\", "/") and not str(file_path).replace("\\", "/").startswith(str(allowed_dir).replace("\\", "/") + "/"):
             return _json_error("Not found", 404)
         if not file_path.exists() or not file_path.is_file():
             return _json_error("Not found", 404)
@@ -392,7 +392,7 @@ class ConfigWebUI:
             return await self._serve_spa(request)
         allowed_dir = _STATIC_DIR.resolve()
         file_path = (allowed_dir / path).resolve()
-        if not str(file_path).startswith(str(allowed_dir) + "/") and str(file_path) != str(allowed_dir):
+        if str(file_path).replace("\\", "/") != str(allowed_dir).replace("\\", "/") and not str(file_path).replace("\\", "/").startswith(str(allowed_dir).replace("\\", "/") + "/"):
             return await self._serve_spa(request)
         if not file_path.exists() or not file_path.is_file():
             return await self._serve_spa(request)
