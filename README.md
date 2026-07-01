@@ -51,6 +51,12 @@ bash scripts/deploy.sh
 bash scripts/start.sh
 ```
 
+**如果第 5 步（NapCatQQ 自动下载）失败**，可手动使用 NTQQ 模式：
+
+1. 下载安装 [NTQQ 9.9.26+ x64](https://dldir1.qq.com/qqfile/qq/QQNT/40d6045a/QQ9.9.26.44343_x64.exe)
+2. 下载 [NapCat.Shell.Windows.OneKey.zip](https://github.com/NapNeko/NapCatQQ/releases/latest)（~1MB），解压到项目 `NapCatQQ/` 目录
+3. 正常启动 `scripts\start.bat`，NapCat 会挂载 NTQQ 协议登录
+
 脚本会自动完成：
 1. 创建 Python 虚拟环境
 2. 安装项目依赖
@@ -211,6 +217,10 @@ astrbot-moon 插件套件
 ### WebSocket 连接错误
 
 检查 NapCat 是否已启动并登录。确认 AstrBot 的 `api_config.json` 中 aiocqhttp 平台配置的 WebSocket 地址指向 NapCat。
+
+### NapCatQQ 自动下载失败
+
+最常见是网络问题。可使用上方的 NTQQ 手动安装方案代替。也欢迎提交 issue 反馈。
 
 ### LLM 调用失败
 
