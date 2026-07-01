@@ -2,6 +2,8 @@ param(
     [string]$OutDir
 )
 
+$ErrorActionPreference = "Stop"
+
 if (-not $OutDir) {
     Write-Host "Usage: dl_napcat.ps1 -OutDir <target_dir>"
     exit 1
@@ -28,31 +30,31 @@ $outZip = Join-Path $OutDir 'NapCatQQ.zip'
 
 Write-Host "Download: $name ($sizeMB MB)"
 
-# 下载函数：带完整性验证
-function Download-File($uri, $description) {
-    Write-Host "Trying $description..."
+# Try direct, then mirrors. Verify size after each attempt.
+$methods = @(
+    @{Label="direct"; Uri=$url},
+    @{Label="ghproxy mirror"; Uri="https://ghproxy.com/$url"},
+    @{Label="gh-proxy mirror"; Uri="https://gh-proxy.com/$url"}
+)
+
+$ok = $false
+foreach ($m in $methods) {
+    Write-Host "Trying $($m.Label)..."
     try {
-        Invoke-WebRequest -Uri $uri -OutFile $outZip -ErrorAction Stop
+        Invoke-WebRequest -Uri $m.Uri -OutFile $outZip -ErrorAction Stop
         $actual = (Get-Item $outZip).Length
         if ($actual -ge $expectedSize * 0.9) {
             Write-Host "OK ($([math]::Round($actual/1MB,1)) MB)"
-            return $true
+            $ok = $true
+            break
         }
-        Write-Host "WARNING: Size mismatch ($actual vs $expectedSize bytes), likely proxy error page"
-        return $false
+        Write-Host "WARNING: Size mismatch ($actual vs $expectedSize bytes)"
     } catch {
         Write-Host "FAILED: $_"
-        return $false
     }
 }
 
-# 直连优先（GitHub CDN 国内通常可达），镜像兜底
-$success = $false
-if (-not $success) { $success = Download-File $url 'direct' }
-if (-not $success) { $success = Download-File "https://ghproxy.com/$url" 'ghproxy mirror' }
-if (-not $success) { $success = Download-File "https://gh-proxy.com/$url" 'gh-proxy mirror' }
-
-if (-not $success) {
+if (-not $ok) {
     Write-Host "ERROR: All download methods failed"
     Write-Host "Manual download: $url"
     Write-Host "Extract to: $OutDir"
