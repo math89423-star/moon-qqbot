@@ -26,8 +26,8 @@
 ### 一键安装
 
 ```bash
-git clone https://github.com/math89423-star/astrbot-moon.git
-cd astrbot-moon
+git clone https://github.com/math89423-star/moon-qqbot.git
+cd moon-qqbot
 bash scripts/deploy.sh      # Linux / macOS
 # 或
 scripts\deploy.bat          # Windows
