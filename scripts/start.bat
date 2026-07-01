@@ -18,7 +18,7 @@ if exist ".env" (
 )
 
 echo 正在启动管理面板: http://localhost:5190
-start "moon-panel" cmd /c "cd /d "%CD%\astrbot_plugin_suli_tavern" && call "%CD%\.venv\Scripts\activate.bat" && python panel_main.py --port 5190"
+start "moon-panel" ".venv\Scripts\python.exe" "astrbot_plugin_suli_tavern\panel_main.py" --port 5190
 
 cd AstrBot
 echo 正在启动 AstrBot...
