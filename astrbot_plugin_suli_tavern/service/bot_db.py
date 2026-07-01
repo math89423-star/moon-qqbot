@@ -1158,7 +1158,7 @@ class BotDatabase:
                 logger.debug("cmd_config.json 不存在，跳过同步")
                 return
 
-            raw = cfg_path.read_text(encoding="utf-8")
+            raw = cfg_path.read_text(encoding="utf-8-sig")
             cfg = json.loads(raw)
             sources: list[dict] = cfg.get("provider_sources", [])
 
@@ -1197,7 +1197,7 @@ class BotDatabase:
                 json.dumps(cfg, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        except Exception:
+        except Exception as e:
             logger.warning("cmd_config.json 同步失败: provider=%s error=%s", provider, type(e).__name__)
 
     def _remove_provider_from_cmd_config(self, provider: str) -> None:
@@ -1209,7 +1209,7 @@ class BotDatabase:
             if not cfg_path.exists():
                 return
 
-            raw = cfg_path.read_text(encoding="utf-8")
+            raw = cfg_path.read_text(encoding="utf-8-sig")
             cfg = json.loads(raw)
             sources: list[dict] = cfg.get("provider_sources", [])
             before = len(sources)
@@ -1223,7 +1223,7 @@ class BotDatabase:
                     encoding="utf-8",
                 )
                 logger.info("cmd_config.json: 已删除 provider=%s", provider)
-        except Exception:
+        except Exception as e:
             logger.warning("cmd_config.json 删除同步失败: provider=%s error=%s", provider, type(e).__name__)
 
     def add_llm_config(
