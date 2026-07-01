@@ -137,7 +137,10 @@ set NAPCAT_DIR=%PROJECT_DIR%\NapCatQQ
 set NAPCAT_CONFIG=%NAPCAT_DIR%\config
 set NAPCAT_LAUNCHER=%NAPCAT_DIR%\launcher.bat
 
-if exist "%NAPCAT_LAUNCHER%" (
+REM check if any launcher.bat exists in NapCatQQ tree
+set NAPCAT_FOUND=0
+for /r "%NAPCAT_DIR%" %%f in (launcher.bat) do set NAPCAT_FOUND=1 2>nul
+if "!NAPCAT_FOUND!"=="1" (
     echo   NapCatQQ already installed, skipped
 ) else (
     echo   Downloading NapCatQQ...
@@ -150,12 +153,9 @@ if exist "%NAPCAT_LAUNCHER%" (
         echo   https://github.com/NapNeko/NapCatQQ/releases
         echo   Download NapCat.Shell.Windows.Node.zip and extract to: %NAPCAT_DIR%
     ) else (
-        for /r "%NAPCAT_DIR%" %%f in (launcher.bat) do (
-            if not exist "%NAPCAT_LAUNCHER%" (
-                move "%%f" "%NAPCAT_LAUNCHER%" >nul 2>&1
-            )
-        )
-        if exist "%NAPCAT_LAUNCHER%" (
+        REM find launcher.bat in extracted tree (don't move it, relative paths would break)
+        for /r "%NAPCAT_DIR%" %%f in (launcher.bat) do set NAPCAT_LAUNCHER=%%f
+        if exist "!NAPCAT_LAUNCHER!" (
             echo   NapCatQQ ready
         ) else (
             echo   [WARNING] NapCatQQ extracted but launcher.bat not found

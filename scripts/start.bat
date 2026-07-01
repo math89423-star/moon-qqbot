@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 
 cd /d "%~dp0.."
 set PROJECT_DIR=%CD%
@@ -18,14 +19,19 @@ if exist ".env" (
 )
 
 REM -- Launch NapCatQQ --
-set NAPCAT_LAUNCHER=%PROJECT_DIR%\NapCatQQ\launcher.bat
-if exist "%NAPCAT_LAUNCHER%" (
+set NAPCAT_LAUNCHER=
+set NAPCAT_HOME=
+for /r "%PROJECT_DIR%\NapCatQQ" %%f in (launcher.bat) do (
+    set NAPCAT_LAUNCHER=%%f
+    set NAPCAT_HOME=%%~dpf
+) 2>nul
+if defined NAPCAT_LAUNCHER (
     echo Launching NapCatQQ...
     echo   WebUI: http://localhost:6099
-    start "NapCatQQ" "%NAPCAT_LAUNCHER%"
+    start "NapCatQQ" cmd /k "cd /d "!NAPCAT_HOME!" && "!NAPCAT_LAUNCHER!""
     echo   Waiting for NapCat init ^(5s^)...
     timeout /t 5 /nobreak >nul
-    echo   NapCat started. Scan QR to login QQ %BOT_QQ_MAIN%
+    echo   NapCat started. Scan QR to login QQ !BOT_QQ_MAIN!
     echo.
 ) else (
     echo [WARNING] NapCatQQ not found. Run scripts\deploy.bat first.
