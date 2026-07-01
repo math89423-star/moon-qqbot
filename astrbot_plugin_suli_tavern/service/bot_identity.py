@@ -358,12 +358,12 @@ class BotIdentityService:
         nicknames_json = json.dumps(identity.nicknames, ensure_ascii=False)
         peer_json = json.dumps(identity.peer_bot_ids)
         metadata = dict(identity.metadata)
-        metadata.setdefault("icon", identity.icon)
-        metadata.setdefault("color", identity.color)
-        metadata.setdefault("role_description", identity.role_description)
-        metadata.setdefault("rejection_style", identity.rejection_style)
+        metadata["icon"] = identity.icon
+        metadata["color"] = identity.color
+        metadata["role_description"] = identity.role_description
+        metadata["rejection_style"] = identity.rejection_style
         if identity.llm_slots:
-            metadata.setdefault("llm_slots", list(identity.llm_slots))
+            metadata["llm_slots"] = list(identity.llm_slots)
         metadata_json = json.dumps(metadata, ensure_ascii=False)
 
         ok = self._db.bot_identity_create(
@@ -386,12 +386,12 @@ class BotIdentityService:
         nicknames_json = json.dumps(identity.nicknames, ensure_ascii=False)
         peer_json = json.dumps(identity.peer_bot_ids)
         metadata = dict(identity.metadata)
-        metadata.setdefault("icon", identity.icon)
-        metadata.setdefault("color", identity.color)
-        metadata.setdefault("role_description", identity.role_description)
-        metadata.setdefault("rejection_style", identity.rejection_style)
+        metadata["icon"] = identity.icon
+        metadata["color"] = identity.color
+        metadata["role_description"] = identity.role_description
+        metadata["rejection_style"] = identity.rejection_style
         if identity.llm_slots:
-            metadata.setdefault("llm_slots", list(identity.llm_slots))
+            metadata["llm_slots"] = list(identity.llm_slots)
         metadata_json = json.dumps(metadata, ensure_ascii=False)
 
         ok = self._db.bot_identity_update(

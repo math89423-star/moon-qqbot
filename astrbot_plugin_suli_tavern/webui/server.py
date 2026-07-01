@@ -535,13 +535,13 @@ class ConfigWebUI:
             # 头像 URL
             if data.get("avatar") is not None:
                 existing.metadata["avatar"] = data["avatar"]
-            # Preserve existing metadata fields not in update
-            existing.metadata.setdefault("icon", existing.icon)
-            existing.metadata.setdefault("color", existing.color)
-            existing.metadata.setdefault("role_description", existing.role_description)
-            existing.metadata.setdefault("rejection_style", existing.rejection_style)
+            # 将已更新的字段同步回 metadata JSON（直接赋值覆盖旧值）
+            existing.metadata["icon"] = existing.icon
+            existing.metadata["color"] = existing.color
+            existing.metadata["role_description"] = existing.role_description
+            existing.metadata["rejection_style"] = existing.rejection_style
             if existing.llm_slots:
-                existing.metadata.setdefault("llm_slots", list(existing.llm_slots))
+                existing.metadata["llm_slots"] = list(existing.llm_slots)
             ok = svc.update_bot(existing)
             if not ok:
                 return _json_error("更新失败", 500)
