@@ -396,7 +396,7 @@ Model: Qwen/Qwen2.5-7B-Instruct
 
 检查 NapCatQQ 是否已启动并登录。确认 AstrBot 的 `api_config.json` 中 aiocqhttp 平台配置的 WebSocket 地址指向 NapCat（默认 `ws://localhost:6199/ws`）。
 
-NapCat WebUI 地址：`http://localhost:6099`（token: `d9cc561123cc`）
+NapCat WebUI 地址：`http://localhost:6099`（Token 在 `NapCatQQ\napcat\config\webui.json` 中查看，NapCat 首次启动时自动生成）
 
 </details>
 
