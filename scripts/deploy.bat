@@ -131,37 +131,48 @@ copy "characters\*.json" "%CHAR_DST%\" /Y >nul 2>&1
 echo   角色卡已就绪 ^^!
 echo.
 
-REM ── NapCatWin ──
-echo [5/5] NapCatWin (QQ 协议) ...
+REM ── NapCatQQ ──
+echo [5/5] NapCatQQ (QQ 协议) ...
 
-set NAPCAT_DIR=%PROJECT_DIR%\NapCatWin
+set NAPCAT_DIR=%PROJECT_DIR%\NapCatQQ
 set NAPCAT_CONFIG=%NAPCAT_DIR%\config
-set NAPCAT_EXE=%NAPCAT_DIR%\NapCatWin.exe
+set NAPCAT_LAUNCHER=%NAPCAT_DIR%\launcher.bat
 
-if exist "%NAPCAT_EXE%" (
-    echo   NapCatWin 已安装，跳过
+if exist "%NAPCAT_LAUNCHER%" (
+    echo   NapCatQQ 已安装，跳过
 ) else (
-    echo   正在下载 NapCatWin...
+    echo   正在下载 NapCatQQ...
     if not exist "%NAPCAT_DIR%" mkdir "%NAPCAT_DIR%"
 
-    REM 从 GitHub 获取最新版本
+    REM GitHub API 获取最新版本 → 国内镜像加速下载
     powershell -Command ^
         "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest' -Headers @{'User-Agent'='moon-qqbot'}; ^
-         $asset = $release.assets | Where-Object { $_.name -like 'NapCatWin*' -and $_.name -like '*.zip' } | Select-Object -First 1; ^
+         $asset = $release.assets | Where-Object { $_.name -like 'NapCat.Shell.Windows.Node*' -and $_.name -like '*.zip' } | Select-Object -First 1; ^
          if ($asset) { ^
+             $mirror = 'https://ghproxy.com/' + $asset.browser_download_url; ^
              Write-Host \"下载: $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)\"; ^
-             Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%NAPCAT_DIR%\NapCatWin.zip' ^
-         } else { Write-Host '未找到 NapCatWin 发布包'; exit 1 }"
+             Write-Host \"镜像: $mirror\"; ^
+             Invoke-WebRequest -Uri $mirror -OutFile '%NAPCAT_DIR%\NapCatQQ.zip'; ^
+             if (-not $?) { Write-Host '镜像失败，尝试直连...'; ^
+             Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%NAPCAT_DIR%\NapCatQQ.zip' } ^
+         } else { Write-Host '未找到 NapCatQQ Windows 发布包'; exit 1 }"
 
     if errorlevel 1 (
-        echo   [警告] 自动下载失败，请手动下载 NapCatWin:
+        echo   [警告] 自动下载失败，请手动下载 NapCatQQ:
         echo   https://github.com/NapNeko/NapCatQQ/releases
+        echo   下载 NapCat.Shell.Windows.Node.zip
         echo   解压到: %NAPCAT_DIR%
     ) else (
         echo   正在解压...
-        powershell -Command "Expand-Archive -Path '%NAPCAT_DIR%\NapCatWin.zip' -DestinationPath '%NAPCAT_DIR%' -Force"
-        del "%NAPCAT_DIR%\NapCatWin.zip" 2>nul
-        echo   NapCatWin 已就绪 ^^!
+        powershell -Command "Expand-Archive -Path '%NAPCAT_DIR%\NapCatQQ.zip' -DestinationPath '%NAPCAT_DIR%' -Force"
+        del "%NAPCAT_DIR%\NapCatQQ.zip" 2>nul
+        REM 查找 launcher（NapCatQQ 可能有多层子目录）
+        for /r "%NAPCAT_DIR%" %%f in (launcher.bat) do (
+            if not exist "%NAPCAT_LAUNCHER%" (
+                move "%%f" "%NAPCAT_LAUNCHER%" >nul 2>&1
+            )
+        )
+        echo   NapCatQQ 已就绪 ^^!
     )
 )
 

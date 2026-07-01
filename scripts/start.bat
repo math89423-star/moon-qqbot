@@ -18,18 +18,18 @@ if exist ".env" (
     )
 )
 
-REM ── 启动 NapCatWin ──
-set NAPCAT_EXE=%PROJECT_DIR%\NapCatWin\NapCatWin.exe
-if exist "%NAPCAT_EXE%" (
-    echo 正在启动 NapCatWin...
+REM ── 启动 NapCatQQ ──
+set NAPCAT_LAUNCHER=%PROJECT_DIR%\NapCatQQ\launcher.bat
+if exist "%NAPCAT_LAUNCHER%" (
+    echo 正在启动 NapCatQQ...
     echo   管理面板: http://localhost:6099
-    start "" "%NAPCAT_EXE%"
+    start "NapCatQQ" "%NAPCAT_LAUNCHER%"
     echo   等待 NapCat 初始化 ^(5 秒^)...
     timeout /t 5 /nobreak >nul
     echo   NapCat 已启动，请扫码登录 QQ %BOT_QQ_MAIN%
     echo.
 ) else (
-    echo [警告] 未找到 NapCatWin，请先运行 scripts\deploy.bat
+    echo [警告] 未找到 NapCatQQ，请先运行 scripts\deploy.bat
     echo   QQ 消息将无法收发！
     echo.
 )
