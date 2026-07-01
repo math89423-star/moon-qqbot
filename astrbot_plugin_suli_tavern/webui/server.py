@@ -421,6 +421,7 @@ class ConfigWebUI:
                         "is_active": b.is_active,
                         "peer_bot_ids": b.peer_bot_ids,
                         "role_description": b.role_description,
+                        "rejection_style": b.rejection_style if b.rejection_style else {},
                         "llm_slots": list(b.llm_slots) if b.llm_slots else [],
                     }
                     for b in bots
@@ -487,6 +488,7 @@ class ConfigWebUI:
                 icon=data.get("icon", "🤖"),
                 color=data.get("color", "#666666"),
                 role_description=data.get("role_description", "").strip(),
+                rejection_style=data.get("rejection_style", {}),
                 llm_slots=tuple(data.get("llm_slots", ())),
                 metadata=data.get("metadata", {}),
             )
@@ -524,6 +526,8 @@ class ConfigWebUI:
             existing.icon = data.get("icon", existing.icon)
             existing.color = data.get("color", existing.color)
             existing.role_description = data.get("role_description", existing.role_description)
+            if "rejection_style" in data:
+                existing.rejection_style = data["rejection_style"]
             if "llm_slots" in data:
                 existing.llm_slots = tuple(data["llm_slots"])
             if "metadata" in data:
@@ -535,6 +539,7 @@ class ConfigWebUI:
             existing.metadata.setdefault("icon", existing.icon)
             existing.metadata.setdefault("color", existing.color)
             existing.metadata.setdefault("role_description", existing.role_description)
+            existing.metadata.setdefault("rejection_style", existing.rejection_style)
             if existing.llm_slots:
                 existing.metadata.setdefault("llm_slots", list(existing.llm_slots))
             ok = svc.update_bot(existing)

@@ -160,18 +160,24 @@ def _resolve_style(bot_id: str) -> tuple[str, str, str]:
         svc = get_bot_identity_service()
         bot = svc.get_bot(str(bot_id))
         if bot:
-            # 尝试从角色特征匹配
+            # 优先级 1: 显式 rejection_style (前端可配，三个字段都非空才生效)
+            explicit = bot.rejection_style
+            if not explicit or not isinstance(explicit, dict):
+                explicit = bot.get_metadata("rejection_style", {})
+            if explicit and isinstance(explicit, dict):
+                style_label = (explicit.get("style_label") or "").strip()
+                pronoun = (explicit.get("pronoun") or "").strip()
+                tone_hint = (explicit.get("tone_hint") or "").strip()
+                if style_label and pronoun and tone_hint:
+                    return (style_label, pronoun, tone_hint)
+
+            # 优先级 2: 从角色特征匹配硬编码风格表
             role = bot.role_description.lower()
             for pattern, style in _STYLE_TABLE.items():
                 if pattern.lower() in role:
                     return style
-            # 从 metadata 读取覆盖
-            override = bot.get_metadata("rejection_style")
-            if override:
-                return (override.get("style_label", "自然风格"),
-                        override.get("pronoun", "我"),
-                        override.get("tone_hint", "自然"))
-            # fallback: 使用 bot name
+
+            # 优先级 3: fallback — 使用 bot name
             return (f"{bot.name}的风格", "我", "自然")
     except Exception:
         pass

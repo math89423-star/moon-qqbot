@@ -32,6 +32,7 @@ class BotIdentity:
     icon: str = "🤖"
     color: str = "#666666"
     role_description: str = ""       # "蛇娘" / "猫娘"
+    rejection_style: dict = field(default_factory=dict)  # {"style_label","pronoun","tone_hint"} 工具拒绝文案风格
     llm_slots: tuple[str, ...] = ()  # per-bot LLM 槽位覆盖，空=默认
     metadata: dict = field(default_factory=dict)  # 原始 JSON blob
     created_at: float = 0.0
@@ -63,6 +64,11 @@ class BotIdentity:
             icon=metadata.get("icon", "🤖"),
             color=metadata.get("color", "#666666"),
             role_description=metadata.get("role_description", ""),
+            rejection_style=(
+                metadata.get("rejection_style", {})
+                if isinstance(metadata.get("rejection_style"), dict)
+                else {}
+            ),
             llm_slots=tuple(metadata.get("llm_slots", ())),
             metadata=metadata,
             created_at=row.get("created_at", 0),
@@ -356,6 +362,7 @@ class BotIdentityService:
         metadata.setdefault("icon", identity.icon)
         metadata.setdefault("color", identity.color)
         metadata.setdefault("role_description", identity.role_description)
+        metadata.setdefault("rejection_style", identity.rejection_style)
         if identity.llm_slots:
             metadata.setdefault("llm_slots", list(identity.llm_slots))
         metadata_json = json.dumps(metadata, ensure_ascii=False)
@@ -383,6 +390,7 @@ class BotIdentityService:
         metadata.setdefault("icon", identity.icon)
         metadata.setdefault("color", identity.color)
         metadata.setdefault("role_description", identity.role_description)
+        metadata.setdefault("rejection_style", identity.rejection_style)
         if identity.llm_slots:
             metadata.setdefault("llm_slots", list(identity.llm_slots))
         metadata_json = json.dumps(metadata, ensure_ascii=False)
