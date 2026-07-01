@@ -83,19 +83,19 @@ if not exist "AstrBot" (
         exit /b 1
     )
     echo   AstrBot 已克隆 ^^!
-    cd AstrBot
-    echo   正在安装依赖...
-    python -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo   [错误] AstrBot 依赖安装失败
-        pause
-        exit /b 1
-    )
-    echo   AstrBot 依赖已安装 ^^!
-    cd ..
 ) else (
-    echo   AstrBot 已存在，跳过克隆和依赖安装
+    echo   AstrBot 已存在，跳过克隆
 )
+cd AstrBot
+echo   正在安装/更新依赖...
+python -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo   [错误] AstrBot 依赖安装失败
+    pause
+    exit /b 1
+)
+echo   AstrBot 依赖已安装 ^^!
+cd ..
 echo.
 
 REM ── 部署插件 ──
