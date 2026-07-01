@@ -34,43 +34,53 @@ echo -e "${GREEN}  Git ✓${NC}"
 
 # ── 输入 QQ 号 ──
 echo ""
-read -p "请输入你的机器人 QQ 号: " QQ_NUMBER
-if [ -z "$QQ_NUMBER" ]; then
-    echo -e "${RED}[错误] QQ 号不能为空${NC}"
-    exit 1
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    read -p "请输入你的机器人 QQ 号: " QQ_NUMBER
+    if [ -z "$QQ_NUMBER" ]; then
+        echo -e "${RED}[错误] QQ 号不能为空${NC}"
+        exit 1
+    fi
+    echo "QQ=$QQ_NUMBER" > "$PROJECT_DIR/.env"
+    echo "BOT_QQ_MAIN=$QQ_NUMBER" >> "$PROJECT_DIR/.env"
+    echo -e "${GREEN}  QQ 号已保存 ✓${NC}"
+else
+    source "$PROJECT_DIR/.env" 2>/dev/null || true
+    QQ_NUMBER="${BOT_QQ_MAIN:-未知}"
+    echo -e "${GREEN}  .env 已存在，QQ: $QQ_NUMBER${NC}"
 fi
-echo "QQ=$QQ_NUMBER" > "$PROJECT_DIR/.env"
-echo "BOT_QQ_MAIN=$QQ_NUMBER" >> "$PROJECT_DIR/.env"
-echo -e "${GREEN}  QQ 号已保存 ✓${NC}"
 
 # ── 创建虚拟环境 ──
 echo ""
-echo -e "${YELLOW}[1/5] 创建 Python 虚拟环境...${NC}"
+echo -e "${YELLOW}[1/5] Python 虚拟环境...${NC}"
+VENV_NEW=0
 if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
     echo -e "${GREEN}  虚拟环境已创建 ✓${NC}"
+    VENV_NEW=1
 else
-    echo -e "${GREEN}  虚拟环境已存在，跳过${NC}"
+    echo -e "${GREEN}  虚拟环境已存在，跳过创建${NC}"
 fi
 
 source "$VENV_DIR/bin/activate"
-pip install -r "$PROJECT_DIR/requirements.txt" -q
-echo -e "${GREEN}  依赖已安装 ✓${NC}"
+if [ "$VENV_NEW" -eq 1 ]; then
+    pip install -r "$PROJECT_DIR/requirements.txt" -q
+    echo -e "${GREEN}  依赖已安装 ✓${NC}"
+else
+    echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
+fi
 
 # ── 安装 AstrBot ──
 echo ""
-echo -e "${YELLOW}[2/5] 安装 AstrBot...${NC}"
+echo -e "${YELLOW}[2/5] AstrBot 框架...${NC}"
 ASTRBOT_DIR="$PROJECT_DIR/AstrBot"
 if [ ! -d "$ASTRBOT_DIR" ]; then
     git clone https://github.com/Soulter/AstrBot.git "$ASTRBOT_DIR"
-    echo -e "${GREEN}  AstrBot 已克隆 ✓${NC}"
+    cd "$ASTRBOT_DIR"
+    pip install -r requirements.txt -q
+    echo -e "${GREEN}  AstrBot 已克隆 + 依赖已安装 ✓${NC}"
 else
-    echo -e "${GREEN}  AstrBot 已存在，跳过克隆${NC}"
+    echo -e "${GREEN}  AstrBot 已存在，跳过克隆和依赖安装${NC}"
 fi
-
-cd "$ASTRBOT_DIR"
-pip install -r requirements.txt -q
-echo -e "${GREEN}  AstrBot 依赖已安装 ✓${NC}"
 
 # ── 部署插件 ──
 echo ""
@@ -78,6 +88,8 @@ echo -e "${YELLOW}[3/5] 部署插件...${NC}"
 PLUGIN_DIR="$ASTRBOT_DIR/data/plugins"
 mkdir -p "$PLUGIN_DIR"
 
+NEW_COUNT=0
+SKIP_COUNT=0
 for plugin_dir in "$PROJECT_DIR"/astrbot_plugin_*; do
     if [ -d "$plugin_dir" ]; then
         plugin_name=$(basename "$plugin_dir")
@@ -85,53 +97,61 @@ for plugin_dir in "$PROJECT_DIR"/astrbot_plugin_*; do
         if [ ! -e "$target" ]; then
             ln -sf "$plugin_dir" "$target" 2>/dev/null || cp -r "$plugin_dir" "$target"
             echo "  $plugin_name ✓"
+            ((NEW_COUNT++)) || true
         else
-            echo "  $plugin_name (已存在，跳过)"
+            ((SKIP_COUNT++)) || true
         fi
     fi
 done
-echo -e "${GREEN}  插件部署完成 ✓${NC}"
+echo -e "${GREEN}  已部署 $NEW_COUNT 个，跳过 $SKIP_COUNT 个 ✓${NC}"
 
 # ── 复制角色卡 ──
 echo ""
-echo -e "${YELLOW}[4/5] 复制角色卡...${NC}"
+echo -e "${YELLOW}[4/5] 角色卡...${NC}"
 CHAR_SRC="$PROJECT_DIR/characters"
 CHAR_DST="$ASTRBOT_DIR/data/plugins/astrbot_plugin_suli_tavern/characters"
 mkdir -p "$CHAR_DST"
-if [ -d "$CHAR_SRC" ]; then
-    cp "$CHAR_SRC"/*.json "$CHAR_DST/" 2>/dev/null || true
-    echo -e "${GREEN}  角色卡已复制 ✓${NC}"
-fi
+cp "$CHAR_SRC"/*.json "$CHAR_DST/" 2>/dev/null || true
+echo -e "${GREEN}  角色卡已就绪 ✓${NC}"
 
-# ── 安装 NapCat ──
+# ── 检查 NapCat ──
 echo ""
-echo -e "${YELLOW}[5/5] 安装 NapCat...${NC}"
-echo -e "${CYAN}  NapCat 需要单独安装。请选择安装方式:${NC}"
-echo "  1) Docker (推荐)"
-echo "  2) 手动安装"
-echo "  3) 跳过 (已安装)"
-read -p "请选择 [1-3]: " NAPCAT_CHOICE
+echo -e "${YELLOW}[5/5] NapCat (QQ 协议)...${NC}"
+NAPCAT_FOUND=0
+if command -v napcat &>/dev/null; then NAPCAT_FOUND=1; fi
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'napcat'; then NAPCAT_FOUND=1; fi
+if [ -d "/opt/napcat" ] || [ -d "$HOME/napcat" ] || [ -d "$HOME/NapCat" ]; then NAPCAT_FOUND=1; fi
 
-case $NAPCAT_CHOICE in
-    1)
-        if command -v docker &>/dev/null; then
-            docker run -d --name napcat \
-                -p 3000:3000 -p 3001:3001 -p 6099:6099 \
-                -v napcat_data:/app/data \
-                napneko/napcat:latest 2>/dev/null || \
-            echo -e "${YELLOW}  Docker 启动失败，请检查 Docker 是否运行${NC}"
-        else
-            echo -e "${YELLOW}  未检测到 Docker，请先安装 Docker 后重试${NC}"
-            echo "  或选择手动安装: https://napcat.napneko.icu/"
-        fi
-        ;;
-    2)
-        echo -e "${CYAN}  请访问 https://napcat.napneko.icu/ 按照指引安装 NapCat${NC}"
-        ;;
-    3)
-        echo -e "${GREEN}  跳过 NapCat 安装${NC}"
-        ;;
-esac
+if [ "$NAPCAT_FOUND" -eq 1 ]; then
+    echo -e "${GREEN}  NapCat 已安装，跳过${NC}"
+else
+    echo -e "${CYAN}  NapCat 未检测到。请选择安装方式:${NC}"
+    echo "  1) Docker (推荐)"
+    echo "  2) 手动安装"
+    echo "  3) 跳过 (已安装)"
+    read -p "请选择 [1-3]: " NAPCAT_CHOICE
+
+    case $NAPCAT_CHOICE in
+        1)
+            if command -v docker &>/dev/null; then
+                docker run -d --name napcat \
+                    -p 3000:3000 -p 3001:3001 -p 6099:6099 \
+                    -v napcat_data:/app/data \
+                    napneko/napcat:latest 2>/dev/null && \
+                echo -e "${GREEN}  NapCat Docker 已启动 ✓${NC}" || \
+                echo -e "${YELLOW}  Docker 启动失败，请检查 Docker 是否运行${NC}"
+            else
+                echo -e "${YELLOW}  未检测到 Docker，请先安装 Docker${NC}"
+            fi
+            ;;
+        2)
+            echo -e "${CYAN}  请访问 https://napcat.napneko.icu/ 安装 NapCat${NC}"
+            ;;
+        3)
+            echo -e "${GREEN}  跳过 NapCat 安装${NC}"
+            ;;
+    esac
+fi
 
 # ── 完成 ──
 echo ""
@@ -140,8 +160,12 @@ echo -e "${GREEN}  安装完成！${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "下一步:"
-echo -e "  1. 确保 NapCat 已启动并登录 QQ 号 ${CYAN}$QQ_NUMBER${NC}"
-echo -e "  2. 启动 AstrBot: ${CYAN}bash scripts/start.sh${NC}"
+if [ "$NAPCAT_FOUND" -eq 0 ]; then
+    echo -e "  1. 安装并启动 NapCat，登录 QQ 号 ${CYAN}$QQ_NUMBER${NC}"
+    echo -e "  2. 启动 AstrBot: ${CYAN}bash scripts/start.sh${NC}"
+else
+    echo -e "  1. 启动 AstrBot: ${CYAN}bash scripts/start.sh${NC}"
+fi
 echo -e "  3. 打开管理面板: ${CYAN}http://localhost:6190${NC}"
 echo -e "  4. 在面板中配置 LLM API (OpenAI 兼容接口)"
 echo ""
