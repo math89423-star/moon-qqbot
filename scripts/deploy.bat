@@ -7,9 +7,9 @@ echo   moon-qqbot 一键安装脚本
 echo ========================================
 echo.
 
-pushd %~dp0..
+cd /d "%~dp0"
+cd ..
 set PROJECT_DIR=%CD%
-popd
 
 REM ── 检查 Python ──
 echo [检查] Python 环境...
