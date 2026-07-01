@@ -23,7 +23,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 DB_DIR = Path("data")
-DB_PATH = DB_DIR / "shared_db" / "none_qqbot.db"
+DB_PATH = DB_DIR / "shared_db" / "suli_qqbot.db"
 
 # ── Provider 分组 — 与 L-Port llm_config_service.py 一致 ──
 VLM_PROVIDERS = frozenset({"gpt4v", "claude", "gemini", "nano_banana", "llama"})

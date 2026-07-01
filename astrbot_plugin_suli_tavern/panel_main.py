@@ -4,7 +4,7 @@
     python panel_main.py --port 5190 --host 0.0.0.0
 
 依赖: aiohttp (Web 服务器), sqlite3 (标准库)
-DB:   data/shared_db/none_qqbot.db (需挂载)
+DB:   data/shared_db/suli_qqbot.db (需挂载)
 SPA:  static/ (同目录下的 Vue 3 构建产物)
 """
 
@@ -41,7 +41,7 @@ async def main() -> None:
     from astrbot_plugin_suli_tavern.service.bot_config import BotConfigService
     from astrbot_plugin_suli_tavern.webui.server import ConfigWebUI
 
-    # 初始化 DB (路径: data/shared_db/none_qqbot.db — 由容器 WORKDIR + volume 决定)
+    # 初始化 DB (路径: data/shared_db/suli_qqbot.db — 由容器 WORKDIR + volume 决定)
     db = get_bot_db()
     logger.info("DB 已连接: %d 条 llm_config", len(db.list_llm_configs()))
 

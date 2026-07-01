@@ -4,7 +4,7 @@
   - 基于 aiohttp, 运行在插件 asyncio 事件循环中 (无需独立进程)
   - 提供 Vue 3 SPA 静态文件 + /api/admin/* REST API
   - 保留 /api/config/* 向后兼容 (别名到 /api/admin/*)
-  - 直接读写 BotConfigService / BotDatabase (none_qqbot.db)
+  - 直接读写 BotConfigService / BotDatabase (suli_qqbot.db)
   - 端口可配置, 默认 5190
 
 用法:

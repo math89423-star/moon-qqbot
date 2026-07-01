@@ -1996,7 +1996,7 @@ http://localhost:6190/
 - `Sidebar.vue` 顶部彩色药丸按钮切换 bot，选中状态持久化到 `localStorage`
 - 子组件通过 `inject('currentBot')` 获取当前 bot，API 调用自动带 `bot_id` 参数
 
-**认证**: Bearer token → `admin_token` (存储在 `none_qqbot.db` 的 `bot_config` 表，首次启动自动生成)。SPA 登录页验证后存入 `localStorage`，请求拦截器自动注入 `Authorization` 头。
+**认证**: Bearer token → `admin_token` (存储在 `suli_qqbot.db` 的 `bot_config` 表，首次启动自动生成)。SPA 登录页验证后存入 `localStorage`，请求拦截器自动注入 `Authorization` 头。
 
 ### 后端 (server.py)
 
@@ -2054,7 +2054,7 @@ ruff check plugins/astrbot_plugin_suli_tavern/webui/
 ### §8b 双 Bot 模型槽位配置 (2026-06-24 审计)
 
 > bot_db `llm_config` 表由 `_sync_astrbot_providers()` 从 `cmd_config.json` 自动同步。
-> 槽位映射存储在 `none_qqbot.db` → `bot_config` 表, key 格式: `bot:<QQ>:llm_<slot>` / `bot:<QQ>:vlm_<slot>`。
+> 槽位映射存储在 `suli_qqbot.db` → `bot_config` 表, key 格式: `bot:<QQ>:llm_<slot>` / `bot:<QQ>:vlm_<slot>`。
 
 **暮恩 (BOT_QQ_MAIN)**:
 
