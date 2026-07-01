@@ -1110,7 +1110,7 @@ class GroupChatScheduler:
             self._peer_name = get_bot_name(get_peer_qq(_bid)) if get_peer_qq(_bid) else ""
             _char = self._resolve_character(_bid).get("name", "")
             self._my_identity = (
-                "暮恩 — 绿毛蛇女 AI 助手，专业冷静"
+                "暮恩 — 白发红瞳冰山少女，寡言精准"
                 if _char == "暮恩"
                 else " — 银发猫娘 AI 助手，温柔俏皮"
             )
