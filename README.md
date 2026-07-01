@@ -23,22 +23,41 @@
 - Git
 - 一个 QQ 小号（用于机器人登录）
 
-### 一键安装
+### Windows 用户
+
+```powershell
+git clone https://github.com/math89423-star/moon-qqbot.git
+cd moon-qqbot
+scripts\deploy.bat
+```
+
+启动：
+
+```powershell
+scripts\start.bat
+```
+
+### Linux / macOS 用户
 
 ```bash
 git clone https://github.com/math89423-star/moon-qqbot.git
 cd moon-qqbot
-bash scripts/deploy.sh      # Linux / macOS
-# 或
-scripts\deploy.bat          # Windows
+bash scripts/deploy.sh
+```
+
+启动：
+
+```bash
+bash scripts/start.sh
 ```
 
 脚本会自动完成：
-1. 安装 AstrBot 框架
-2. 部署全部 17 个插件
-3. 复制角色卡
-4. 引导安装 NapCat
-5. 生成配置文件
+1. 创建 Python 虚拟环境
+2. 安装项目依赖
+3. 安装 AstrBot 框架
+4. 部署全部 17 个插件
+5. 复制角色卡
+6. 引导安装 NapCat
 
 ### 启动
 

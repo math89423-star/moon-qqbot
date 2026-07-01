@@ -53,20 +53,32 @@ fi
 echo ""
 echo -e "${YELLOW}[1/5] Python 虚拟环境...${NC}"
 VENV_NEW=0
+USE_VENV=1
+
 if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
-    echo -e "${GREEN}  虚拟环境已创建 ✓${NC}"
-    VENV_NEW=1
+    if python3 -m venv "$VENV_DIR" 2>/dev/null; then
+        echo -e "${GREEN}  虚拟环境已创建 ✓${NC}"
+        VENV_NEW=1
+    else
+        echo -e "${YELLOW}  venv 创建失败 (可能缺少 python3-venv 包)${NC}"
+        echo -e "${YELLOW}  将使用全局 pip 安装依赖${NC}"
+        USE_VENV=0
+    fi
 else
     echo -e "${GREEN}  虚拟环境已存在，跳过创建${NC}"
 fi
 
-source "$VENV_DIR/bin/activate"
-if [ "$VENV_NEW" -eq 1 ]; then
-    pip install -r "$PROJECT_DIR/requirements.txt" -q
-    echo -e "${GREEN}  依赖已安装 ✓${NC}"
+if [ "$USE_VENV" -eq 1 ]; then
+    source "$VENV_DIR/bin/activate"
+    if [ "$VENV_NEW" -eq 1 ]; then
+        pip install -r "$PROJECT_DIR/requirements.txt" -q
+        echo -e "${GREEN}  依赖已安装 ✓${NC}"
+    else
+        echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
+    fi
 else
-    echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
+    pip3 install -r "$PROJECT_DIR/requirements.txt" -q 2>/dev/null || pip install -r "$PROJECT_DIR/requirements.txt" -q
+    echo -e "${GREEN}  依赖已安装 (全局) ✓${NC}"
 fi
 
 # ── 安装 AstrBot ──
