@@ -21,7 +21,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_DIR = Path("data")
+# 项目根目录 (astrbot_plugin_suli_tavern/service/ → ../../ = 项目根)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DB_DIR = _PROJECT_ROOT / "data"
 DB_PATH = DB_DIR / "shared_db" / "suli_qqbot.db"
 
 # ── Provider 分组 — 与 L-Port llm_config_service.py 一致 ──
@@ -1664,7 +1666,7 @@ class BotDatabase:
     # {bot_id: {group_id: tier}}。文件放在 shared_db/ 目录以确保
     # ADR-001 双实例容器间共享。
 
-    _WHITELIST_PATH = Path("data") / "shared_db" / "group_chat_whitelist.json"
+    _WHITELIST_PATH = _PROJECT_ROOT / "data" / "shared_db" / "group_chat_whitelist.json"
 
     def _read_whitelist_raw(self) -> dict:
         """读取原始白名单 JSON，自动处理旧格式迁移。
