@@ -42,15 +42,11 @@ $ok = $false
 foreach ($m in $methods) {
     Write-Host "Trying $($m.Label)..."
     try {
-        # curl.exe has built-in progress bar (Win10+), fallback to Invoke-WebRequest
-        $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-        if ($curl) {
-            & curl.exe -L -o $outZip $m.Uri --progress-bar
-            if ($LASTEXITCODE -ne 0) { throw "curl exited with $LASTEXITCODE" }
-        } else {
-            Write-Host "  (no progress bar, downloading 109MB, please wait...)"
-            Invoke-WebRequest -Uri $m.Uri -OutFile $outZip -ErrorAction Stop
-        }
+        Write-Host "  Downloading $sizeMB MB, please wait..."
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-WebRequest -Uri $m.Uri -OutFile $outZip -ErrorAction Stop
+        $sw.Stop()
+        Write-Host "  Done in $([math]::Round($sw.Elapsed.TotalSeconds,1))s"
         $actual = (Get-Item $outZip).Length
         if ($actual -ge $expectedSize * 0.9) {
             Write-Host "OK ($([math]::Round($actual/1MB,1)) MB)"

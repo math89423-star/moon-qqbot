@@ -748,6 +748,19 @@ class MoonTavernPlugin(Star):
         _bot_count = _bot_db.bot_identity_count()
         logger.info("BotIdentity 注册中心已初始化: %d bots", _bot_count)
 
+        # ── 加载管理员 QQ 配置 (覆盖 config.py 硬编码默认值) ──
+        _db_admin_qq = _config_svc.get_super_admin_qq()
+        _db_admin_ids = _config_svc.get_admin_qq_ids()
+        if _db_admin_qq:
+            self._lport_config.super_admin_qq = _db_admin_qq
+        if _db_admin_ids:
+            self._lport_config.admin_qq_ids = _db_admin_ids
+        if _db_admin_qq or _db_admin_ids:
+            logger.info("管理员 QQ 配置已加载: super_admin=%d, admins=%s",
+                        self._lport_config.super_admin_qq, self._lport_config.admin_qq_ids)
+        else:
+            logger.warning("管理员 QQ 未配置！请在管理面板 http://localhost:5190 设置")
+
         # ── 知识库迁移修复: 之前因路径未注入导致静默失败, 重置 flag 重跑 ──
         try:
             _bot_db.conn.execute(

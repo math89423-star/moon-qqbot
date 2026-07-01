@@ -317,6 +317,12 @@ class ConfigWebUI:
         app.router.add_get(_API_PREFIX + "/config", self._get_all_config)
         app.router.add_put(_API_PREFIX + "/config", self._set_config)
 
+        # ── 管理员 QQ 配置 ───────────────────────────
+        app.router.add_get(_API_PREFIX + "/admin-qq", self._get_admin_qq)
+        app.router.add_put(_API_PREFIX + "/admin-qq", self._set_admin_qq)
+        # 简易配置页面 (免编译 SPA)
+        app.router.add_get("/admin-qq", self._serve_admin_qq_page)
+
         # ── SPA 客户端路由 fallback ──────────────────
         app.router.add_get("/{route:.*}", self._serve_spa_fallback)
 
@@ -1518,6 +1524,123 @@ class ConfigWebUI:
         except Exception:
             logger.error("设置配置失败", exc_info=True)
             return _json_error("Internal server error", 500)
+
+    # ── 管理员 QQ 配置 ─────────────────────────────────────
+
+    async def _get_admin_qq(self, request: web.Request) -> web.Response:
+        """GET /api/admin/admin-qq → {super_admin_qq: int, admin_qq_ids: [int, ...]}"""
+        try:
+            return _json({
+                "super_admin_qq": self.config_service.get_super_admin_qq(),
+                "admin_qq_ids": self.config_service.get_admin_qq_ids(),
+            })
+        except Exception:
+            logger.error("获取管理员 QQ 配置失败", exc_info=True)
+            return _json_error("Internal server error", 500)
+
+    async def _set_admin_qq(self, request: web.Request) -> web.Response:
+        """PUT /api/admin/admin-qq — body: {super_admin_qq: int, admin_qq_ids: [int, ...]}"""
+        try:
+            data = await request.json()
+            if "super_admin_qq" in data:
+                qq = int(data["super_admin_qq"])
+                if qq < 0:
+                    return _json_error("super_admin_qq 必须为非负整数")
+                self.config_service.set_super_admin_qq(qq)
+            if "admin_qq_ids" in data:
+                ids = data["admin_qq_ids"]
+                if not isinstance(ids, list):
+                    return _json_error("admin_qq_ids 必须是整数数组")
+                clean_ids: list[int] = []
+                for q in ids:
+                    q_int = int(q)
+                    if q_int > 0:
+                        clean_ids.append(q_int)
+                self.config_service.set_admin_qq_ids(clean_ids)
+            return _json({"ok": True})
+        except Exception:
+            logger.error("设置管理员 QQ 配置失败", exc_info=True)
+            return _json_error("Internal server error", 500)
+
+    async def _serve_admin_qq_page(self, request: web.Request) -> web.Response:
+        """GET /admin-qq — 简易管理员 QQ 配置页面"""
+        super_qq = self.config_service.get_super_admin_qq()
+        admin_ids = self.config_service.get_admin_qq_ids()
+        admin_ids_str = ", ".join(str(q) for q in admin_ids) if admin_ids else ""
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理员 QQ 配置 — 暮恩</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box }}
+body {{ font-family: system-ui, -apple-system, sans-serif; background:#0f0f13; color:#e0e0e0; min-height:100vh; display:flex; align-items:center; justify-content:center }}
+.card {{ background:#1a1a24; border-radius:12px; padding:32px; max-width:480px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,.4) }}
+h1 {{ font-size:20px; margin-bottom:4px; color:#fff }}
+.sub {{ font-size:13px; color:#888; margin-bottom:24px }}
+.field {{ margin-bottom:20px }}
+.field label {{ display:block; font-size:13px; font-weight:600; color:#aaa; margin-bottom:6px }}
+.field input {{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid #333; background:#121218; color:#e0e0e0; font-size:15px; outline:none; transition:border .2s }}
+.field input:focus {{ border-color:#7c5cfc }}
+.hint {{ font-size:12px; color:#666; margin-top:4px }}
+.btn {{ display:inline-block; padding:10px 24px; border-radius:8px; border:none; font-size:14px; cursor:pointer; font-weight:600; transition:all .2s }}
+.btn-primary {{ background:#7c5cfc; color:#fff }}
+.btn-primary:hover {{ background:#6a4af0 }}
+.msg {{ font-size:13px; margin-top:12px; padding:8px 12px; border-radius:6px; display:none }}
+.msg.ok {{ background:#0d2818; color:#4ade80; display:block }}
+.msg.err {{ background:#2d0f0f; color:#f87171; display:block }}
+.back {{ font-size:13px; color:#888; margin-top:16px; display:block }}
+.back:hover {{ color:#7c5cfc }}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>管理员 QQ 配置</h1>
+<p class="sub">设置后将覆盖默认值，重启 AstrBot 生效</p>
+<div class="field">
+  <label>超级管理员 QQ (角色扮演「主人」)</label>
+  <input id="super_qq" type="number" value="{super_qq or ''}" placeholder="例如: 3998854903">
+  <p class="hint">拥有最高权限，群聊中享有"主人"称呼</p>
+</div>
+<div class="field">
+  <label>全局管理员 QQ 列表 (逗号分隔)</label>
+  <input id="admin_ids" type="text" value="{admin_ids_str}" placeholder="例如: 3998854903, 123456789">
+  <p class="hint">所有管理员 QQ 号，以英文逗号分隔</p>
+</div>
+<button class="btn btn-primary" onclick="save()">保存配置</button>
+<div id="msg" class="msg"></div>
+<a class="back" href="/">&larr; 返回管理面板</a>
+</div>
+<script>
+async function save() {{
+  const msg = document.getElementById('msg');
+  msg.className = 'msg';
+  const superQq = parseInt(document.getElementById('super_qq').value) || 0;
+  const adminIdsRaw = document.getElementById('admin_ids').value;
+  const adminIds = adminIdsRaw ? adminIdsRaw.split(',').map(s => parseInt(s.trim())).filter(n => n > 0) : [];
+  try {{
+    const res = await fetch('/api/admin/admin-qq', {{
+      method: 'PUT',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{super_admin_qq: superQq, admin_qq_ids: adminIds}})
+    }});
+    if (res.ok) {{
+      msg.className = 'msg ok';
+      msg.textContent = '配置已保存！请重启 AstrBot 使配置生效。';
+    }} else {{
+      const err = await res.json();
+      throw new Error(err.message || '保存失败');
+    }}
+  }} catch(e) {{
+    msg.className = 'msg err';
+    msg.textContent = '保存失败: ' + (e.message || '网络错误');
+  }}
+}}
+</script>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html; charset=utf-8")
 
     # ═══════════════════════════════════════════════════════
     # 插件发现 — 动态探测已安装增强插件及其管理页面

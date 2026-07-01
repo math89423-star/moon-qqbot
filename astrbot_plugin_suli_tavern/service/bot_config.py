@@ -800,6 +800,42 @@ class BotConfigService:
         """获取指定 bot 的工具冷却秒数 (per-bot 可配, 默认 60)。"""
         return int(self.get_tool_setting(bot_id, "tool_cooldown_seconds") or 60)
 
+    # ── 管理员 QQ ──────────────────────────────────────────
+
+    def get_super_admin_qq(self) -> int:
+        """获取超级管理员 QQ 号。未配置时返回 0。"""
+        val = self._db.get_config("super_admin_qq", "0")
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
+    def set_super_admin_qq(self, qq: int) -> None:
+        """设置超级管理员 QQ 号。"""
+        self._db.set_config("super_admin_qq", str(qq))
+        logger.info("超级管理员 QQ 已更新: %d", qq)
+
+    def get_admin_qq_ids(self) -> list[int]:
+        """获取全局管理员 QQ 号列表。未配置时返回空列表。"""
+        val = self._db.get_config("admin_qq_ids", "")
+        if not val:
+            return []
+        ids: list[int] = []
+        for part in val.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    ids.append(int(part))
+                except (ValueError, TypeError):
+                    pass
+        return ids
+
+    def set_admin_qq_ids(self, qq_ids: list[int]) -> None:
+        """设置全局管理员 QQ 号列表。"""
+        val = ",".join(str(q) for q in qq_ids)
+        self._db.set_config("admin_qq_ids", val)
+        logger.info("全局管理员 QQ 列表已更新: %s", val)
+
     # ── 通用配置 ──────────────────────────────────────────
 
     def get(self, key: str, default: str = "") -> str:

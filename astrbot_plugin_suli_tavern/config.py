@@ -852,14 +852,14 @@ class Config(BaseModel):
 
     # 全局管理员 QQ 号列表
     admin_qq_ids: list[int] = Field(
-        default_factory=lambda: [824941143],
-        description="全局管理员 QQ 号列表",
+        default_factory=list,
+        description="全局管理员 QQ 号列表 (通过 Web 管理面板 /api/admin/admin-qq 配置)",
     )
 
     # 唯一超级管理员 QQ 号 (角色扮演中称呼为「主人」，其他用户称呼为「小可爱」)
     super_admin_qq: int = Field(
-        default=824941143,
-        description="唯一超级管理员 QQ 号，角色扮演中享有「主人」称呼特权",
+        default=0,
+        description="唯一超级管理员 QQ 号 (通过 Web 管理面板 /api/admin/admin-qq 配置)，角色扮演中享有「主人」称呼特权",
     )
 
     # 同群对照 bot () 的 QQ 号 — 其消息不应触发暮恩的管线
