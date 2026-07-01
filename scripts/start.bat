@@ -1,7 +1,9 @@
 @echo off
 chcp 65001 >nul
 
-set PROJECT_DIR=%~dp0..
+pushd %~dp0..
+set PROJECT_DIR=%CD%
+popd
 
 if not exist "%PROJECT_DIR%\.venv" (
     echo [错误] 未找到虚拟环境，请先运行 deploy.bat
