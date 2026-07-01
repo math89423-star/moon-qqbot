@@ -8,12 +8,13 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}========================================${NC}"
-echo -e "${CYAN}  astrbot-moon 一键安装脚本${NC}"
+echo -e "${CYAN}  moon-qqbot 一键安装脚本${NC}"
 echo -e "${CYAN}========================================${NC}"
 echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+VENV_DIR="$PROJECT_DIR/.venv"
 
 # ── 检查 Python ──
 echo -e "${YELLOW}[检查] Python 环境...${NC}"
@@ -42,9 +43,23 @@ echo "QQ=$QQ_NUMBER" > "$PROJECT_DIR/.env"
 echo "BOT_QQ_MAIN=$QQ_NUMBER" >> "$PROJECT_DIR/.env"
 echo -e "${GREEN}  QQ 号已保存 ✓${NC}"
 
+# ── 创建虚拟环境 ──
+echo ""
+echo -e "${YELLOW}[1/5] 创建 Python 虚拟环境...${NC}"
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+    echo -e "${GREEN}  虚拟环境已创建 ✓${NC}"
+else
+    echo -e "${GREEN}  虚拟环境已存在，跳过${NC}"
+fi
+
+source "$VENV_DIR/bin/activate"
+pip install -r "$PROJECT_DIR/requirements.txt" -q
+echo -e "${GREEN}  依赖已安装 ✓${NC}"
+
 # ── 安装 AstrBot ──
 echo ""
-echo -e "${YELLOW}[1/4] 安装 AstrBot...${NC}"
+echo -e "${YELLOW}[2/5] 安装 AstrBot...${NC}"
 ASTRBOT_DIR="$PROJECT_DIR/AstrBot"
 if [ ! -d "$ASTRBOT_DIR" ]; then
     git clone https://github.com/Soulter/AstrBot.git "$ASTRBOT_DIR"
@@ -54,12 +69,12 @@ else
 fi
 
 cd "$ASTRBOT_DIR"
-pip3 install -r requirements.txt -q
+pip install -r requirements.txt -q
 echo -e "${GREEN}  AstrBot 依赖已安装 ✓${NC}"
 
 # ── 部署插件 ──
 echo ""
-echo -e "${YELLOW}[2/4] 部署插件...${NC}"
+echo -e "${YELLOW}[3/5] 部署插件...${NC}"
 PLUGIN_DIR="$ASTRBOT_DIR/data/plugins"
 mkdir -p "$PLUGIN_DIR"
 
@@ -79,7 +94,7 @@ echo -e "${GREEN}  插件部署完成 ✓${NC}"
 
 # ── 复制角色卡 ──
 echo ""
-echo -e "${YELLOW}[3/4] 复制角色卡...${NC}"
+echo -e "${YELLOW}[4/5] 复制角色卡...${NC}"
 CHAR_SRC="$PROJECT_DIR/characters"
 CHAR_DST="$ASTRBOT_DIR/data/plugins/astrbot_plugin_suli_tavern/characters"
 mkdir -p "$CHAR_DST"
@@ -90,7 +105,7 @@ fi
 
 # ── 安装 NapCat ──
 echo ""
-echo -e "${YELLOW}[4/4] 安装 NapCat...${NC}"
+echo -e "${YELLOW}[5/5] 安装 NapCat...${NC}"
 echo -e "${CYAN}  NapCat 需要单独安装。请选择安装方式:${NC}"
 echo "  1) Docker (推荐)"
 echo "  2) 手动安装"
@@ -126,9 +141,7 @@ echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "下一步:"
 echo -e "  1. 确保 NapCat 已启动并登录 QQ 号 ${CYAN}$QQ_NUMBER${NC}"
-echo -e "  2. 启动 AstrBot: ${CYAN}cd AstrBot && python3 main.py${NC}"
+echo -e "  2. 启动 AstrBot: ${CYAN}bash scripts/start.sh${NC}"
 echo -e "  3. 打开管理面板: ${CYAN}http://localhost:6190${NC}"
 echo -e "  4. 在面板中配置 LLM API (OpenAI 兼容接口)"
-echo ""
-echo -e "快速启动: ${CYAN}bash scripts/start.sh${NC}"
 echo ""

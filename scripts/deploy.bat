@@ -3,9 +3,11 @@ chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 echo ========================================
-echo   astrbot-moon 一键安装脚本
+echo   moon-qqbot 一键安装脚本
 echo ========================================
 echo.
+
+set PROJECT_DIR=%~dp0..
 
 REM ── 检查 Python ──
 echo [检查] Python 环境...
@@ -43,8 +45,21 @@ echo BOT_QQ_MAIN=%QQ_NUMBER%>> .env
 echo   QQ 号已保存 ^^!
 echo.
 
+REM ── 创建虚拟环境 ──
+echo [1/5] 创建 Python 虚拟环境...
+if not exist ".venv" (
+    python -m venv .venv
+    echo   虚拟环境已创建 ^^!
+) else (
+    echo   虚拟环境已存在，跳过
+)
+call .venv\Scripts\activate.bat
+pip install -r requirements.txt -q
+echo   依赖已安装 ^^!
+echo.
+
 REM ── 安装 AstrBot ──
-echo [1/4] 安装 AstrBot...
+echo [2/5] 安装 AstrBot...
 if not exist "AstrBot" (
     git clone https://github.com/Soulter/AstrBot.git
     echo   AstrBot 已克隆 ^^!
@@ -58,7 +73,7 @@ cd ..
 echo.
 
 REM ── 部署插件 ──
-echo [2/4] 部署插件...
+echo [3/5] 部署插件...
 if not exist "AstrBot\data\plugins" mkdir "AstrBot\data\plugins"
 
 for /d %%i in (astrbot_plugin_*) do (
@@ -76,7 +91,7 @@ echo   插件部署完成 ^^!
 echo.
 
 REM ── 复制角色卡 ──
-echo [3/4] 复制角色卡...
+echo [4/5] 复制角色卡...
 set CHAR_DST=AstrBot\data\plugins\astrbot_plugin_suli_tavern\characters
 if not exist "%CHAR_DST%" mkdir "%CHAR_DST%"
 if exist "characters\*.json" (
@@ -86,7 +101,7 @@ if exist "characters\*.json" (
 echo.
 
 REM ── 安装 NapCat ──
-echo [4/4] 安装 NapCat...
+echo [5/5] 安装 NapCat...
 echo   NapCat 需要单独安装。
 echo   请访问: https://napcat.napneko.icu/
 echo   推荐使用 NapCatWin (Windows GUI 版本)
@@ -100,10 +115,8 @@ echo ========================================
 echo.
 echo 下一步:
 echo   1. 启动 NapCatWin 并登录 QQ 号 %QQ_NUMBER%
-echo   2. 启动 AstrBot: cd AstrBot ^&^& python main.py
+echo   2. 启动 AstrBot: scripts\start.bat
 echo   3. 打开管理面板: http://localhost:6190
 echo   4. 在面板中配置 LLM API (OpenAI 兼容接口)
-echo.
-echo 快速启动: scripts\start.bat
 echo.
 pause
