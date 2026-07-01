@@ -70,6 +70,7 @@ fi
 
 if [ "$USE_VENV" -eq 1 ]; then
     source "$VENV_DIR/bin/activate"
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || true
     if [ "$VENV_NEW" -eq 1 ]; then
         echo "  正在安装项目依赖..."
 pip install -r "$PROJECT_DIR/requirements.txt"
@@ -78,9 +79,9 @@ pip install -r "$PROJECT_DIR/requirements.txt"
         echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
     fi
 else
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || true
     echo "  正在安装项目依赖..."
     pip3 install -r "$PROJECT_DIR/requirements.txt" 2>/dev/null || pip install -r "$PROJECT_DIR/requirements.txt"
-pip install -r "$PROJECT_DIR/requirements.txt"
     echo -e "${GREEN}  依赖已安装 (全局) ✓${NC}"
 fi
 

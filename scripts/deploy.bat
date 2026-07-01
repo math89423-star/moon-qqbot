@@ -63,6 +63,7 @@ if not exist ".venv" (
     set VENV_NEW=0
 )
 call .venv\Scripts\activate.bat
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple >nul 2>&1
 if "!VENV_NEW!"=="1" (
     echo   正在安装依赖...
 pip install -r requirements.txt
