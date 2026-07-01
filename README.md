@@ -171,7 +171,15 @@ scripts\start.bat
 bash scripts/start.sh
 ```
 
-启动后访问 **`http://localhost:5190`** 进入管理面板 🌑
+### 🔑 首次启动后
+
+启动后还需要完成两步，暮恩才能真正开始工作：
+
+**① QQ 登录** — 访问 **`http://localhost:6099`**，用手机 QQ 扫描二维码登录机器人账号。
+
+**② 配置 LLM** — 访问 **`http://localhost:5190`** 进入管理面板，在「机器人配置」中填入 LLM API 信息（详见下方 ⚙️ 配置 LLM）。
+
+> ⚠️ 这两步缺一不可——不登录 QQ 机器人就收不到消息，不配 LLM 机器人就不知道怎么回。
 
 <details>
 <summary>🐱 NapCatQQ 自动下载失败？点我查看手动方案</summary>
