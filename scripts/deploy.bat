@@ -63,10 +63,10 @@ if not exist ".venv" (
     set VENV_NEW=0
 )
 call .venv\Scripts\activate.bat
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple >nul 2>&1
+python -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple >nul 2>&1
 if "!VENV_NEW!"=="1" (
     echo   正在安装依赖...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
     echo   依赖已安装 ^^!
 ) else (
     echo   依赖跳过 (虚拟环境已存在)
@@ -85,7 +85,7 @@ if not exist "AstrBot" (
     echo   AstrBot 已克隆 ^^!
     cd AstrBot
     echo   正在安装依赖...
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
     if errorlevel 1 (
         echo   [错误] AstrBot 依赖安装失败
         pause

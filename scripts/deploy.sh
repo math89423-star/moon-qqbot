@@ -73,7 +73,7 @@ if [ "$USE_VENV" -eq 1 ]; then
     pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || true
     if [ "$VENV_NEW" -eq 1 ]; then
         echo "  正在安装项目依赖..."
-pip install -r "$PROJECT_DIR/requirements.txt"
+python3 -m pip install -r "$PROJECT_DIR/requirements.txt"
         echo -e "${GREEN}  依赖已安装 ✓${NC}"
     else
         echo -e "${GREEN}  依赖跳过 (虚拟环境已存在)${NC}"
@@ -81,7 +81,7 @@ pip install -r "$PROJECT_DIR/requirements.txt"
 else
     pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null || true
     echo "  正在安装项目依赖..."
-    pip3 install -r "$PROJECT_DIR/requirements.txt" 2>/dev/null || pip install -r "$PROJECT_DIR/requirements.txt"
+    pip3 install -r "$PROJECT_DIR/requirements.txt" 2>/dev/null || python3 -m pip install -r "$PROJECT_DIR/requirements.txt"
     echo -e "${GREEN}  依赖已安装 (全局) ✓${NC}"
 fi
 
@@ -96,7 +96,7 @@ if [ ! -d "$ASTRBOT_DIR" ]; then
     fi
     cd "$ASTRBOT_DIR"
     echo "  正在安装 AstrBot 依赖..."
-    pip install -r requirements.txt
+    python3 -m pip install -r requirements.txt
     echo -e "${GREEN}  AstrBot 已克隆 + 依赖已安装 ✓${NC}"
 else
     echo -e "${GREEN}  AstrBot 已存在，跳过克隆和依赖安装${NC}"
