@@ -58,11 +58,13 @@ async def main() -> None:
     await webui.start()
     logger.info("管理面板已就绪: http://localhost:%d", args.port)
 
-    # 保持运行直到收到 SIGTERM
     stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop_event.set)
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop_event.set)
+    except NotImplementedError:
+        pass
     await stop_event.wait()
 
     logger.info("正在关闭...")
