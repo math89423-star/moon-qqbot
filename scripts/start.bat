@@ -1,11 +1,10 @@
 @echo off
-chcp 65001 >nul
 
 cd /d "%~dp0.."
 set PROJECT_DIR=%CD%
 
 if not exist "AstrBot\main.py" (
-    echo [错误] 未找到 AstrBot 目录，请先运行 scripts\deploy.bat
+    echo [ERROR] AstrBot not found. Run scripts\deploy.bat first.
     pause
     exit /b 1
 )
@@ -18,28 +17,28 @@ if exist ".env" (
     )
 )
 
-REM ── 启动 NapCatQQ ──
+REM -- Launch NapCatQQ --
 set NAPCAT_LAUNCHER=%PROJECT_DIR%\NapCatQQ\launcher.bat
 if exist "%NAPCAT_LAUNCHER%" (
-    echo 正在启动 NapCatQQ...
-    echo   管理面板: http://localhost:6099
+    echo Launching NapCatQQ...
+    echo   WebUI: http://localhost:6099
     start "NapCatQQ" "%NAPCAT_LAUNCHER%"
-    echo   等待 NapCat 初始化 ^(5 秒^)...
+    echo   Waiting for NapCat init ^(5s^)...
     timeout /t 5 /nobreak >nul
-    echo   NapCat 已启动，请扫码登录 QQ %BOT_QQ_MAIN%
+    echo   NapCat started. Scan QR to login QQ %BOT_QQ_MAIN%
     echo.
 ) else (
-    echo [警告] 未找到 NapCatQQ，请先运行 scripts\deploy.bat
-    echo   QQ 消息将无法收发！
+    echo [WARNING] NapCatQQ not found. Run scripts\deploy.bat first.
+    echo   QQ messages will NOT work!
     echo.
 )
 
 set ROOT=%CD%
-echo 正在启动管理面板: http://localhost:5190
+echo Starting admin panel: http://localhost:5190
 start "moon-panel" cmd /k "cd /d "%ROOT%\AstrBot" && "%ROOT%\.venv\Scripts\python.exe" "%ROOT%\astrbot_plugin_suli_tavern\panel_main.py" --port 5190"
 
 cd AstrBot
-echo 正在启动 AstrBot...
+echo Starting AstrBot...
 echo QQ: %BOT_QQ_MAIN%
 echo.
 python main.py
