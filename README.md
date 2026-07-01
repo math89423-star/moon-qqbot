@@ -1,6 +1,6 @@
 # astrbot-moon
 
-基于 [AstrBot](https://github.com/Soulter/AstrBot) + [NapCat](https://napcat.napneko.icu/) 的 QQ 机器人插件套件，一键部署，开箱即用。
+基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) + [NapCat](https://napcat.napneko.icu/) 的 QQ 机器人插件套件，一键部署，开箱即用。
 
 ## 功能特性
 

@@ -75,11 +75,21 @@ echo.
 REM ── 安装 AstrBot ──
 echo [2/5] AstrBot 框架...
 if not exist "AstrBot" (
-    git clone https://github.com/Soulter/AstrBot.git
+    git clone https://github.com/AstrBotDevs/AstrBot.git
+    if errorlevel 1 (
+        echo   [错误] AstrBot 克隆失败，请检查网络连接
+        pause
+        exit /b 1
+    )
     echo   AstrBot 已克隆 ^^!
     cd AstrBot
     echo   正在安装依赖...
-pip install -r requirements.txt
+    pip install -r requirements.txt
+    if errorlevel 1 (
+        echo   [错误] AstrBot 依赖安装失败
+        pause
+        exit /b 1
+    )
     echo   AstrBot 依赖已安装 ^^!
     cd ..
 ) else (

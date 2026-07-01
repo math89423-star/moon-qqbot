@@ -89,7 +89,10 @@ echo ""
 echo -e "${YELLOW}[2/5] AstrBot 框架...${NC}"
 ASTRBOT_DIR="$PROJECT_DIR/AstrBot"
 if [ ! -d "$ASTRBOT_DIR" ]; then
-    git clone https://github.com/Soulter/AstrBot.git "$ASTRBOT_DIR"
+    if ! git clone https://github.com/AstrBotDevs/AstrBot.git "$ASTRBOT_DIR"; then
+        echo -e "${RED}[错误] AstrBot 克隆失败，请检查网络连接${NC}"
+        exit 1
+    fi
     cd "$ASTRBOT_DIR"
     echo "  正在安装 AstrBot 依赖..."
     pip install -r requirements.txt
