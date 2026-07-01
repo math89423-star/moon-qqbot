@@ -342,6 +342,74 @@ def get_llm_semaphore(bot_id: str = "", max_calls: int = 3) -> asyncio.Semaphore
 # LLM 决定沉默时的回复标记
 SILENCE_MARKER = "[静默]"
 
+def _inject_knowledge(messages: list[dict], group_id: str = "") -> int:
+    """知识库 Pre-inject: 用最近用户消息检索本地知识库，注入到 system prompt。
+
+    无 LLM 调用 — 纯关键词分词检索，~5-20ms。
+    返回注入的条数 (0 = 无结果或跳过)。
+    """
+    try:
+        from astrbot_plugin_suli_services import get_knowledge_base as _get_kb
+    except Exception as _e:
+        logger.warning("知识库 pre-inject: import 失败: %s", _e)
+        return 0
+
+    # 提取 query: 从格式化 user 消息中提取最后一条实际聊天内容
+    # 格式: "Name[QQ:...] [主人] (HH:MM): 消息内容"
+    import re as _re_query
+    query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user" and m.get("content"):
+            raw = str(m["content"]).strip()
+            for line in reversed(raw.split("\n")):
+                line = line.strip()
+                # 匹配: "): " 分隔符 (时间在括号里, 格式 "(HH:MM): 消息")
+                if "): " in line:
+                    query = line.split("): ", 1)[-1].strip()
+                    break
+            break
+    if not query or len(query) < 4:
+        logger.info("知识库 pre-inject: query 为空或太短 (%d chars), 跳过", len(query))
+        return 0
+    query = query[:200]
+
+    try:
+        kb = _get_kb()
+        results = kb.search(query, top_n=3)
+    except Exception as _e:
+        logger.warning("知识库 pre-inject: 搜索异常: %s", _e)
+        return 0
+
+    if not results:
+        logger.info("知识库 pre-inject: query=\"%.50s\" → 无结果", query)
+        return 0
+
+    # 格式化注入 — 作为独立 system message 插在 message[0] (静态缓存) 之后
+    lines = [
+        "[系统指令] 以下本地知识库内容可能与用户问题相关——优先参考回答。"
+        "如果内容明显不匹配（比如同名但来自不同作品），再正常追问确认。",
+        f"匹配「{query[:80]}」({len(results)} 条):",
+    ]
+    for i, section in enumerate(results, 1):
+        title = section.split("\n")[0] if section else "(空)"
+        body = section[:600]
+        lines.append(f"\n── {i}. {title} ──")
+        lines.append(body)
+    lines.append("── 以上来自本地知识库 ——")
+
+    kb_msg = {"role": "system", "content": "\n".join(lines)}
+
+    # 插在第一条 system 之后 (message[0] 保持不变 → 缓存命中 ✅)
+    messages.insert(1, kb_msg)
+
+    if group_id:
+        logger.info(
+            "群 %s: 知识库 pre-inject: query=\"%.50s\" → %d 条",
+            group_id, query, len(results),
+        )
+    return len(results)
+
+
 # ── 拒绝反应表情包 ──
 _REJECTION_STICKER_COOLDOWN = 300  # per-group: 5 分钟内最多发一个拒绝表情包
 _REJECTION_STICKER_TAG: dict[str, str] = {
@@ -4730,8 +4798,21 @@ class GroupChatScheduler:
                 except Exception:
                     pass
 
-                # 能量消耗: 每次成功回复扣减
-                self._update_energy(ctx, did_reply=True)
+                # 能量消耗: 按 token + 工具轮数计算
+                try:
+                    from ..intelligence.tools import get_last_energy_stats
+                    _stats = get_last_energy_stats(self._current_bot_id or "")
+                except Exception:
+                    _stats = {}
+                _new_tokens = (
+                    _stats.get("total_in", 0) - _stats.get("total_cache_hit", 0)
+                    + _stats.get("total_out", 0)
+                ) if _stats else 0
+                self._update_energy(
+                    ctx, did_reply=True,
+                    total_tokens=_new_tokens,
+                    tool_rounds=_stats.get("tool_rounds", 0) if _stats else 0,
+                )
 
                 # ── 关注槽加热 (E3): bot 回复后 — 替换旧 _update_thread ──
                 if trigger_reason in ("mention", "nickname", "reply", "thread_continuation"):
@@ -5454,6 +5535,33 @@ class GroupChatScheduler:
             _gate_suggested_tools = list(judge_decision.suggested_tools or [])
             _gate_intent_type = judge_decision.intent_type or ""
 
+        # ── Reaction 约束: Gate 判为纯反应 → 回复应极简, 不猜测图片/表情包内容 ──
+        if judge_decision is not None and _gate_intent_type == "reaction":
+            _reaction_note = (
+                "\n\n[系统指令] 本轮 Gate 判定为纯反应 (reaction)。"
+                "对方可能只发了表情包/图片/极短附和——不是在跟你对话，只是在表达情绪。"
+                "回复极简：一个表情包或极短句（最多1句）即可。"
+                "★ 铁律: 不要追问「这是什么」「你想说什么」，不要猜测图片内容，不要延伸话题。"
+                "回完就停——不需要把天聊下去。"
+            )
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "system":
+                    messages[i]["content"] = str(messages[i]["content"]) + _reaction_note
+                    break
+
+        # ── 知识库 Pre-inject: 自动检索本地知识库 (零额外 LLM 调用, ~5-20ms) ──
+        _inject_knowledge(messages, group_id)
+
+        # ── 工具闸: 只给 LLM Gate 建议的工具 + 常驻豁免工具 ──
+        # Gate 没建议 → LLM 看不到 → 不会滥调 (send_sticker/parse_forwarded_message 始终可用)
+        if _tools_list and _gate_suggested_tools is not None:
+            _exempt = {"send_sticker", "parse_forwarded_message", "search_knowledge"}
+            _gate_set = set(_gate_suggested_tools) | _exempt
+            _tools_list = [
+                t for t in _tools_list
+                if t.get("function", {}).get("name", "") in _gate_set
+            ]
+
         return await run_tool_loop(
             tavern=self._tavern,
             messages=messages,
@@ -5536,8 +5644,17 @@ class GroupChatScheduler:
 
     # ── 能量疲劳值 (P1.5, from Heartflow) ──────────────
 
-    def _update_energy(self, ctx: GroupChatContext, did_reply: bool = False) -> float:
+    def _update_energy(
+        self, ctx: GroupChatContext, did_reply: bool = False,
+        total_tokens: int = 0, tool_rounds: int = 0,
+    ) -> float:
         """更新 bot 能量疲劳值 — 回复消耗 / 静默恢复 / 隔日补贴。
+
+        消耗公式: base × token_multiplier + tool_rounds × tool_cost
+          - base_cost = 0.04 (基础扣减)
+          - token_multiplier: ≤4000→1.0  ≤10000→1.5  >10000→2.0
+            (只计"新"token: total_in - cache_hit + total_out)
+          - tool_cost_per_round = 0.015
 
         返回更新后的 energy 值 (0.1~1.0)。
         """
@@ -5564,14 +5681,28 @@ class GroupChatScheduler:
             recovery_rate = getattr(self._config, "energy_recovery_per_minute", 0.004)
             ctx.energy = min(1.0, ctx.energy + elapsed_minutes * recovery_rate)
 
-        # ── 回复消耗 ──
+        # ── 回复消耗: 次数 × token系数 × 工具系数 ──
         if did_reply:
-            decay = getattr(self._config, "energy_decay_per_reply", 0.1)
+            if total_tokens > 0:
+                if total_tokens <= 4000:
+                    token_mult = 1.0
+                elif total_tokens <= 10000:
+                    token_mult = 1.5
+                else:
+                    token_mult = 2.0
+                tool_cost = tool_rounds * 0.015
+                base_cost = 0.04
+                decay = base_cost * token_mult + tool_cost
+                decay = min(decay, 0.3)  # 封顶 0.3 — 防止极端情况一次耗尽
+            else:
+                # 无统计时回退到固定扣减
+                decay = getattr(self._config, "energy_decay_per_reply", 0.08)
+
             old = ctx.energy
             ctx.energy = max(0.1, ctx.energy - decay)
             logger.info(
-                "群 %d: 能量消耗 (reply) %.2f → %.2f (-%.2f)",
-                ctx.group_id, old, ctx.energy, decay,
+                "群 %d: 能量消耗 (reply) %.2f → %.2f (-%.3f) tokens=%d tool_rounds=%d",
+                ctx.group_id, old, ctx.energy, decay, total_tokens, tool_rounds,
             )
 
         ctx.energy_updated_at = now

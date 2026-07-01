@@ -196,8 +196,7 @@ class BotIdentityService:
                 icon = data.get("icon", "🐍" if "moon" in card_name else "🤖")
                 color = data.get("color", "#4ecca3" if "moon" in card_name else "#666666")
                 llm_slots = data.get("llm_slots", [])
-                if not llm_slots and "" in card_name:
-                    llm_slots = ["llm_lite", "llm_pro", "llm_gate"]
+                # 单 bot 架构 — moon 不需要额外的 llm_slots 覆盖
 
                 metadata = {
                     "icon": icon,

@@ -1545,7 +1545,13 @@ class ConfigWebUI:
             plugins: list[dict] = []
 
             # suli_meme — 表情包管理
+            # 检测顺序: (1) AstrBot data/plugins (2) 兄弟目录 (纯净包分发版)
             meme_dir = data_plugins / "astrbot_plugin_suli_meme"
+            if not meme_dir.is_dir():
+                # 回退: 检查与 tavern 同级的 meme 插件目录
+                sibling = Path(__file__).resolve().parent.parent.parent / "astrbot_plugin_suli_meme"
+                if sibling.is_dir():
+                    meme_dir = sibling
             if meme_dir.is_dir():
                 plugins.append({
                     "id": "suli_meme",

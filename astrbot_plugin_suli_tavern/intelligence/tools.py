@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextvars
+import copy
 import inspect
 import asyncio
 import json
@@ -507,6 +508,80 @@ def get_thread_summary_cache(bot_id: str) -> str:
 def clear_thread_summary_cache(bot_id: str) -> None:
     """清除 thread_summary 缓存 (per-bot)。"""
     _thread_summary_cache.pop(bot_id, None)
+
+
+def _strip_xml_tool_calls(content: str) -> str:
+    """剥离 LLM 幻输出的 XML tool_call 标签。
+
+    tool_choice=none 阻止 API 解析 tool_calls，但 DeepSeek 训练数据
+    含 XML 格式 → 行为惯性 → 模型仍可能将 XML 当作文本输出。
+    """
+    if '<tool_calls>' not in content and '<invoke' not in content and '<send_sticker' not in content:
+        return content
+    _cleaned = re.sub(
+        r'<tool_calls>.*?</tool_calls>',
+        '', content, flags=re.DOTALL,
+    )
+    _cleaned = re.sub(
+        r'</?[a-z_][a-z0-9_]*(?:\s+[a-z_]+="[^"]*")*\s*/?>',
+        '', _cleaned, flags=re.I,
+    )
+    _cleaned = _cleaned.strip()
+    if _cleaned != content:
+        logger.info(
+            "XML tool_call 标签已剥离: %d→%d 字",
+            len(content), len(_cleaned),
+        )
+    return _cleaned
+
+
+def _extract_thread_summary(content: str) -> str:
+    """从 LLM 回复中提取 <thread_summary> 标签，缓存，返回剥离后内容。
+
+    1. 提取标签内容 → 缓存 (供 group_chat.py 写入 conversation_session)
+    2. 剥离标签 → 防止泄漏到用户可见的回复中
+    """
+    if '<thread_summary>' not in content:
+        return content
+    _ts_match = re.search(
+        r'<thread_summary>(.*?)</thread_summary>',
+        content, re.DOTALL,
+    )
+    if _ts_match:
+        _ts_text = _ts_match.group(1).strip()
+        _bid = _current_bot_id.get()
+        if _ts_text and _bid:
+            set_thread_summary_cache(_bid, _ts_text)
+            logger.debug(
+                "<thread_summary> 已提取缓存: %.60s", _ts_text,
+            )
+    _ts_cleaned = re.sub(
+        r'<thread_summary>.*?</thread_summary>',
+        '', content, flags=re.DOTALL,
+    ).strip()
+    if _ts_cleaned != content:
+        logger.info(
+            "<thread_summary> 源头剥离: %d→%d 字",
+            len(content), len(_ts_cleaned),
+        )
+    return _ts_cleaned
+
+
+# ── 能量消耗统计缓存 (per-bot) ──
+# run_tool_loop 完成后将累计 token/tool 统计存入此缓存，
+# group_chat.py 读取后用于计算疲劳值消耗。
+_energy_stats_cache: dict[str, dict] = {}
+
+
+def set_energy_stats(bot_id: str, stats: dict) -> None:
+    """存入本轮 token/tool 统计 (per-bot)。"""
+    if bot_id:
+        _energy_stats_cache[bot_id] = stats
+
+
+def get_last_energy_stats(bot_id: str) -> dict:
+    """读取并清除本轮 token/tool 统计 (per-bot, 一次消费)。"""
+    return _energy_stats_cache.pop(bot_id, {})
 
 
 def _get_memory_ctx() -> dict:
@@ -2413,6 +2488,165 @@ TOOL_EXECUTORS: dict[str, callable] = {
 _active_tool_loops: set[str] = set()
 
 
+def _parse_xml_tool_calls(raw_content: str) -> list[dict] | None:
+    """从 LLM 文本输出中提取 XML 格式的工具调用，转为标准 tool_calls。
+
+    DeepSeek 训练数据含 XML tool_call 格式 → 行为惯性 →
+    tool_choice=none 阻止 API 解析后，模型仍可能在 content 中输出：
+        <tool_calls>
+        <invoke name="tool_name">
+        <parameter name="p1" string="true">v1</parameter>
+        </invoke>
+        </tool_calls>
+
+    本函数将其解析为 API 兼容的 tool_calls 列表，让现有执行逻辑复用。
+    返回 None 表示解析失败（格式不匹配或无可提取的工具）。
+    """
+    if not raw_content or '<invoke name="' not in raw_content:
+        return None
+    invoke_pattern = re.compile(
+        r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>',
+        re.DOTALL,
+    )
+    invokes = invoke_pattern.findall(raw_content)
+    if not invokes:
+        return None
+    tool_calls = []
+    for tool_name, invoke_body in invokes:
+        tool_name = tool_name.strip()
+        if not tool_name:
+            continue
+        param_pattern = re.compile(
+            r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>',
+            re.DOTALL,
+        )
+        params = param_pattern.findall(invoke_body)
+        args = {}
+        for pname, pvalue in params:
+            args[pname.strip()] = pvalue.strip()
+        call_id = f"xml_{tool_name}_{len(tool_calls)}"
+        tool_calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        })
+    return tool_calls or None
+
+
+# ── 检索结果压缩阈值 ──
+_COMPRESS_IF_CHARS = 3000    # 超过此长度触发 LLM 压缩
+_COMPRESS_TRUNCATE = 4000    # 压缩失败时的截断长度
+
+
+async def _compress_search_buffer(
+    tavern,  # duck-typing: .chat_with_tools(messages, tools, ...)
+    buffer: list[dict],
+    original_query: str,
+    model: str,
+    provider: str = "",
+    api_base: str = "",
+    api_key: str = "",
+    bot_id: str = "",
+    timeout: float = 20.0,
+) -> str:
+    """压缩检索结果 buffer 为精炼摘要，供 clean synthesis 使用。
+
+    Phase 3 of 四相分离: Search → Collect → Compress → Synthesize.
+
+    Args:
+        buffer: [{tool, args, result}, ...] — 原始检索结果
+        original_query: 用户原始问题，帮助 LLM 理解压缩目标
+        timeout: 压缩调用的超时秒数
+
+    Returns:
+        压缩后的摘要字符串。失败时回落为截断的原始文本。
+    """
+    # 1. 格式化为结构化文本
+    _parts: list[str] = []
+    for i, item in enumerate(buffer):
+        _tool = item.get("tool", "?")
+        _args = item.get("args", "{}")
+        _result = item.get("result", "")
+        _parts.append(
+            f"── 检索 {i + 1}: {_tool} ──\n"
+            f"参数: {_args}\n"
+            f"结果: {_result}"
+        )
+    _formatted = "\n\n".join(_parts)
+
+    # 2. 短内容直接返回
+    if len(_formatted) <= _COMPRESS_IF_CHARS:
+        logger.debug(
+            "检索 buffer %d 条 / %d 字 → 无需压缩，直接使用",
+            len(buffer), len(_formatted),
+        )
+        return _formatted
+
+    logger.info(
+        "检索 buffer %d 条 / %d 字 → 触发 LLM 压缩",
+        len(buffer), len(_formatted),
+    )
+
+    # 3. LLM 压缩调用
+    _hint = (
+        "[系统指令] 以下是多次检索的原始结果。请压缩为一份精炼摘要：\n"
+        "- 保留所有关键事实、数据、名称、链接（不要丢失信息）\n"
+        "- 去除冗余和重复内容\n"
+        "- 按主题组织，方便后续基于此信息回答用户问题\n"
+        "- 不要编造任何原文没有的信息\n"
+        "- 使用中文输出"
+    )
+    _msgs = [
+        {"role": "system", "content": _hint},
+        {
+            "role": "user",
+            "content": (
+                f"用户原始问题: {original_query}\n\n"
+                f"检索结果 ({len(buffer)} 条):\n{_formatted}"
+            ),
+        },
+    ]
+    try:
+        result = await asyncio.wait_for(
+            tavern.chat_with_tools(
+                _msgs,
+                tools=None,
+                tool_choice="none",
+                temperature=0.3,
+                max_tokens=2048,
+                provider=provider,
+                model=model,
+                extra_params={},
+                api_base=api_base,
+                api_key=api_key,
+                bot_id=bot_id,
+            ),
+            timeout=timeout,
+        )
+        content = (result.get("content") or "").strip()
+        if content:
+            logger.info(
+                "检索压缩完成: %d→%d 字 (%.0f%%)",
+                len(_formatted), len(content),
+                100 * len(content) / max(1, len(_formatted)),
+            )
+            return content
+    except TimeoutError:
+        logger.warning("检索压缩超时 (%.1fs)", timeout)
+    except Exception:
+        logger.warning("检索压缩失败", exc_info=True)
+
+    # 4. 回落: 截断
+    _truncated = _formatted[:_COMPRESS_TRUNCATE]
+    logger.warning(
+        "检索压缩回落截断: %d→%d 字", len(_formatted), len(_truncated),
+    )
+    return _truncated + "\n\n[压缩失败，已截断]"
+
+
 async def _try_emergency_summary(
     tavern, messages: list[dict], model: str,
     provider: str = "", api_base: str = "", api_key: str = "", bot_id: str = "",
@@ -2559,6 +2793,10 @@ async def _run_tool_loop_impl(
         _eff_max_tokens = max(max_tokens, 1024)
 
     _tools_used_this_loop = False  # 本轮是否真正调用了工具
+    _tool_round_count = 0  # 工具调用轮数 (用于能量消耗计算)
+    _total_input_tokens = 0  # 累计输入 token
+    _total_cache_hit = 0  # 累计缓存命中 token
+    _total_output_tokens = 0  # 累计输出 token
 
     # ── 防阻塞: 总超时 + 每轮超时 ──
     # deepseek-v4-pro 每轮 25-40s, 4+ 轮工具调用 → 120s 不够
@@ -2570,6 +2808,19 @@ async def _run_tool_loop_impl(
     if _tool_extra_params.get("reasoning_effort") in ("high", "max", "xhigh") and tools:
         _tool_extra_params["reasoning_effort"] = "low"
         logger.debug("工具循环: 降低 reasoning_effort → low (加速工具决策)")
+
+    # ── 四相分离: 保存循环前干净上下文 + 检索 buffer ──
+    # entry_messages 不含工具循环中追加的 assistant tool_calls / tool results,
+    # 供 Phase 4 clean synthesis 使用。深拷贝隔离后续 messages.append()。
+    _entry_messages = copy.deepcopy(messages)
+    # 提取用户原始问题 (最后一条 user role 消息)
+    _original_query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            _original_query = m.get("content", "")
+            break
+    _search_buffer: list[dict] = []       # 累积原始检索结果
+    _clean_synthesis_needed = False        # 工具使用后触发 clean synthesis
 
     # ── 注入 bot_id + admin_qq 到 tool_context, 让执行器能读取 per-bot 配置 ──
     if tool_context is None:
@@ -2631,30 +2882,44 @@ async def _run_tool_loop_impl(
 
         # ── 输出预算: 工具决策轮只需输出 JSON (<100 tokens),
         #     一旦使用过工具, 任何轮次都可能产出实质性回答 (LLM 不必等到最终轮),
-        #     此时必须给足 max_tokens → 否则含检索结果的详细回复会被 finish=length 截断 ──
+        #     此时必须给足 max_tokens → 否则含检索结果的详细回复会被 finish=length 截断
+        #     ★ reasoning_effort CoT 开销: medium≈1500 tokens, high+≈3000+
+        #       如果 max_tokens 只给 2048, CoT 吃掉大半 → 输出窗口≈0 → 空 content ──
         _round_max_tokens = _eff_max_tokens
         if _tools_used_this_loop:
             _round_max_tokens = max(_eff_max_tokens, 2048)
+            # reasoning_effort 需要额外预算覆盖 CoT 思考 token
+            _active_effort = _use_params.get("reasoning_effort") if _use_params else None
+            if _active_effort == "medium":
+                _round_max_tokens = max(_round_max_tokens, 4096)
+            elif _active_effort in ("high", "max", "xhigh"):
+                _round_max_tokens = max(_round_max_tokens, 8192)
             logger.debug(
-                "LLM 工具循环: 提升 max_tokens %d → %d (工具已使用, round=%d/%d)",
+                "LLM 工具循环: 提升 max_tokens %d → %d (工具已使用, round=%d/%d, effort=%s)",
                 _eff_max_tokens, _round_max_tokens, _round + 1, max_rounds + 1,
+                _active_effort or "none",
             )
 
         try:
             # ★ 日志全覆盖: 打印 LLM 收到的 prompt 和 tools
             _msg_snippet = str(messages)[:1500]
+            # 最终轮不传 tools: tool_choice=none 阻止 API 解析, 但模型仍能"看到"工具定义
+            # → 训练数据中的工具调用惯性 → 模型可能输出纯 tool_call XML 文本。
+            # 直接不传 tools → 模型看不见工具 → 没有诱惑 → 根治 XML 幻输出。
+            _round_tools = tools if not is_last else None
             _tool_names = [t.get("function", {}).get("name", "?") for t in tools] if tools else []
             logger.info(
                 "LLM 工具循环 round=%d/%d: model=%s tools=%s tool_choice=%s msgs_len=%d max_tokens=%d",
                 _round + 1, max_rounds + 1, model or "deepseek-v4-pro",
-                _tool_names, tool_choice, len(str(messages)), _round_max_tokens,
+                _tool_names if not is_last else ["(已剥离—最终轮)"],
+                tool_choice, len(str(messages)), _round_max_tokens,
             )
             logger.info("LLM messages: %s", _msg_snippet)
 
             result = await asyncio.wait_for(
                 tavern.chat_with_tools(
                     messages,
-                    tools=tools,
+                    tools=_round_tools,
                     tool_choice=tool_choice,
                     temperature=temperature,
                     max_tokens=_round_max_tokens,
@@ -2667,6 +2932,14 @@ async def _run_tool_loop_impl(
                 ),
                 timeout=_timeout,
             )
+            # ── 能量统计: 累计本轮 token 消耗 ──
+            try:
+                _usage = tavern.get_last_usage()
+                _total_input_tokens += _usage.get("input_tokens", 0)
+                _total_cache_hit += _usage.get("cache_hit_tokens", 0)
+                _total_output_tokens += _usage.get("output_tokens", 0)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             _elapsed = time.monotonic() - _loop_start
             logger.warning(
@@ -2685,8 +2958,26 @@ async def _run_tool_loop_impl(
             # 非最终轮: 跳过本轮工具调用, 继续下一轮
             continue
 
+        # ── XML tool_call 文本 → 标准 tool_calls 转换 ──────────
+        # tool_choice=none 时 API 不解析 tool_calls, 但 DeepSeek 训练数据含
+        # XML 格式 → 行为惯性 → 模型可能在 content 中输出纯 XML 工具调用文本。
+        # 非最终轮: 解析 XML → 合成标准 tool_calls → 复用下方工具执行逻辑。
+        # 最终轮: 不做此转换 (工具不应在最终轮执行), 由后续 XML 剥离 + 空内容保护处理。
+        if not result.get("tool_calls") and tools and not is_last:
+            _raw = result.get("content") or ""
+            if '<invoke name="' in _raw:
+                _synthetic = _parse_xml_tool_calls(_raw)
+                if _synthetic:
+                    logger.info(
+                        "LLM 输出 XML tool_call 文本 → 解析为 %d 个工具调用: %s",
+                        len(_synthetic),
+                        [tc["function"]["name"] for tc in _synthetic],
+                    )
+                    result = {**result, "tool_calls": _synthetic}
+
         # 有工具调用 → 执行 (最后一轮已禁工具, 此分支不会进入)
         if result.get("tool_calls") and tools and not is_last:
+            _tool_round_count += 1  # 能量统计
             tool_calls = result["tool_calls"]
             logger.info(
                 "LLM 调用工具: %s",
@@ -2717,9 +3008,17 @@ async def _run_tool_loop_impl(
 
             # 执行每个工具
             for tc in tool_calls:
+                _func_name = tc.get("function", {}).get("name", "")
+                _args_str = tc.get("function", {}).get("arguments", "{}")
                 tool_msg = await execute_tool_with_retry(
                     tc, max_retries=2, tool_context=tool_context, executors=executors,
                 )
+                # ★ 存原始结果到 buffer（压缩前），供 Phase 3 压缩使用
+                _search_buffer.append({
+                    "tool": _func_name,
+                    "args": _args_str,
+                    "result": tool_msg.get("content", ""),
+                })
                 # ── 压缩去抖动: 新结果追加前去冗余 (不碰已追加内容, 保 append-only) ──
                 tool_msg = _compress_tool_result(tool_msg, messages)
                 messages.append(tool_msg)
@@ -2740,61 +3039,260 @@ async def _run_tool_loop_impl(
                 _round + 1, max_rounds + 1,
                 is_last, bool(result.get("tool_calls")),
             )
-            return content
-
-        # ── 剥离 LLM 幻输出的 XML tool_call 标签 ──
-        # tool_choice=none 阻止 API 解析 <tool_calls>，但 LLM 仍可能将
-        # XML 格式当作文本输出（DeepSeek 训练数据含此格式 → 行为惯性）。
-        # 多行块 <tool_calls>...</tool_calls> + 行级标签 </?tag attr="val">
-        if '<tool_calls>' in content or '<invoke' in content:
-            _cleaned = re.sub(
-                r'<tool_calls>.*?</tool_calls>',
-                '', content, flags=re.DOTALL,
-            )
-            _cleaned = re.sub(
-                r'</?[a-z_][a-z0-9_]*(?:\s+[a-z_]+="[^"]*")*\s*/?>',
-                '', _cleaned, flags=re.I,
-            )
-            _cleaned = _cleaned.strip()
-            if _cleaned != content:
-                logger.info(
-                    "XML tool_call 标签已剥离: %d→%d 字",
-                    len(content), len(_cleaned),
+            # 最终轮 tool_choice=none 但模型仍产出 tool_calls (API 解析级)
+            # → 这些工具不会被执行 (is_last 门控) → content 为空。
+            # 若有已检索结果, 尝试紧急汇总; 否则回落礼貌提示。
+            if is_last and _tools_used_this_loop:
+                _emergency = await _try_emergency_summary(
+                    tavern, messages, model or "deepseek-v4-pro",
+                    provider, api_base, api_key, bot_id,
                 )
-                content = _cleaned
-
-        # ── 剥离 <thread_summary> 内部元数据标签 (源头防线) ──
-        # LLM 被指示在回复末尾输出 <thread_summary>...</thread_summary>，
-        # 但偶尔标签出现在开头或其他位置。此处:
-        #   1. 提取标签内容 → 缓存 (供 group_chat.py 写入 conversation_session)
-        #   2. 剥离标签 → 防止泄漏到用户可见的回复中
-        if '<thread_summary>' in content:
-            _ts_match = re.search(
-                r'<thread_summary>(.*?)</thread_summary>',
-                content, re.DOTALL,
+                if _emergency:
+                    set_energy_stats(bot_id, {
+                        "total_in": _total_input_tokens,
+                        "total_cache_hit": _total_cache_hit,
+                        "total_out": _total_output_tokens,
+                        "tool_rounds": _tool_round_count,
+                    })
+                    return _emergency
+            set_energy_stats(bot_id, {
+                "total_in": _total_input_tokens,
+                "total_cache_hit": _total_cache_hit,
+                "total_out": _total_output_tokens,
+                "tool_rounds": _tool_round_count,
+            })
+            return (
+                "搜了一圈信息但还是不太够…换个方式问我试试？"
+                if _tools_used_this_loop else
+                content
             )
-            if _ts_match:
-                _ts_text = _ts_match.group(1).strip()
-                _bid = _current_bot_id.get()
-                if _ts_text and _bid:
-                    set_thread_summary_cache(_bid, _ts_text)
-                    logger.debug(
-                        "<thread_summary> 已提取缓存: %.60s", _ts_text,
+        # ── 内容清理: XML 剥离 + thread_summary 提取 ──
+        content = _strip_xml_tool_calls(content)
+        content = _extract_thread_summary(content)
+
+        # ── 剥离后空内容保护 ──────────────────────────────────────
+        # tool_choice=none 阻止 API 解析 tool_calls，但 DeepSeek 训练数据
+        # 含 XML tool_call 格式 → 行为惯性 → 模型仍可能输出纯 XML。
+        # 上述 XML 剥离 + thread_summary 剥离后 content 可能变空。
+        if not content.strip():
+            logger.warning(
+                "LLM 返回内容经 XML/标签剥离后为空 (round=%d/%d, is_last=%s, tools_used=%s)",
+                _round + 1, max_rounds + 1, is_last, _tools_used_this_loop,
+            )
+            if is_last:
+                # 最终轮: 尝试紧急汇总已有检索结果，不浪费已查到的信息
+                if _tools_used_this_loop:
+                    _emergency = await _try_emergency_summary(
+                        tavern, messages, model or "deepseek-v4-pro",
+                        provider, api_base, api_key, bot_id,
                     )
-            _ts_cleaned = re.sub(
-                r'<thread_summary>.*?</thread_summary>',
-                '', content, flags=re.DOTALL,
-            ).strip()
-            if _ts_cleaned != content:
-                logger.info(
-                    "<thread_summary> 源头剥离: %d→%d 字",
-                    len(content), len(_ts_cleaned),
+                    if _emergency:
+                        set_energy_stats(bot_id, {
+                            "total_in": _total_input_tokens,
+                            "total_cache_hit": _total_cache_hit,
+                            "total_out": _total_output_tokens,
+                            "tool_rounds": _tool_round_count,
+                        })
+                        return _emergency
+                _fallback = (
+                    "搜了一圈但没找到合适的信息…换个方式问我试试？"
+                    if _tools_used_this_loop else
+                    "嗯…刚才想查点东西但信息不够，再问我一次？"
                 )
-                content = _ts_cleaned
+                set_energy_stats(bot_id, {
+                    "total_in": _total_input_tokens,
+                    "total_cache_hit": _total_cache_hit,
+                    "total_out": _total_output_tokens,
+                    "tool_rounds": _tool_round_count,
+                })
+                return _fallback
+            # 非最终轮: 还有剩余轮次可用，不浪费。跳过本轮继续循环。
+            # 模型在非最终轮输出纯 XML 文本 (非 API tool_calls) 是小概率事件，
+            # 但一旦发生不应直接退出循环。
+            if tools:
+                logger.warning(
+                    "非最终轮 XML 幻输出 → 跳过本轮, 继续循环 (剩余 %d 轮)",
+                    max_rounds - _round,
+                )
+                continue
+            # 无工具可用的非最终轮 → 无意义继续
+            return ""
 
+        # ── 工具已使用 + 最终轮 → 不直接返回污染上下文中的文本 ──
+        # 跳转到循环后的 clean synthesis 路径 (Phase 3+4)。
+        if is_last and _tools_used_this_loop:
+            logger.info(
+                "LLM 工具循环: 工具已使用 → 跳过污染上下文合成, "
+                "进入 clean synthesis (buffer=%d 条)",
+                len(_search_buffer),
+            )
+            _clean_synthesis_needed = True
+            break
+
+        set_energy_stats(bot_id, {
+            "total_in": _total_input_tokens,
+            "total_cache_hit": _total_cache_hit,
+            "total_out": _total_output_tokens,
+            "tool_rounds": _tool_round_count,
+        })
+        # ── 持久化: 非最终轮产出内容 + 使用过工具 → 写入知识库 ──
+        if _search_buffer and _original_query and content.strip():
+            try:
+                from astrbot_plugin_suli_services import add_web_result
+                _raw_items: list[dict[str, str]] = []
+                for _buf_entry in _search_buffer:
+                    if isinstance(_buf_entry, dict):
+                        _raw_items.append(_buf_entry)
+                add_web_result(_original_query, _raw_items, synthesized=content)
+            except Exception:
+                logger.debug("知识库持久化跳过 (非关键): %s", _original_query[:40], exc_info=True)
         return content
 
+    # ── Clean Synthesis: Phase 3 (压缩) + Phase 4 (干净合成) ──
+    # 仅在工具被实际使用且模型未在非最终轮产出有效文本时触发。
+    # 使用循环前的干净上下文 (_entry_messages) + 压缩后的检索结果,
+    # 避免工具循环中累积的 assistant tool_calls / tool results 污染合成上下文。
+    if _clean_synthesis_needed and _search_buffer:
+        logger.info(
+            "Clean synthesis: buffer=%d 条, entry_msgs=%d",
+            len(_search_buffer), len(_entry_messages),
+        )
+
+        # ── 超时预算: 复用循环剩余时间 ──
+        _remaining = _loop_deadline - time.monotonic()
+        _compress_timeout = min(20.0, max(10.0, _remaining * 0.3))
+        _synthesis_timeout = max(20.0, _remaining - _compress_timeout - 5.0)
+        logger.debug(
+            "Clean synthesis 超时预算: compress=%.1fs synthesis=%.1fs (剩余 %.1fs)",
+            _compress_timeout, _synthesis_timeout, _remaining,
+        )
+
+        # Phase 3: 压缩检索 buffer
+        _compressed = await _compress_search_buffer(
+            tavern, _search_buffer, _original_query,
+            model=model or "deepseek-v4-pro",
+            provider=provider, api_base=api_base, api_key=api_key,
+            bot_id=bot_id, timeout=_compress_timeout,
+        )
+
+        # Phase 4: 干净上下文合成
+        _synthesis_msgs = copy.deepcopy(_entry_messages)
+        _synthesis_msgs.append({
+            "role": "system",
+            "content": (
+                "[系统提示] 以下是本轮搜索的汇总结果。"
+                "请基于这些信息回答用户的问题。\n"
+                "如果信息不足，请诚实告知用户，不要编造。"
+                "保持角色性格和语气。\n\n"
+                "=== 检索结果汇总 ===\n"
+                f"{_compressed}"
+            ),
+        })
+
+        try:
+            # ── Clean synthesis 输出预算: 按 reasoning_effort + buffer 大小分级
+            _buf_chars = len(_compressed) if _compressed else 0
+            _synth_effort = extra_params.get("reasoning_effort") if extra_params else None
+            if _synth_effort in ("high", "max", "xhigh"):
+                _synth_budget = max(8192, int(_buf_chars * 0.4))
+            elif _synth_effort == "medium":
+                _synth_budget = max(4096, int(_buf_chars * 0.3))
+            else:
+                _synth_budget = max(4096, int(_buf_chars * 0.2))
+            _synth_budget = min(_synth_budget, 8192)  # 硬上限: 极端情况下 ≈3000 字 ≈4 条消息
+            logger.debug(
+                "Clean synthesis 预算: effort=%s buf=%d chars → max_tokens=%d",
+                _synth_effort or "none", _buf_chars, _synth_budget,
+            )
+            _synthesis_result = await asyncio.wait_for(
+                tavern.chat_with_tools(
+                    _synthesis_msgs,
+                    tools=None,
+                    tool_choice="none",
+                    temperature=temperature,
+                    max_tokens=_synth_budget,
+                    provider=provider,
+                    model=model or "deepseek-v4-pro",
+                    extra_params=extra_params or {},
+                    api_base=api_base,
+                    api_key=api_key,
+                    bot_id=bot_id,
+                ),
+                timeout=_synthesis_timeout,
+            )
+            # 累计合成调用的能量统计
+            try:
+                _usage = tavern.get_last_usage()
+                _total_input_tokens += _usage.get("input_tokens", 0)
+                _total_cache_hit += _usage.get("cache_hit_tokens", 0)
+                _total_output_tokens += _usage.get("output_tokens", 0)
+            except Exception:
+                pass
+
+            content = _synthesis_result.get("content") or ""
+            # 清理: XML 剥离 + thread_summary 提取
+            content = _strip_xml_tool_calls(content)
+            content = _extract_thread_summary(content)
+
+            if content.strip():
+                logger.info(
+                    "Clean synthesis 完成: %d 字 (cache=%d)",
+                    len(content), _total_cache_hit,
+                )
+                # ── 持久化: 网页检索结果写入知识库, 供未来检索复用 ──
+                if _search_buffer and _original_query:
+                    try:
+                        from astrbot_plugin_suli_services import add_web_result
+                        # 从 search_buffer 提取原始结果
+                        _raw_items: list[dict[str, str]] = []
+                        for _buf_entry in _search_buffer:
+                            if isinstance(_buf_entry, dict):
+                                _raw_items.append(_buf_entry)
+                        add_web_result(_original_query, _raw_items, synthesized=content)
+                    except Exception:
+                        logger.debug("知识库持久化跳过 (非关键): %s", _original_query[:40], exc_info=True)
+                set_energy_stats(bot_id, {
+                    "total_in": _total_input_tokens,
+                    "total_cache_hit": _total_cache_hit,
+                    "total_out": _total_output_tokens,
+                    "tool_rounds": _tool_round_count,
+                })
+                return content
+        except TimeoutError:
+            logger.warning("Clean synthesis 超时 (%.1fs)", _synthesis_timeout)
+        except Exception:
+            logger.warning("Clean synthesis 失败", exc_info=True)
+
+        # 合成失败 → 回落: 用干净上下文 + 压缩结果做紧急汇总
+        _emergency_msgs = copy.deepcopy(_entry_messages)
+        _emergency_msgs.append({
+            "role": "system",
+            "content": f"以下是搜索结果 (可能不完整):\n{_compressed[:3000]}",
+        })
+        _emergency = await _try_emergency_summary(
+            tavern, _emergency_msgs, model or "deepseek-v4-pro",
+            provider, api_base, api_key, bot_id,
+        )
+        if _emergency:
+            set_energy_stats(bot_id, {
+                "total_in": _total_input_tokens,
+                "total_cache_hit": _total_cache_hit,
+                "total_out": _total_output_tokens,
+                "tool_rounds": _tool_round_count,
+            })
+            return _emergency
+
+        # 最终回落
+        set_energy_stats(bot_id, {
+            "total_in": _total_input_tokens,
+            "total_cache_hit": _total_cache_hit,
+            "total_out": _total_output_tokens,
+            "tool_rounds": _tool_round_count,
+        })
+        return "搜到一些信息但整理时出了点问题…换个方式问我试试？"
+
     # 理论不可达: 最后一轮 tool_choice=none 保证返回 text
+    # (clean synthesis 未触发时到达此处)
     logger.warning("LLM 工具调用超过最大轮数 %d (不应到达)", max_rounds)
     return "翻了翻工具箱但没找到合适的答案…要不要换个方式问我？"
 
