@@ -1,0 +1,28 @@
+name: astrbot_plugin_suli_guards
+display_name: 粟藜 · 注入拦截与滥用检测
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: 粟藜安全守卫系统 — 预 LLM 注入拦截 + 滥用检测 + 恶意调教处置 + 同行隔离 + Bot 行为检测。纯库插件，供其他插件 import 使用。
+desc: 守卫系统：注入拦截、滥用检测、调教处置、同行隔离、Bot检测
+repo: https://github.com/math89423-star/suli_qqbot
+category: 安全
+tags:
+  - 安全
+  - 注入防护
+  - 滥用检测
+  - Bot检测
+help: |
+  本插件为纯库插件 (library plugin)，不注册任何命令或事件处理器。
+  提供以下可导入的守卫类:
+
+  - InjectionGuard  — 预 LLM 注入拦截 (59 条统一模式)
+  - AbuseGuard      — 滥用检测 (频率/重复/配额/线程深度)
+  - GroomingGuard   — 恶意调教处置 (记忆联动)
+  - PeerIsolation   — 外部 bot 内容隔离标注
+  - BotDetector     — Bot 行为检测 (滚动嫌疑分 + social_play)
+
+  用法: from astrbot_plugin_suli_guards import InjectionGuard
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

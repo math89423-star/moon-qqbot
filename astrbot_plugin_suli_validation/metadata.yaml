@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_validation
+display_name: 粟藜 · 回答交叉验证
+desc: "交叉验证编排器 — 用户质疑 bot 技术回答时自动查证 + 裁决 — 纯库插件，供其他 AstrBot 插件 import 使用"
+version: 1.0.0
+author: 粟藜

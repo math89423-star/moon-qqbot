@@ -1,0 +1,63 @@
+"""暮恩双轨情感系统 — 已提取至 astrbot_plugin_suli_emotion。
+
+本文件保持向后兼容 — 外部 import 路径不变。
+"""
+
+# 直接导入新插件，避免触发子模块 shim 的 DeprecationWarning
+from astrbot_plugin_suli_emotion import (
+    AffinityGates,
+    AffinityState,
+    EmotionEngine,
+    EmotionEvent,
+    MoodState,
+    UserRelation,
+    apply_emotion_events,
+    blacklist_add,
+    blacklist_remove,
+    can_generate_image,
+    can_use_tools,
+    can_use_vlm,
+    check_daily_image_limit,
+    check_daily_tools_limit,
+    check_daily_vlm_limit,
+    check_tool_cooldown,
+    get_blacklist,
+    get_user_relation,
+    record_image_generation,
+    record_tool_use,
+    record_tools_usage,
+    record_vlm_usage,
+    reset_user_relation,
+    save_user_relation,
+    set_user_nickname,
+    validate_nickname,
+)
+
+__all__ = [
+    "AffinityGates",
+    "AffinityState",
+    "EmotionEngine",
+    "EmotionEvent",
+    "MoodState",
+    "UserRelation",
+    "apply_emotion_events",
+    "blacklist_add",
+    "blacklist_remove",
+    "can_generate_image",
+    "can_use_tools",
+    "can_use_vlm",
+    "check_daily_image_limit",
+    "check_daily_tools_limit",
+    "check_daily_vlm_limit",
+    "check_tool_cooldown",
+    "get_blacklist",
+    "get_user_relation",
+    "record_image_generation",
+    "record_tool_use",
+    "record_tools_usage",
+    "record_vlm_usage",
+    "reset_user_relation",
+    "save_user_relation",
+    "set_user_nickname",
+    "validate_nickname",
+]

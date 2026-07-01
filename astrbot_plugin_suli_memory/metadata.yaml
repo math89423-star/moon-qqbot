@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_memory
+display_name: 粟藜 · 三层记忆蒸馏
+desc: "三层记忆蒸馏 — UserMemoryStore (daily) + CoreMemoryStore (core) + MemoryTierManager (编排) — 纯库插件，供其他 AstrBot 插件 import 使用"
+version: 1.0.0
+author: 粟藜

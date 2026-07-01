@@ -1,0 +1,8 @@
+{
+  "max_consecutive_newlines": {
+    "description": "最多保留连续换行数",
+    "type": "int",
+    "hint": "建议保持默认值 1",
+    "default": 1
+  }
+}

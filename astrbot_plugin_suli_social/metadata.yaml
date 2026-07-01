@@ -1,0 +1,7 @@
+name: astrbot_plugin_suli_social
+display_name: 粟藜 · 社会压力与选择性静默
+author: 粟藜
+category: AI 增强
+version: 1.0.0
+desc: 社会性生存 — InputClassifier 预筛选 + 自回复速率建模 + 社会压力感知 + 选择性静默。纯库插件，供 astrbot_plugin_suli_tavern import 使用。
+plugin_type: library

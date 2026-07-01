@@ -1,0 +1,8 @@
+name: astrbot_plugin_remove_blank_lines
+display_name: 粟藜 · 回复空行清理
+short_desc: 自动压缩机器人回复中的连续换行。
+desc: 在消息发送前检测 Plain 文本段，将连续空行压缩掉，避免回复中出现两段话之间多空一行。
+version: 1.0.0
+author: 粟藜
+repo: ""
+astrbot_version: ">=4.16,<5"

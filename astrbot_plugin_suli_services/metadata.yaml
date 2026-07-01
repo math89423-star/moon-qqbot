@@ -1,0 +1,28 @@
+name: astrbot_plugin_suli_services
+display_name: 粟藜 · 识图搜索与知识库
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: 粟藜基础服务层 — VLM 识图 + SearXNG 联网搜索 + 本地知识库检索。纯库插件，供其他插件 import 使用。
+desc: 服务层：VLM识图、联网搜索、知识库
+repo: https://github.com/math89423-star/suli_qqbot
+category: 基础设施
+tags:
+  - VLM
+  - 搜索
+  - 知识库
+  - 识图
+help: |
+  本插件为纯库插件 (library plugin)，不注册任何命令或事件处理器。
+
+  提供:
+    - vision:   describe_image_from_url / detect_image_intent / has_active_vlm
+    - web_search: web_search / format_web_results
+    - knowledge_base: KnowledgeBase / get_knowledge_base / tokenize
+
+  用法:
+    from astrbot_plugin_suli_services import web_search, KnowledgeBase
+    from astrbot_plugin_suli_services.vision import describe_image_from_url
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

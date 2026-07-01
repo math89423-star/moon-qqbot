@@ -1,0 +1,36 @@
+name: astrbot_plugin_suli_pipeline
+display_name: 粟藜 · 异步消息管线引擎
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: 粟藜可组合异步管线引擎 — Pipeline + PipelineStep + PipelineContext。纯抽象框架，零外部依赖。纯库插件，供其他插件 import 使用。
+desc: 管线引擎：可组合异步步骤编排器
+repo: https://github.com/math89423-star/suli_qqbot
+category: 基础设施
+tags:
+  - 管线
+  - 框架
+  - 编排
+help: |
+  本插件为纯库插件 (library plugin)，不注册任何命令或事件处理器。
+
+  提供:
+    - Pipeline       — 线性管线编排器，支持动态 add_step/remove_step
+    - PipelineStep   — 异步步骤抽象基类 (abc.ABC)
+    - PipelineContext — 步骤间共享的 dict-based 上下文
+    - PIPELINE_SILENCE — 短路标记常量
+
+  用法:
+    from astrbot_plugin_suli_pipeline import Pipeline, PipelineStep, PipelineContext
+
+    class MyStep(PipelineStep):
+        name = "my_step"
+        async def execute(self, ctx: PipelineContext) -> PipelineContext:
+            ...
+            return ctx
+
+    pipeline = Pipeline("my_pipeline", steps=[MyStep()])
+    result = await pipeline.run(ctx)
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

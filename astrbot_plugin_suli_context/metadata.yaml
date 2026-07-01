@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_context
+display_name: 粟藜 · 对话上下文预分析
+desc: 粟藜 Pre-flight 上下文分析层 — 复杂度评分 + 工具推荐 + 预收集
+version: 1.0.0
+author: 粟藜

@@ -1,0 +1,8 @@
+name: astrbot_plugin_suli_draw
+display_name: 粟藜 · AI 生图与编辑
+title: AI 绘图客户端
+author: 粟藜
+version: 1.0.0
+desc: OpenAI-compatible 图像生成 API 客户端 — 自然语言驱动的 generate_image / edit_image 后端
+plugin_type: library
+dependencies: {}

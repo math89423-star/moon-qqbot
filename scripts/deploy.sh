@@ -1,0 +1,134 @@
+#!/bin/bash
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}  astrbot-moon 一键安装脚本${NC}"
+echo -e "${CYAN}========================================${NC}"
+echo ""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# ── 检查 Python ──
+echo -e "${YELLOW}[检查] Python 环境...${NC}"
+if ! command -v python3 &>/dev/null; then
+    echo -e "${RED}[错误] 未找到 python3，请安装 Python 3.10+${NC}"
+    exit 1
+fi
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo -e "${GREEN}  Python $PYTHON_VERSION ✓${NC}"
+
+# ── 检查 Git ──
+if ! command -v git &>/dev/null; then
+    echo -e "${RED}[错误] 未找到 git，请先安装 Git${NC}"
+    exit 1
+fi
+echo -e "${GREEN}  Git ✓${NC}"
+
+# ── 输入 QQ 号 ──
+echo ""
+read -p "请输入你的机器人 QQ 号: " QQ_NUMBER
+if [ -z "$QQ_NUMBER" ]; then
+    echo -e "${RED}[错误] QQ 号不能为空${NC}"
+    exit 1
+fi
+echo "QQ=$QQ_NUMBER" > "$PROJECT_DIR/.env"
+echo "BOT_QQ_MAIN=$QQ_NUMBER" >> "$PROJECT_DIR/.env"
+echo -e "${GREEN}  QQ 号已保存 ✓${NC}"
+
+# ── 安装 AstrBot ──
+echo ""
+echo -e "${YELLOW}[1/4] 安装 AstrBot...${NC}"
+ASTRBOT_DIR="$PROJECT_DIR/AstrBot"
+if [ ! -d "$ASTRBOT_DIR" ]; then
+    git clone https://github.com/Soulter/AstrBot.git "$ASTRBOT_DIR"
+    echo -e "${GREEN}  AstrBot 已克隆 ✓${NC}"
+else
+    echo -e "${GREEN}  AstrBot 已存在，跳过克隆${NC}"
+fi
+
+cd "$ASTRBOT_DIR"
+pip3 install -r requirements.txt -q
+echo -e "${GREEN}  AstrBot 依赖已安装 ✓${NC}"
+
+# ── 部署插件 ──
+echo ""
+echo -e "${YELLOW}[2/4] 部署插件...${NC}"
+PLUGIN_DIR="$ASTRBOT_DIR/data/plugins"
+mkdir -p "$PLUGIN_DIR"
+
+for plugin_dir in "$PROJECT_DIR"/astrbot_plugin_*; do
+    if [ -d "$plugin_dir" ]; then
+        plugin_name=$(basename "$plugin_dir")
+        target="$PLUGIN_DIR/$plugin_name"
+        if [ ! -e "$target" ]; then
+            ln -sf "$plugin_dir" "$target" 2>/dev/null || cp -r "$plugin_dir" "$target"
+            echo "  $plugin_name ✓"
+        else
+            echo "  $plugin_name (已存在，跳过)"
+        fi
+    fi
+done
+echo -e "${GREEN}  插件部署完成 ✓${NC}"
+
+# ── 复制角色卡 ──
+echo ""
+echo -e "${YELLOW}[3/4] 复制角色卡...${NC}"
+CHAR_SRC="$PROJECT_DIR/characters"
+CHAR_DST="$ASTRBOT_DIR/data/plugins/astrbot_plugin_suli_tavern/characters"
+mkdir -p "$CHAR_DST"
+if [ -d "$CHAR_SRC" ]; then
+    cp "$CHAR_SRC"/*.json "$CHAR_DST/" 2>/dev/null || true
+    echo -e "${GREEN}  角色卡已复制 ✓${NC}"
+fi
+
+# ── 安装 NapCat ──
+echo ""
+echo -e "${YELLOW}[4/4] 安装 NapCat...${NC}"
+echo -e "${CYAN}  NapCat 需要单独安装。请选择安装方式:${NC}"
+echo "  1) Docker (推荐)"
+echo "  2) 手动安装"
+echo "  3) 跳过 (已安装)"
+read -p "请选择 [1-3]: " NAPCAT_CHOICE
+
+case $NAPCAT_CHOICE in
+    1)
+        if command -v docker &>/dev/null; then
+            docker run -d --name napcat \
+                -p 3000:3000 -p 3001:3001 -p 6099:6099 \
+                -v napcat_data:/app/data \
+                napneko/napcat:latest 2>/dev/null || \
+            echo -e "${YELLOW}  Docker 启动失败，请检查 Docker 是否运行${NC}"
+        else
+            echo -e "${YELLOW}  未检测到 Docker，请先安装 Docker 后重试${NC}"
+            echo "  或选择手动安装: https://napcat.napneko.icu/"
+        fi
+        ;;
+    2)
+        echo -e "${CYAN}  请访问 https://napcat.napneko.icu/ 按照指引安装 NapCat${NC}"
+        ;;
+    3)
+        echo -e "${GREEN}  跳过 NapCat 安装${NC}"
+        ;;
+esac
+
+# ── 完成 ──
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}  安装完成！${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo ""
+echo -e "下一步:"
+echo -e "  1. 确保 NapCat 已启动并登录 QQ 号 ${CYAN}$QQ_NUMBER${NC}"
+echo -e "  2. 启动 AstrBot: ${CYAN}cd AstrBot && python3 main.py${NC}"
+echo -e "  3. 打开管理面板: ${CYAN}http://localhost:6190${NC}"
+echo -e "  4. 在面板中配置 LLM API (OpenAI 兼容接口)"
+echo ""
+echo -e "快速启动: ${CYAN}bash scripts/start.sh${NC}"
+echo ""

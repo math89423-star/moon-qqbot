@@ -1,0 +1,26 @@
+name: astrbot_plugin_suli_bridge
+display_name: 粟藜 · LLM 配置桥接
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: LLM 配置桥接插件 — 读取外部数据库中的 LLM 配置, 提供 /chat 对话命令。支持多模型切换、多轮会话、30min 自动清理。
+desc: "LLM 桥接: /chat 多轮对话, 模型切换, 外部配置只读"
+repo: https://github.com/math89423-star/suli_qqbot
+category: AI 增强
+tags:
+  - LLM
+  - 对话
+  - 桥接
+help: |
+  发送：
+  - /chat <消息>       与 AI 对话
+  - /chat reset        重置会话
+  - /chat model        查看当前模型
+  - /chat list         列出可用模型
+  - /chat switch <id>  切换模型
+  - /chat help         显示帮助
+
+  支持多轮对话，30分钟无操作自动清除会话。
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

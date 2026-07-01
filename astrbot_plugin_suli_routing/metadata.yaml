@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_routing
+display_name: 粟藜 · 三级模型自适应路由
+description: "自适应三级模型路由 (Flash / Pro / Opus) — 纯库插件，供其他 AstrBot 插件 import 使用"
+author: 粟藜
+version: 1.0.0

@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_intelligence
+display_name: 粟藜 · 领域检测与知识注入
+desc: "通用 AI 智力基础设施 — 领域检测 / 世界书 / 用户画像 / 提示拦截 / 群聊摘要 / 提示缓存 / 事实纠错 — 纯库插件，供其他 AstrBot 插件 import 使用"
+version: 1.0.0
+author: 粟藜

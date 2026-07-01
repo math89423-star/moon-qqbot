@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_proactive
+display_name: 粟藜 · 主动话题与感知触发
+desc: 粟藜主动行为引擎 — 私聊/群聊主动交互调度, 决策门控, 候选池管理 提取自 proactive 引擎核心模式
+version: 1.0.0
+author: 粟藜

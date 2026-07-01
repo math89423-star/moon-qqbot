@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_emotion
+display_name: 粟藜 · 双轨情感追踪
+desc: "双轨情感系统 — 短期情绪 (Mood) + 长期好感 (Affinity) + 情绪事件检测 (EmotionEngine) — 纯库插件，供其他 AstrBot 插件 import 使用"
+version: 1.0.0
+author: 粟藜

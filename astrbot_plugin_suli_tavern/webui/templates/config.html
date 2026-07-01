@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>配置面板 — 暮恩 &amp; </title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.slate.min.css">
+<style>
+  :root {
+    --pico-font-size: 92.5%;
+    --pico-border-radius: 0.5rem;
+    --bot-moon: #4ecca3;
+    --bot-: #e94560;
+    --bot-moon-bg: rgba(78, 204, 163, 0.12);
+    --bot--bg: rgba(233, 69, 96, 0.12);
+  }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  .app-header {
+    display: flex; align-items: center; gap: 1rem; padding: 0.8rem 1.5rem;
+    border-bottom: 1px solid var(--pico-muted-border-color);
+    flex-wrap: wrap;
+  }
+  .app-header h1 { font-size: 1.3rem; margin: 0; white-space: nowrap; }
+  .app-header .subtitle { color: var(--pico-muted-color); font-size: 0.82rem; margin-left: 0.3rem; }
+  .bot-switch {
+    display: flex; gap: 4px; margin-left: auto; background: var(--pico-background-color);
+    border-radius: 2rem; padding: 3px; border: 1px solid var(--pico-muted-border-color);
+  }
+  .bot-switch button {
+    all: unset; cursor: pointer; padding: 0.35rem 1rem; border-radius: 2rem;
+    font-size: 0.85rem; font-weight: 600; color: var(--pico-muted-color);
+    transition: all 0.15s; white-space: nowrap;
+    display: flex; align-items: center; gap: 0.35rem;
+  }
+  .bot-switch button:hover { background: var(--pico-dropdown-hover-background-color); }
+  .bot-switch button.active { color: #fff; }
+  .bot-switch button.active.moon { background: var(--bot-moon); }
+  .bot-switch button.active. { background: var(--bot-); }
+  .tab-bar {
+    display: flex; gap: 0; padding: 0 1.5rem;
+    border-bottom: 1px solid var(--pico-muted-border-color);
+  }
+  .tab-bar button {
+    all: unset; cursor: pointer; padding: 0.6rem 1.1rem; font-size: 0.85rem;
+    color: var(--pico-muted-color); border-bottom: 2px solid transparent; transition: all 0.15s;
+  }
+  .tab-bar button:hover { color: var(--pico-color); }
+  .tab-bar button.active { color: var(--pico-primary); border-bottom-color: var(--pico-primary); }
+  main { flex: 1; padding: 1.5rem; max-width: 1100px; margin: 0 auto; width: 100%; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  article { margin-bottom: 1rem; padding: 1.25rem 1.5rem; }
+  .bot-status-row {
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0;
+  }
+  .bot-status-row .indicator {
+    width: 10px; height: 10px; border-radius: 50%; display: inline-block;
+  }
+  .toggle-row { display: flex; gap: 1.5rem; margin-left: auto; flex-wrap: wrap; align-items: center; }
+  .toggle-row label { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; margin: 0; }
+  .masked-key { font-family: var(--pico-font-family-monospace); font-size: 0.8rem; }
+  table { font-size: 0.84rem; }
+  th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .badge-llm { background: rgba(91, 155, 213, 0.18); color: #5b9bd5; }
+  .badge-vlm { background: rgba(176, 91, 213, 0.18); color: #b05bd5; }
+  .badge-active { background: rgba(78, 204, 163, 0.18); color: var(--bot-moon); }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; }
+  .stat-card { text-align: center; padding: 1rem 0.5rem; }
+  .stat-card .val { font-size: 1.7rem; font-weight: 700; color: var(--pico-primary); }
+  .stat-card .lbl { font-size: 0.76rem; color: var(--pico-muted-color); margin-top: 0.2rem; }
+  .empty-state { text-align: center; padding: 2rem; color: var(--pico-muted-color); }
+  .range-group { display: flex; align-items: center; gap: 0.6rem; }
+  .range-group input[type="range"] { flex: 1; }
+  .range-group .val { min-width: 3rem; text-align: right; font-weight: 700; font-size: 0.85rem; }
+  .section-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--pico-muted-color); margin: 1.2rem 0 0.5rem;
+    padding-bottom: 0.3rem; border-bottom: 1px solid var(--pico-muted-border-color);
+    grid-column: 1 / -1;
+  }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.8rem; }
+  .toolbar { display: flex; gap: 0.5rem; align-items: center; }
+  select.inline { width: auto; display: inline-block; }
+  .toast-container { position: fixed; top: 1rem; right: 1rem; z-index: 9999; display: flex; flex-direction: column; gap: 0.4rem; }
+  .toast {
+    padding: 0.6rem 1.2rem; border-radius: 0.4rem; font-size: 0.85rem; font-weight: 500;
+    animation: slideIn 0.25s ease; max-width: 360px;
+  }
+  .toast-ok { background: #1a3c2a; border: 1px solid var(--bot-moon); color: var(--bot-moon); }
+  .toast-err { background: #3c1a1a; border: 1px solid var(--bot-); color: var(--bot-); }
+  @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  /* SVG icon sizing */
+  .icon-sm { width: 1em; height: 1em; vertical-align: -0.125em; }
+
+  /* ── Modal ─────────────────────────────── */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000;
+    display: flex; align-items: center; justify-content: center; animation: fadeIn 0.15s ease;
+  }
+  .modal-overlay.closing { animation: fadeOut 0.12s ease forwards; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+  .modal-box {
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius);
+    padding: 1.5rem; max-width: 540px; width: 92%;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    animation: slideUp 0.18s ease;
+  }
+  @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  .modal-box h3 { margin-top: 0; }
+  .modal-box label { font-size: 0.82rem; margin-top: 0.6rem; display: block; }
+  .modal-box label small { color: var(--pico-muted-color); font-weight: 400; }
+  .modal-box input, .modal-box select { width: 100%; margin-bottom: 0.1rem; }
+  .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1.2rem; }
+  .modal-actions button { min-width: 5rem; }
+  .btn-sm { font-size: 0.78rem; padding: 0.25rem 0.55rem; }
+  .btn-danger { background: var(--bot-); border-color: var(--bot-); color: #fff; }
+  .btn-danger:hover { background: #c0392b; }
+  .table-actions { display: flex; gap: 4px; }
+  .add-btn-row { margin-bottom: 0.75rem; }
+  .provider-preset { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .provider-preset button {
+    all: unset; cursor: pointer; padding: 0.2rem 0.55rem; border-radius: 1rem;
+    font-size: 0.72rem; background: var(--pico-dropdown-hover-background-color);
+    color: var(--pico-muted-color); transition: all 0.12s;
+  }
+  .provider-preset button:hover { color: var(--pico-primary); }
+  .provider-preset button.active { background: var(--pico-primary); color: #111; }
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <h1>配置面板</h1>
+  <span class="subtitle">LLM / VLM / 参数 / 用量</span>
+  <div class="bot-switch" id="bot-switch">
+    <button class="active moon" data-bot="BOT_QQ_MAIN">
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><path d="M12 8v5M9 21c0-2 1.5-5 3-5s3 3 3 5"/></svg>
+      暮恩
+    </button>
+    <button class="" data-bot="BOT_QQ_ALT">
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2c-1 4-1 8 0 12s4 6 8 0c-3 1-6 0-8-4s-2.5-8 0-12Z"/></svg>
+      
+    </button>
+  </div>
+</header>
+
+<nav class="tab-bar">
+  <button class="active" data-tab="llm">LLM 模型</button>
+  <button data-tab="vlm">VLM 视觉</button>
+  <button data-tab="temp">温度设置</button>
+  <button data-tab="chat">对话参数</button>
+  <button data-tab="tokens">用量统计</button>
+</nav>
+
+<main>
+
+  <!-- LLM -->
+  <div class="panel active" id="panel-llm">
+    <article id="bot-status-card">
+      <div class="bot-status-row">
+        <strong id="bot-status-name">暮恩</strong>
+        <small style="color:var(--pico-muted-color)" id="bot-status-qq">BOT_QQ_MAIN</small>
+        <div class="toggle-row">
+          <label><input type="checkbox" id="toggle-group-chat" onchange="saveBotToggle('group_chat_enabled',this.checked)"> 群聊</label>
+          <label><input type="checkbox" id="toggle-private-chat" onchange="saveBotToggle('private_chat_enabled',this.checked)"> 私聊</label>
+        </div>
+      </div>
+    </article>
+    <article>
+      <hgroup><h3>LLM 配置</h3></hgroup>
+      <div class="add-btn-row"><button onclick="openModal('llm')">+ 添加配置</button></div>
+      <div style="display:flex;gap:16px;margin-bottom:1rem;flex-wrap:wrap" id="llm-slots-bar">
+        <div><small>主模型</small> <select id="llm-slot-primary" onchange="assignSlot('llm', 'llm_primary', this.value)"><option value="">— 未分配 —</option></select></div>
+        <div><small>备用模型</small> <select id="llm-slot-secondary" onchange="assignSlot('llm', 'llm_secondary', this.value)"><option value="">— 未分配 —</option></select></div>
+      </div>
+      <div class="overflow-auto"><table>
+        <thead><tr><th>ID</th><th>名称</th><th>Provider</th><th>模型</th><th>Key</th><th>Base URL</th><th>已分配槽位</th><th>操作</th></tr></thead>
+        <tbody id="llm-table-body"><tr><td colspan="8" class="empty-state">加载中...</td></tr></tbody>
+      </table></div>
+    </article>
+  </div>
+
+  <!-- VLM -->
+  <div class="panel" id="panel-vlm">
+    <article>
+      <hgroup><h3>VLM 视觉模型</h3></hgroup>
+      <div class="add-btn-row"><button onclick="openModal('vlm')">+ 添加配置</button></div>
+      <div style="display:flex;gap:16px;margin-bottom:1rem;flex-wrap:wrap" id="vlm-slots-bar">
+        <div><small>识图</small> <select id="vlm-slot-primary" onchange="assignSlot('vlm', 'vlm_primary', this.value)"><option value="">— 未分配 —</option></select></div>
+        <div><small>绘图</small> <select id="vlm-slot-secondary" onchange="assignSlot('vlm', 'vlm_secondary', this.value)"><option value="">— 未分配 —</option></select></div>
+      </div>
+      <div class="overflow-auto"><table>
+        <thead><tr><th>ID</th><th>名称</th><th>Provider</th><th>模型</th><th>Key</th><th>Base URL</th><th>已分配槽位</th><th>操作</th></tr></thead>
+        <tbody id="vlm-table-body"><tr><td colspan="8" class="empty-state">加载中...</td></tr></tbody>
+      </table></div>
+    </article>
+  </div>
+
+  <!-- 温度 -->
+  <div class="panel" id="panel-temp">
+    <article>
+      <hgroup><h3>Temperature</h3><p>范围 0.0–2.0，低=确定，高=创造</p></hgroup>
+      <form id="temp-form">
+        <div class="form-grid" id="temp-fields"><div class="empty-state">加载中...</div></div>
+        <button type="submit" style="margin-top:1rem">保存</button>
+      </form>
+    </article>
+  </div>
+
+  <!-- 对话参数 -->
+  <div class="panel" id="panel-chat">
+    <article>
+      <hgroup><h3>对话参数</h3><p>群聊策略 / 上下文 / 模型路由</p></hgroup>
+      <form id="chat-form">
+        <div id="chat-fields"><div class="empty-state">加载中...</div></div>
+        <button type="submit" style="margin-top:1rem">保存</button>
+      </form>
+    </article>
+  </div>
+
+  <!-- 用量 -->
+  <div class="panel" id="panel-tokens">
+    <article>
+      <hgroup>
+        <h3>每日预算上限 (M)</h3>
+        <small style="color:var(--pico-muted-color)">硬上限 = 全部拒绝；软上限 = 低优先级延后</small>
+      </hgroup>
+      <div class="stats-grid" style="grid-template-columns:1fr 1fr">
+        <fieldset style="border-color:var(--bot-moon)">
+          <legend style="color:var(--bot-moon);font-weight:600">🟢 暮恩</legend>
+          <label>硬上限 <input type="number" id="moon-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
+          <label>软上限 <input type="number" id="moon-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
+        </fieldset>
+        <fieldset style="border-color:var(--bot-)">
+          <legend style="color:var(--bot-);font-weight:600">🔴 </legend>
+          <label>硬上限 <input type="number" id="-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
+          <label>软上限 <input type="number" id="-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
+        </fieldset>
+      </div>
+      <button id="save-budget-btn" style="margin-top:0.5rem">保存预算</button>
+    </article>
+    <article>
+      <hgroup><h3>Per-Bot 消耗</h3></hgroup>
+      <div class="toolbar" style="margin-bottom:1rem">
+        <select class="inline" id="token-period">
+          <option value="today">今天</option>
+          <option value="week">本周</option>
+          <option value="month">本月</option>
+          <option value="all">全部</option>
+        </select>
+      </div>
+      <div id="token-by-bot"><div class="empty-state">加载中...</div></div>
+      <div class="stats-grid" id="token-stats-grid" style="margin-top:1rem"><div class="empty-state">加载中...</div></div>
+    </article>
+    <article>
+      <hgroup><h3>按场景分布</h3></hgroup>
+      <div id="token-by-scenario"><div class="empty-state">加载中...</div></div>
+    </article>
+    <article>
+      <hgroup><h3>数据库</h3></hgroup>
+      <div class="stats-grid" id="db-stats-grid"><div class="empty-state">加载中...</div></div>
+    </article>
+  </div>
+
+</main>
+
+<div class="toast-container" id="toast-container"></div>
+
+<!-- ── 编辑弹窗 ────────────────────────────────────────────── -->
+<div id="config-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <h3 id="modal-title">添加配置</h3>
+    <form id="modal-form" onsubmit="saveConfig(event)">
+      <input type="hidden" id="mf-id">
+      <input type="hidden" id="mf-config-type">
+      <label>名称 <small>必填 · 显示在面板中</small></label>
+      <input id="mf-name" required placeholder="例: llama-cpp-qwen">
+      <label>Provider <small>自由文本 · 如 deepseek / custom / llama / ollama</small></label>
+      <div class="provider-preset" id="provider-presets">
+        <button type="button" data-prov="deepseek">DeepSeek</button>
+        <button type="button" data-prov="custom">OpenAI 兼容</button>
+        <button type="button" data-prov="anthropic">Anthropic</button>
+        <button type="button" data-prov="llama">llama.cpp</button>
+        <button type="button" data-prov="ollama">Ollama</button>
+        <button type="button" data-prov="gpt4v">GPT-4V</button>
+        <button type="button" data-prov="claude">Claude V</button>
+        <button type="button" data-prov="gemini">Gemini V</button>
+      </div>
+      <input id="mf-provider" placeholder="custom" list="provider-suggestions">
+      <datalist id="provider-suggestions">
+        <option value="deepseek"><option value="custom"><option value="anthropic">
+        <option value="llama"><option value="ollama"><option value="gpt4v">
+        <option value="claude"><option value="gemini"><option value="nano_banana">
+      </datalist>
+      <label>Provider 名称 <small>用于 AstrBot 同步辨识</small></label>
+      <input id="mf-provider-name" placeholder="例: deepseek / openai / anthropic / llama-cpp">
+      <label>模型名 <small>传给 API 的 model 参数</small></label>
+      <input id="mf-model-name" placeholder="例: deepseek-v4-pro / gpt-4o / qwen3-8b">
+      <label>API Key <small id="mf-key-hint"></small></label>
+      <input id="mf-api-key" placeholder="sk-...">
+      <label>Base URL <small>OpenAI 兼容端点 · 自动补全 /v1</small></label>
+      <input id="mf-base-url" placeholder="例: https://api.deepseek.com 或 http://host:8080/v1">
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeModal()">取消</button>
+        <button type="button" id="btn-delete-config" class="btn-danger" style="display:none;margin-right:auto" onclick="deleteConfig()">删除</button>
+        <button type="submit">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+const API = '/api/config';
+
+const BOTS = {
+  'BOT_QQ_MAIN': { name: '暮恩', cssClass: 'moon' },
+  'BOT_QQ_ALT': { name: '', cssClass: '' },
+};
+let CURRENT_BOT = sessionStorage.getItem('selected_bot') || 'BOT_QQ_MAIN';
+
+// ── Auth ─────────────────────────────────────────────────
+
+let AUTH_TOKEN = sessionStorage.getItem('admin_token') || null;
+
+async function login(token) {
+  const r = await fetch(API + '/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token}),
+  });
+  return r.ok;
+}
+
+function showLoginScreen() {
+  document.body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;">
+      <article style="max-width:400px;width:100%;text-align:center;">
+        <h2>配置面板</h2>
+        <p style="color:var(--pico-muted-color)">admin_token 在 <code>none_qqbot.db</code> 首次启动时自动生成。</p>
+        <form id="login-form">
+          <input name="token" type="password" placeholder="admin_token..." autofocus
+                 style="text-align:center">
+          <button type="submit" style="width:100%">验证</button>
+          <small class="login-error" style="color:var(--bot-);display:none">认证失败，请检查 token</small>
+        </form>
+      </article>
+    </div>`;
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const token = e.target.elements.token.value.trim();
+    if (!token) return;
+    const ok = await login(token);
+    if (ok) {
+      sessionStorage.setItem('admin_token', token);
+      AUTH_TOKEN = token;
+      location.reload();
+    } else {
+      const el = document.querySelector('.login-error');
+      el.style.display = 'block';
+      e.target.elements.token.value = '';
+      e.target.elements.token.focus();
+    }
+  });
+}
+
+(function initAuth() {
+  if (!AUTH_TOKEN) { showLoginScreen(); return; }
+})();
+if (!AUTH_TOKEN) throw new Error('Not authenticated');
+
+function authHeaders() {
+  return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {};
+}
+
+// ── Helpers ───────────────────────────────────────────────
+
+function qs() { return '?bot_id=' + CURRENT_BOT; }
+
+function toast(msg, err) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (err ? 'toast-err' : 'toast-ok');
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 2800);
+}
+
+async function apiGet(path) {
+  const r = await fetch(API + path, { headers: authHeaders() });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+async function apiPost(path, data) {
+  const r = await fetch(API + path, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+function esc(s) { return typeof s === 'string' ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : s; }
+function fm(n) { return n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+'K' : String(n); }
+
+// ── Bot switching ─────────────────────────────────────────
+
+function switchBot(id) {
+  CURRENT_BOT = id;
+  sessionStorage.setItem('selected_bot', id);
+  const meta = BOTS[id];
+  document.querySelectorAll('.bot-switch button').forEach(b => {
+    b.classList.toggle('active', b.dataset.bot === id);
+  });
+  document.getElementById('bot-status-name').textContent = meta.name;
+  document.getElementById('bot-status-qq').textContent = id;
+  document.getElementById('bot-status-card').style.borderLeft = '3px solid ' + (id==='BOT_QQ_MAIN'?'var(--bot-moon)':'var(--bot-)');
+  loadBotSettings();
+  loadLLM(); loadVLM();
+}
+
+document.getElementById('bot-switch').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (btn) switchBot(btn.dataset.bot);
+});
+
+// ── Bot settings ──────────────────────────────────────────
+
+async function loadBotSettings() {
+  try {
+    const d = await apiGet('/bot-settings' + qs());
+    document.getElementById('toggle-group-chat').checked = d.group_chat_enabled;
+    document.getElementById('toggle-private-chat').checked = d.private_chat_enabled;
+  } catch(e) { console.error(e); }
+}
+
+async function saveBotToggle(key, val) {
+  try {
+    await apiPost('/bot-settings', {bot_id: CURRENT_BOT, [key]: val});
+    const label = key === 'group_chat_enabled' ? '群聊' : '私聊';
+    toast(label + (val ? ' 已开启' : ' 已关闭'));
+  } catch(e) { toast('保存失败', true); }
+}
+
+// ── LLM ───────────────────────────────────────────────────
+
+async function loadLLM() {
+  try {
+    const d = await apiGet('/llm/list' + qs());
+    const configs = d.configs.filter(c => c.is_llm);
+    _llmCache = configs;
+    const slots = d.slots;
+
+    // 填充槽位下拉
+    populateSlotSelects('llm', configs, slots);
+
+    const tbody = document.getElementById('llm-table-body');
+    if (!configs.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无 LLM 配置，点击上方「+ 添加配置」创建第一个。</td></tr>';
+      return;
+    }
+    // 计算每个 config 被分配到哪些槽位
+    const slotNames = { llm_primary: '主模型', llm_secondary: '备用模型' };
+    tbody.innerHTML = configs.map(c => {
+      const assignedSlots = [];
+      for (const [sn, sl] of Object.entries(slots)) {
+        if (sl === c.id) assignedSlots.push(slotNames[sn] || sn);
+      }
+      const cfgJson = JSON.stringify(c).replace(/'/g, "&#39;").replace(/"/g, "&quot;");
+      return `<tr>
+        <td>${c.id}</td><td><strong>${esc(c.name)}</strong></td>
+        <td><kbd class="badge-llm">${esc(c.provider)}</kbd></td>
+        <td>${esc(c.model_name||'-')}</td>
+        <td><code class="masked-key">${esc(c.api_key_masked)}</code></td>
+        <td><small>${esc((c.base_url||'-').substring(0,40))}</small></td>
+        <td>${assignedSlots.length ? assignedSlots.map(s => `<ins class="badge-active">${s}</ins>`).join(' ') : '<small style="color:var(--pico-muted-color)">—</small>'}</td>
+        <td><div class="table-actions"><button class="btn-sm secondary" onclick="openModal('llm', ${c.id})" title="编辑">✏️</button><button class="btn-sm btn-danger" onclick="deleteConfig(${c.id},'llm')" title="删除">🗑</button></div></td>
+      </tr>`;
+    }).join('');
+  } catch(e) { document.getElementById('llm-table-body').innerHTML = '<tr><td colspan="8" class="empty-state">加载失败</td></tr>'; }
+}
+
+// ── Modal (LLM / VLM 添加/编辑) ──────────────────────────
+
+const PROVIDER_PRESETS = ['deepseek', 'custom', 'anthropic', 'llama', 'ollama', 'gpt4v', 'claude', 'gemini'];
+
+let _llmCache = [];
+let _vlmCache = [];
+
+function openModal(configType, configId) {
+  const isVlm = configType === 'vlm';
+  const isEdit = configId !== undefined;
+  document.getElementById('modal-title').textContent = (isEdit ? '编辑' : '添加') + (isVlm ? ' VLM' : ' LLM') + ' 配置';
+  document.getElementById('mf-id').value = isEdit ? configId : '';
+  document.getElementById('mf-config-type').value = isVlm ? 'vlm' : 'llm';
+  document.getElementById('btn-delete-config').style.display = isEdit ? '' : 'none';
+
+  // provider presets
+  document.querySelectorAll('#provider-presets button').forEach(b => b.classList.remove('active'));
+
+  if (isEdit) {
+    const cache = isVlm ? _vlmCache : _llmCache;
+    const cfg = cache.find(c => c.id === configId);
+    if (cfg) {
+      document.getElementById('mf-name').value = cfg.name || '';
+      document.getElementById('mf-provider').value = cfg.provider || '';
+      document.getElementById('mf-provider-name').value = cfg.provider_name || '';
+      document.getElementById('mf-model-name').value = cfg.model_name || '';
+      document.getElementById('mf-api-key').value = '';
+      document.getElementById('mf-base-url').value = cfg.base_url || '';
+      document.getElementById('mf-key-hint').textContent = '留空则不修改';
+      // highlight preset
+      const preset = document.querySelector(`#provider-presets button[data-prov="${cfg.provider}"]`);
+      if (preset) preset.classList.add('active');
+    } else {
+      // fallback: fetch from API
+      loadConfigForModal(configType, configId);
+      return;
+    }
+  } else {
+    document.getElementById('mf-name').value = '';
+    document.getElementById('mf-provider').value = configType === 'vlm' ? 'gpt4v' : 'custom';
+    document.getElementById('mf-provider-name').value = '';
+    document.getElementById('mf-model-name').value = '';
+    document.getElementById('mf-api-key').value = '';
+    document.getElementById('mf-base-url').value = '';
+    document.getElementById('mf-key-hint').textContent = '纯文本存储 — 请确保传输加密';
+  }
+
+  document.getElementById('config-modal').style.display = 'flex';
+}
+
+async function loadConfigForModal(configType, configId) {
+  try {
+    const path = configType === 'vlm' ? '/vlm/list' : '/llm/list';
+    const d = await apiGet(path + qs());
+    const configs = (configType === 'vlm') ? d.configs : d.configs.filter(c => c.is_llm);
+    const cfg = configs.find(c => c.id === configId);
+    if (cfg) {
+      if (configType === 'vlm') _vlmCache = configs; else _llmCache = configs;
+      document.getElementById('mf-name').value = cfg.name || '';
+      document.getElementById('mf-provider').value = cfg.provider || '';
+      document.getElementById('mf-provider-name').value = cfg.provider_name || '';
+      document.getElementById('mf-model-name').value = cfg.model_name || '';
+      document.getElementById('mf-api-key').value = '';
+      document.getElementById('mf-base-url').value = cfg.base_url || '';
+      document.getElementById('mf-key-hint').textContent = '留空则不修改';
+      const preset = document.querySelector(`#provider-presets button[data-prov="${cfg.provider}"]`);
+      if (preset) preset.classList.add('active');
+    }
+    document.getElementById('config-modal').style.display = 'flex';
+  } catch(e) { toast('加载配置失败', true); }
+}
+
+function closeModal() {
+  document.getElementById('config-modal').style.display = 'none';
+}
+
+async function saveConfig(e) {
+  e.preventDefault();
+  const id = document.getElementById('mf-id').value;
+  const configType = document.getElementById('mf-config-type').value;
+  const isEdit = !!id;
+  const prefix = configType === 'vlm' ? '/vlm' : '/llm';
+
+  const data = {
+    name: document.getElementById('mf-name').value.trim(),
+    provider: document.getElementById('mf-provider').value.trim() || 'custom',
+    provider_name: document.getElementById('mf-provider-name').value.trim(),
+    api_key: document.getElementById('mf-api-key').value.trim(),
+    base_url: document.getElementById('mf-base-url').value.trim(),
+    model_name: document.getElementById('mf-model-name').value.trim(),
+    config_type: configType,
+  };
+  if (!data.name) { toast('名称为必填项', true); return; }
+
+  try {
+    if (isEdit) {
+      // PUT: 只发送有值的字段（api_key 为空时不上传，保持原值）
+      const updateFields = { name: data.name };
+      if (data.provider) updateFields.provider = data.provider;
+      if (data.provider_name) updateFields.provider_name = data.provider_name;
+      if (data.api_key) updateFields.api_key = data.api_key;
+      if (data.base_url) updateFields.base_url = data.base_url;
+      if (data.model_name) updateFields.model_name = data.model_name;
+      if (data.config_type) updateFields.config_type = data.config_type;
+      const r = await fetch(API + prefix + '/' + id, {
+        method: 'PUT',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(updateFields),
+      });
+      if (!r.ok) throw new Error(r.status);
+      toast('配置已更新');
+    } else {
+      await apiPost(prefix, data);
+      toast('配置已创建');
+    }
+    closeModal();
+    if (configType === 'vlm') loadVLM(); else loadLLM();
+  } catch(e) { toast('保存失败: ' + e.message, true); }
+}
+
+async function deleteConfig(configId, configType) {
+  if (!confirm('确定删除配置 #' + configId + '？此操作不可恢复。')) return;
+  const prefix = configType === 'vlm' ? '/vlm' : '/llm';
+  try {
+    const r = await fetch(API + prefix + '/' + configId, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    if (!r.ok) throw new Error(r.status);
+    toast('配置已删除');
+    // 如果当前在 modal 中则关闭
+    closeModal();
+    if (configType === 'vlm') loadVLM(); else loadLLM();
+  } catch(e) { toast('删除失败: ' + e.message, true); }
+}
+
+// provider preset 点击事件
+document.getElementById('provider-presets').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-prov]');
+  if (!btn) return;
+  document.getElementById('mf-provider').value = btn.dataset.prov;
+  document.querySelectorAll('#provider-presets button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+});
+
+async function assignSlot(type, slot, configId) {
+  const endpoint = type === 'llm' ? '/llm/activate' : '/vlm/activate';
+  if (!configId) {
+    // 清空槽位: POST with config_id=0 to clear
+    try {
+      await apiPost(endpoint, {config_id: 0, slot, bot_id: CURRENT_BOT});
+      // 直接删 key
+      const dummy = await apiGet('/' + type + '/list' + qs());
+      loadLLM(); loadVLM(); loadBotSettings();
+      toast((type==='llm'?'LLM':'VLM') + ' 槽位已清空');
+    } catch(e) { toast('清空失败', true); }
+    return;
+  }
+  try {
+    await apiPost(endpoint, {config_id: parseInt(configId), slot, bot_id: CURRENT_BOT});
+    toast((type==='llm'?'LLM':'VLM') + ' 槽位已分配');
+    if (type === 'llm') loadLLM(); else loadVLM();
+    loadBotSettings();
+  } catch(e) { toast('分配失败', true); }
+}
+
+function populateSlotSelects(type, configs, slots) {
+  const slotDefs = type === 'llm'
+    ? { primary: 'llm_primary', secondary: 'llm_secondary' }
+    : { primary: 'vlm_primary', secondary: 'vlm_secondary' };
+  for (const [label, key] of Object.entries(slotDefs)) {
+    const sel = document.getElementById(type + '-slot-' + label);
+    if (!sel) continue;
+    const currentVal = String(slots[key] || '');
+    sel.innerHTML = '<option value="">— 未分配 —</option>' +
+      configs.map(c => `<option value="${c.id}" ${String(c.id) === currentVal ? 'selected' : ''}>${esc(c.name)} (${esc(c.provider)})</option>`).join('');
+  }
+}
+
+// ── VLM ───────────────────────────────────────────────────
+
+async function loadVLM() {
+  try {
+    const d = await apiGet('/vlm/list' + qs());
+    const configs = d.configs;
+    _vlmCache = configs;
+    const slots = d.slots;
+
+    populateSlotSelects('vlm', configs, slots);
+
+    const tbody = document.getElementById('vlm-table-body');
+    if (!configs.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无 VLM 配置，点击上方「+ 添加配置」创建第一个。</td></tr>';
+      return;
+    }
+    const slotNames = { vlm_primary: '识图', vlm_secondary: '绘图' };
+    tbody.innerHTML = configs.map(c => {
+      const assignedSlots = [];
+      for (const [sn, sl] of Object.entries(slots)) {
+        if (sl === c.id) assignedSlots.push(slotNames[sn] || sn);
+      }
+      return `<tr>
+        <td>${c.id}</td><td><strong>${esc(c.name)}</strong></td>
+        <td><kbd class="badge-vlm">${esc(c.provider)}</kbd></td>
+        <td>${esc(c.model_name||'-')}</td>
+        <td><code class="masked-key">${esc(c.api_key_masked)}</code></td>
+        <td><small>${esc((c.base_url||'-').substring(0,40))}</small></td>
+        <td>${assignedSlots.length ? assignedSlots.map(s => `<ins class="badge-active">${s}</ins>`).join(' ') : '<small style="color:var(--pico-muted-color)">—</small>'}</td>
+        <td><div class="table-actions"><button class="btn-sm secondary" onclick="openModal('vlm', ${c.id})" title="编辑">✏️</button><button class="btn-sm btn-danger" onclick="deleteConfig(${c.id},'vlm')" title="删除">🗑</button></div></td>
+      </tr>`;
+    }).join('');
+  } catch(e) { document.getElementById('vlm-table-body').innerHTML = '<tr><td colspan="8" class="empty-state">加载失败</td></tr>'; }
+}
+
+// ── Temperatures ──────────────────────────────────────────
+
+const TEMP_LABELS = {
+  tavern_group: ['群聊', '群聊自然对话'],
+  memory_extract: ['记忆提取', '低温度保证准确性'],
+  context_compress: ['上下文压缩', '低温度保证信息不丢失'],
+  cross_validation: ['交叉验证', '极低温度保证公正'],
+};
+
+async function loadTemps() {
+  try {
+    const d = await apiGet('/temperatures');
+    document.getElementById('temp-fields').innerHTML = Object.entries(TEMP_LABELS).map(([k,[label,desc]]) => `
+      <div>
+        <label><strong>${label}</strong> <small>${desc}</small></label>
+        <div class="range-group">
+          <input type="range" name="${k}" min="0" max="2" step="0.05" value="${d.temperatures[k]||0.7}">
+          <span class="val">${(d.temperatures[k]||0.7).toFixed(2)}</span>
+        </div>
+      </div>`).join('');
+    document.querySelectorAll('#temp-fields input[type=range]').forEach(inp => {
+      inp.addEventListener('input', () => { inp.parentElement.querySelector('.val').textContent = parseFloat(inp.value).toFixed(2); });
+    });
+  } catch(e) { document.getElementById('temp-fields').innerHTML = '<div class="empty-state">加载失败</div>'; }
+}
+
+document.getElementById('temp-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const data = {};
+  e.target.querySelectorAll('input[type=range]').forEach(inp => { data[inp.name] = parseFloat(inp.value); });
+  try { await apiPost('/temperatures', data); toast('温度已保存'); }
+  catch(err) { toast('保存失败', true); }
+});
+
+// ── Chat Params ───────────────────────────────────────────
+
+async function loadChatParams() {
+  try {
+    const d = await apiGet('/chat-params');
+    const groups = {};
+    d.params.forEach(p => { const g = p.group||'其他'; (groups[g]=groups[g]||[]).push(p); });
+    let html = '';
+    for (const [group, items] of Object.entries(groups)) {
+      html += `<div class="section-label">${group}</div>`;
+      for (const p of items) {
+        html += `<div><label><strong>${p.label}</strong> <small>${p.desc}</small></label>`;
+        if (p.type==='bool') {
+          html += `<select name="${p.key}"><option value="true" ${p.value?'selected':''}>开启</option><option value="false" ${!p.value?'selected':''}>关闭</option></select>`;
+        } else if (p.type==='float') {
+          html += `<div class="range-group"><input type="range" name="${p.key}" min="${p.min||0}" max="${p.max||2}" step="${p.step||0.1}" value="${p.value}"><span class="val">${parseFloat(p.value).toFixed(2)}</span></div>`;
+        } else if (p.type==='csv') {
+          html += `<input type="text" name="${p.key}" value="${esc(Array.isArray(p.value)?p.value.join(', '):p.value)}">`;
+        } else {
+          html += `<input type="${p.type==='int'?'number':'text'}" name="${p.key}" value="${p.value}" ${p.type==='int'?`min="${p.min||0}" max="${p.max||9999}" step="${p.step||1}"`:''}>`;
+        }
+        html += '</div>';
+      }
+    }
+    document.getElementById('chat-fields').innerHTML = '<div class="form-grid">' + html + '</div>';
+    document.querySelectorAll('#chat-fields input[type=range]').forEach(inp => {
+      inp.addEventListener('input', () => { inp.parentElement.querySelector('.val').textContent = parseFloat(inp.value).toFixed(2); });
+    });
+  } catch(e) { document.getElementById('chat-fields').innerHTML = '<div class="empty-state">加载失败</div>'; }
+}
+
+document.getElementById('chat-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const data = {};
+  e.target.querySelectorAll('input, select').forEach(el => {
+    if (!el.name) return;
+    let v = el.value;
+    if (el.type==='range') v = parseFloat(v);
+    else if (el.tagName==='SELECT') v = v==='true' ? true : v==='false' ? false : v;
+    data[el.name] = v;
+  });
+  try { await apiPost('/chat-params', data); toast('参数已保存'); }
+  catch(err) { toast('保存失败', true); }
+});
+
+// ── Token Stats ───────────────────────────────────────────
+
+async function loadTokens() {
+  const period = document.getElementById('token-period').value;
+  try {
+    const [s, budget] = await Promise.all([
+      apiGet('/token-stats?period='+period),
+      apiGet('/token-budget'),
+    ]);
+
+    // Per-bot 消耗卡片
+    const bots = s.by_bot || [];
+    const botCards = bots.length ? bots.map(b => {
+      const name = b.bot_id === 'BOT_QQ_MAIN' ? '暮恩' : b.bot_id === 'BOT_QQ_ALT' ? '' : b.bot_id;
+      const cssColor = b.bot_id === 'BOT_QQ_MAIN' ? 'var(--bot-moon)' : 'var(--bot-)';
+      const total = (b.input_tokens||0) + (b.output_tokens||0);
+      const hardKey = b.bot_id === 'BOT_QQ_MAIN' ? 'moon_hard_limit_m' : '_hard_limit_m';
+      const limitM = budget[hardKey] || 3;
+      const pct = limitM > 0 ? Math.round(total / (limitM * 1e6) * 100) : 0;
+      const barColor = pct > 90 ? 'var(--bot-)' : pct > 70 ? '#f0ad4e' : 'var(--bot-moon)';
+      return `<div class="stat-card" style="border-left:3px solid ${cssColor}">
+        <div class="val" style="font-size:1.1rem;color:${cssColor}">${name}</div>
+        <div style="margin:0.3rem 0;background:var(--pico-muted-border-color);border-radius:4px;height:6px">
+          <div style="width:${Math.min(pct,100)}%;height:6px;background:${barColor};border-radius:4px"></div>
+        </div>
+        <div class="lbl">${fm(total)} / ${limitM}M (${pct}%)</div>
+        <div class="lbl" style="font-size:0.75rem;margin-top:0.2rem">
+          in:${fm(b.input_tokens)} out:${fm(b.output_tokens)} 请求:${b.request_count||0}
+        </div>
+      </div>`;
+    }).join('') : '<div class="empty-state">暂无 per-bot 数据（需重启后启用 bot_id 标记）</div>';
+
+    document.getElementById('token-by-bot').innerHTML = botCards
+      ? `<div class="stats-grid">${botCards}</div>` : botCards;
+
+    document.getElementById('token-stats-grid').innerHTML = `
+      <div class="stat-card"><div class="val">${fm(s.input_tokens)}</div><div class="lbl">Input Tokens</div></div>
+      <div class="stat-card"><div class="val">${fm(s.output_tokens)}</div><div class="lbl">Output Tokens</div></div>
+      <div class="stat-card"><div class="val">${s.cache_hit_rate}%</div><div class="lbl">Cache Hit</div></div>
+      <div class="stat-card"><div class="val">${s.request_count}</div><div class="lbl">请求次数</div></div>
+      <div class="stat-card"><div class="val">&yen;${s.estimated_cost_cny}</div><div class="lbl">估算费用</div></div>`;
+
+    const sc = s.by_scenario||{};
+    document.getElementById('token-by-scenario').innerHTML = Object.keys(sc).length
+      ? `<div class="overflow-auto"><table><thead><tr><th>场景</th><th>Input</th><th>Output</th><th>请求数</th></tr></thead>
+         <tbody>${Object.entries(sc).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${fm(v.input_tokens)}</td><td>${fm(v.output_tokens)}</td><td>${v.request_count}</td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty-state">暂无数据</div>';
+
+    const db = (await apiGet('/db-stats')).stats;
+    document.getElementById('db-stats-grid').innerHTML = `
+      <div class="stat-card"><div class="val">${db.user_count||0}</div><div class="lbl">用户数</div></div>
+      <div class="stat-card"><div class="val">${db.memory_count||0}</div><div class="lbl">记忆条数</div></div>
+      <div class="stat-card"><div class="val">${db.knowledge_sections||0}</div><div class="lbl">知识库章节</div></div>
+      <div class="stat-card"><div class="val">${db.suspected_bots||0}</div><div class="lbl">疑似 Bot</div></div>
+      <div class="stat-card"><div class="val">${db.db_size_kb||0} KB</div><div class="lbl">数据库</div></div>`;
+  } catch(e) { console.error(e); }
+}
+
+async function loadBudget() {
+  try {
+    const b = await apiGet('/token-budget');
+    document.getElementById('moon-hard-m').value = b.moon_hard_limit_m;
+    document.getElementById('moon-soft-m').value = b.moon_soft_limit_m;
+    document.getElementById('-hard-m').value = b._hard_limit_m;
+    document.getElementById('-soft-m').value = b._soft_limit_m;
+  } catch(e) { console.error(e); }
+}
+
+document.getElementById('save-budget-btn').addEventListener('click', async () => {
+  try {
+    await apiPost('/token-budget', {
+      daily_token_limit_moon_m: parseFloat(document.getElementById('moon-hard-m').value)||3,
+      daily_token_soft_limit_moon_m: parseFloat(document.getElementById('moon-soft-m').value)||2.4,
+      daily_token_limit__m: parseFloat(document.getElementById('-hard-m').value)||3,
+      daily_token_soft_limit__m: parseFloat(document.getElementById('-soft-m').value)||2.4,
+    });
+    toast('Token 预算已保存');
+    loadTokens();
+  } catch(e) { toast('保存失败', true); }
+});
+
+document.getElementById('token-period').addEventListener('change', loadTokens);
+
+// ── Tab switching ─────────────────────────────────────────
+
+document.querySelector('.tab-bar').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
+  const loaders = {llm:loadLLM, vlm:loadVLM, temp:loadTemps, chat:loadChatParams, tokens:() => { loadTokens(); loadBudget(); }};
+  if (loaders[btn.dataset.tab]) loaders[btn.dataset.tab]();
+});
+
+// ── Init ──────────────────────────────────────────────────
+
+(function init() {
+  switchBot(CURRENT_BOT);
+  loadLLM();
+})();
+</script>
+
+</body>
+</html>

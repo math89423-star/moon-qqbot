@@ -1,0 +1,31 @@
+name: astrbot_plugin_suli_tavern
+display_name: 粟藜 · 角色扮演与群聊主控
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: 粟藜 (L-Port) AstrBot 原生插件 — QQ 角色扮演 + 群聊自然对话 + L-Port 生图入口。B 路线直连 API，自带三层记忆系统、统一意图门控 (含 Grace)、Bot 行为检测、VLM 识图、工具调用。
+desc: 粟藜：角色扮演、群聊自然对话、L-Port 生图、三层记忆、意图门控、VLM 识图
+repo: https://github.com/math89423-star/suli_qqbot
+category: AI 增强
+tags:
+  - 角色扮演
+  - 群聊
+  - 生图
+  - 记忆
+  - 识图
+  - L-Port
+help: |
+  私聊/群聊发送：
+  - /role <消息>            与粟藜角色扮演
+  - /role reset             重置会话
+  - /role help              显示帮助
+  - /role group status      查看群聊状态
+  - 直接发消息即可自动角色扮演（私聊无需 /role 前缀）
+  - 群聊中 @粟藜 或喊名字触发自然对话
+  - 发送图片 @粟藜 可触发识图
+
+  管理命令：
+  - Web 管理面板: 群聊白名单/配置/记忆管理
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

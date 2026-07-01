@@ -1,0 +1,5 @@
+name: astrbot_plugin_suli_gate
+display_name: 粟藜 · 三层意图门控
+desc: 粟藜 3-Stage Intent Gate — 意图行为闸 (Relevance → Intent → Grace)
+version: 1.0.0
+author: 粟藜
