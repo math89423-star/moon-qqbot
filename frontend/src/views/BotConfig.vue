@@ -16,7 +16,7 @@ import type {
 } from '@/types'
 import {
   Cpu, Server, Thermometer, Sliders, BarChart3,
-  MessageSquare, User, Brain,
+  MessageSquare, User, Brain, Eye, Shield,
   Plus, Pencil, Trash2, X, Wrench,
 } from '@lucide/vue'
 
@@ -47,11 +47,25 @@ async function loadSettings() {
   finally { settingsLoading.value = false }
 }
 
-async function toggleChat(type: 'group_chat_enabled' | 'private_chat_enabled' | 'reasoning_enabled', val: boolean) {
+async function toggleChat(type: 'group_chat_enabled' | 'private_chat_enabled' | 'reasoning_enabled' | 'shadow_agent_enabled', val: boolean) {
   if (!settings.value) return
   try {
     await updateBotSettings(currentBot.value, { [type]: val })
     settings.value[type] = val
+  } catch { /* ignore */ }
+}
+
+async function saveOwnerQQ() {
+  if (!settings.value) return
+  try {
+    await updateBotSettings(currentBot.value, { owner_qq: settings.value.owner_qq })
+  } catch { /* ignore */ }
+}
+
+async function saveShadowModel() {
+  if (!settings.value) return
+  try {
+    await updateBotSettings(currentBot.value, { shadow_agent_model: settings.value.shadow_agent_model })
   } catch { /* ignore */ }
 }
 
@@ -465,6 +479,23 @@ function slotLabel(slotKey: string, tab: string): string {
           <input type="checkbox" :checked="settings.reasoning_enabled"
             @change="toggleChat('reasoning_enabled', ($event.target as HTMLInputElement).checked)" />
         </label>
+        <label class="toggle-label">
+          <Eye :size="14" />
+          <span>影子</span>
+          <input type="checkbox" :checked="settings.shadow_agent_enabled"
+            @change="toggleChat('shadow_agent_enabled', ($event.target as HTMLInputElement).checked)" />
+        </label>
+      </div>
+      <div class="owner-row">
+        <label class="owner-label">
+          <Shield :size="14" />
+          <span>管理员QQ</span>
+        </label>
+        <input class="owner-input" type="text" v-model="settings.owner_qq" placeholder="824941143"
+          @blur="saveOwnerQQ" @keyup.enter="($event.target as HTMLInputElement).blur()" />
+        <input class="shadow-model-input" type="text" v-model="settings.shadow_agent_model"
+          placeholder="影子模型覆写(空=跟llm_lite)" @blur="saveShadowModel"
+          @keyup.enter="($event.target as HTMLInputElement).blur()" />
       </div>
     </div>
 
@@ -645,7 +676,8 @@ function slotLabel(slotKey: string, tab: string): string {
               <span class="tool-label">{{ t.label }}</span>
               <span class="tool-name-tag">{{ t.name }}</span>
               <span v-if="t.bot === 'both'" class="badge badge-shared">共享</span>
-              <span v-else class="badge badge-loput">暮恩</span>
+              <span v-else-if="t.bot === 'loput'" class="badge badge-loput">洛普特</span>
+              <span v-else class="badge badge-luna">露娜</span>
               <span class="tool-desc">{{ t.desc }}</span>
             </div>
             <div class="tool-controls">
@@ -835,6 +867,7 @@ function slotLabel(slotKey: string, tab: string): string {
 .badge-active { background: #ecfdf5; color: #065f46; }
 .badge-shared { background: var(--primary-light); color: var(--primary-700); }
 .badge-loput { background: #ecfdf5; color: #065f46; }
+.badge-luna { background: #fdf2f8; color: #9d174d; }
 
 /* ── Row actions ── */
 .row-actions { display: flex; gap: 4px; }

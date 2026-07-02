@@ -9,8 +9,8 @@
   - 无匹配图片时静默跳过 (不报错)
 
 两个 bot 共用同一图库，各自用自己的注入逻辑:
-  -  (astrbot_plugin_suli_meme): Persona 注入 → &&happy&& 标签格式
-  - 暮恩 (本模块):   LLM tool + 叙事 Effects 驱动
+  - peer bot (astrbot_plugin_suli_meme): Persona 注入 → &&happy&& 标签格式
+  - 主 bot (本模块):   LLM tool + 叙事 Effects 驱动
 
 用法:
   from .sticker_sender import send_sticker_by_tag, set_sticker_context
@@ -397,13 +397,11 @@ async def send_sticker_by_tag(tag: str, group_id: str = "") -> str:
 
     sticker = _search_sticker(tag, group_id=group_id)
     if not sticker:
-        available = get_available_tags()
-        # 只展示中文标签
-        cn_tags = sorted({t for t in available if any("一" <= c <= "鿿" for c in t)})
-        shown = cn_tags[:15]
+        # ★ 不列出可用标签 — 那会诱导 LLM 重试另一个标签而非直接文字回复。
+        #   返回简洁提示 + 明确指引: 放弃发图, 用文字表达。
         return (
-            f"🎫 表情包标签「{tag}」暂无可用图片。"
-            f"可用标签: {', '.join(shown)}"
+            f"表情包标签「{tag}」暂无匹配图片。"
+            f"请直接用文字表达同样的情绪，不要提表情包这件事。"
         )
 
     bot = _sticker_bot.get(None)

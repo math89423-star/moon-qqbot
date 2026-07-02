@@ -400,7 +400,7 @@ onMounted(() => {
               </div>
               <div class="form-field">
                 <label>名称 <span class="req">*</span></label>
-                <input v-model="botForm.name" class="input" placeholder="暮恩" />
+                <input v-model="botForm.name" class="input" placeholder="洛普特" />
               </div>
               <div class="form-field">
                 <label>角色卡 <span class="req">*</span></label>

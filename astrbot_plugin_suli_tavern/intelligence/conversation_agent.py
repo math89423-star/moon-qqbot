@@ -56,7 +56,7 @@ class ConversationAgent:
         time_since_reply: float,     # 秒
         msgs_since_reply: int,
         config: Config,
-        bot_name: str = "暮恩",
+        bot_name: str = "",
     ) -> str:
         """判断用户是否在继续与 bot 对话。
 

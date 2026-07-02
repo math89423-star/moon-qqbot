@@ -1,7 +1,7 @@
 """主动行为调度器 — 后台轮询循环 + 用户扫描 + 群冷场检测。
 
 整合:
-  - 私聊主动行为 (提取自 _scheduler_loop + _tick)
+  - 私聊主动行为 (提取自社区插件 _scheduler_loop + _tick)
   - 群聊冷场破冰 (继承自原有 proactive_speaker.py)
 """
 

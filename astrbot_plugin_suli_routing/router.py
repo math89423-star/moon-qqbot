@@ -91,6 +91,8 @@ class ModelRouter:
         admin_qq: int = 0,
         challenge_verdict: str | None = None,
         tools_enabled: bool = False,
+        # ── Gate 信号 (权威) ──
+        gate_tier: str = "",
         # ── Pre-flight 增强信号 ──
         context_complexity: float = 0.0,
         tool_chain_depth: int = 0,
@@ -98,7 +100,11 @@ class ModelRouter:
         user_affinity_level: int = 0,
         active_domain_count: int = 0,
     ) -> ModelTier:
-        """根据上下文信号决定使用哪个模型 tier。
+        """根据 Gate 权威 tier + 上下文信号决定使用哪个模型 tier。
+
+        ★ Gate 的 model_tier 是权威输入——路由层只降不升，除非安全硬线触发。
+        降级: 好感度门控 (非管理员好感<3 → pro→lite)
+        升级: 仅 deadlock / bot_wrong 两条安全硬线可升。
 
         Args:
             trigger_reason: 触发原因 — "mention"|"nickname"|"reply"|"batch"
@@ -109,6 +115,7 @@ class ModelRouter:
             admin_qq: 管理员 QQ 号
             challenge_verdict: 交叉验证结果 — "bot_wrong"|"bot_right"|"deadlock"|None
             tools_enabled: 本轮是否启用工具调用
+            gate_tier: ★ Gate 权威 tier 判定 ("lite"|"pro") — 路由层以此为基线
             context_complexity: Pre-flight 上下文复杂度 (0.0-10.0)
             tool_chain_depth: 推荐工具数量
             has_unresolved_images: 是否有未解析的图片
@@ -119,82 +126,37 @@ class ModelRouter:
             ModelTier — 该用哪个等级的模型
         """
 
-        _ = tools_enabled  # 预留给未来工具感知路由 (工具链深度已覆盖)
-
+        _ = tools_enabled  # 预留给未来工具感知路由
         _is_admin = bool(admin_qq and str(user_id) == str(admin_qq))
-        tier: ModelTier = ModelTier.LITE  # 默认
 
-        # ── deadlock → 至少用 PRO 纠错 ──────
+        # ★ Gate tier 为权威基线
+        if gate_tier == "pro":
+            tier = ModelTier.PRO
+        else:
+            tier = ModelTier.LITE
+
+        # ═══════════════════════════════════════════════════════════
+        # 安全硬线: 仅这两条可无视 Gate 升级到 PRO (且豁免亲和力门控)
+        # ═══════════════════════════════════════════════════════════
+        _safety_override = False
+
+        # deadlock → 至少用 PRO 纠错
         if challenge_verdict == "deadlock":
-            logger.info("模型路由: deadlock 升级到 PRO")
+            logger.info("模型路由: deadlock 升级到 PRO (安全硬线)")
             tier = ModelTier.PRO
+            _safety_override = True
 
-        # ── 交叉验证 bot_wrong — 用 pro 纠正
+        # 交叉验证 bot_wrong → 用 pro 纠正
         elif challenge_verdict == "bot_wrong":
-            logger.info("模型路由: bot_wrong 升级到 PRO")
+            logger.info("模型路由: bot_wrong 升级到 PRO (安全硬线)")
             tier = ModelTier.PRO
-
-        # 技术话题激活 → 需要深度推理 (注入 domain 感知)
-        elif active_domains and _domain is not None and _domain.is_reasoning_needed(active_domains):
-            logger.debug("模型路由: 技术话题 → PRO")
-            tier = ModelTier.PRO
-
-        # 用户显式要求思考/分析 (注入 domain 感知)
-        elif user_message and _domain is not None and _domain.user_force_reasoning(user_message):
-            logger.debug("模型路由: 用户要求推理 → PRO")
-            tier = ModelTier.PRO
-
-        # ── 🆕 上下文复杂度驱动升级 ──────────────────────
-
-        # 信号 A: 上下文复杂度 >= 4.0 — 需要更深的推理
-        elif context_complexity >= 4.0:
-            logger.info(
-                "模型路由: 上下文复杂度 %.1f >= 4.0 → PRO",
-                context_complexity,
-            )
-            tier = ModelTier.PRO
-
-        # 信号 B: 有未解析图片 — 图片理解需要更强能力
-        elif has_unresolved_images:
-            logger.info("模型路由: 有待解析图片 → PRO")
-            tier = ModelTier.PRO
-
-        # 信号 C: 工具链深度 >= 2 — 多工具编排需要更好的规划
-        elif tool_chain_depth >= 2:
-            logger.info("模型路由: 工具链深度 %d >= 2 → PRO", tool_chain_depth)
-            tier = ModelTier.PRO
-
-        # 信号 D: 问句 + 中等复杂度 — 可能需要推理才能回答好
-        elif (
-            user_message
-            and _QUESTION_SIGNAL_RE.search(user_message)
-            and context_complexity >= 3.0
-        ):
-            logger.info(
-                "模型路由: 含问句 + 复杂度 %.1f → PRO",
-                context_complexity,
-            )
-            tier = ModelTier.PRO
-
-        # 信号 E: 多话题并发 — 需要更好的上下文切换能力
-        elif active_domain_count >= 2:
-            logger.info(
-                "模型路由: 多话题并发 (%d domains) → PRO",
-                active_domain_count,
-            )
-            tier = ModelTier.PRO
-
-        # ── Tier 1: LITE — 默认闲聊 ────────────────────
-        # tier 已是 LITE
+            _safety_override = True
 
         # ═══════════════════════════════════════════════════════════
-        # 后处理: 亲和力门控 (管理员豁免)
+        # 降级门控: PRO 亲和力门控 — 非管理员 + 好感度 < 3 → 强制降级 LITE
+        # ★ 安全硬线豁免: deadlock/bot_wrong 不受亲和力限制
         # ═══════════════════════════════════════════════════════════
-
-        # ── PRO 亲和力门控: 非管理员 + 好感度 < 3 → 强制降级 LITE ──
-        #    管理员豁免此门控 — 管理员不受好感度限制，Gate 判 pro 即放行
-        #    pro 永远由 Gate 判定，路由层不做任何人的自动升级
-        if tier == ModelTier.PRO and not _is_admin and user_affinity_level < 3:
+        if tier == ModelTier.PRO and not _is_admin and user_affinity_level < 3 and not _safety_override:
             logger.info(
                 "模型路由: PRO 降级 LITE (好感度 Lv.%d < 3, 非管理员)",
                 user_affinity_level,

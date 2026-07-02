@@ -6,6 +6,7 @@ AstrBot 插件 — L-Port LLM 配置桥接。核心业务逻辑 (config_reader /
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import Optional
 
@@ -68,13 +69,13 @@ class LPortBridgePlugin(Star):
     @filter.command("chat")
     async def on_chat_command(self, event: AstrMessageEvent):
         # ── /chat 命令已禁用 ──
-        await event.send(Plain("❌ /chat 命令已禁用。请直接发送消息与暮恩对话。"))
+        await event.send(Plain("❌ /chat 命令已禁用。请直接发送消息进行对话。"))
         return
 
     async def _on_chat_command_disabled(self, event: AstrMessageEvent):
         # 保留旧入口供参考, 实际不可达
-        # ── Self-ID 身份门控: 仅处理暮恩的事件 (fail-closed) ──
-        if not self._self_id(event) or self._self_id(event) != "BOT_QQ_MAIN":
+        # ── Self-ID 身份门控: 仅处理主 bot 的事件 (fail-closed) ──
+        if not self._self_id(event) or self._self_id(event) != os.environ.get("BOT_QQ_MAIN", ""):
             return
         if self._init_error:
             await event.send(Plain(f"❌ {self._init_error}"))

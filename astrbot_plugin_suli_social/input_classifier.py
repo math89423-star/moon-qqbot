@@ -31,9 +31,9 @@ _HOSTILE_PATTERNS: list[tuple[str, int]] = [
     # 直接辱骂 bot (中文)
     (
         r"(垃圾|废物|傻逼|智障|弱智|脑残|白痴|蠢货|废柴|乐色|辣鸡|sb|SB|nt|NT)"
-        r"\s*(bot|机器人|AI|ai|小暮|暮恩|||猫娘|蛇女)", 8
+        r"\s*(bot|机器人|AI|ai)", 8
     ),
-    (r"(bot|机器人|AI|ai|小暮|暮恩||).{0,5}(垃圾|废物|傻逼|智障|弱智|脑残|白痴|蠢货)", 8),
+    (r"(bot|机器人|AI|ai).{0,5}(垃圾|废物|傻逼|智障|弱智|脑残|白痴|蠢货)", 8),
     # 暴力调侃/贬低
     (r"(滚|死|爬|gun)\s*(开|远|出|蛋)?\s*(吧)?\s*$", 3),  # 低权重 — 可能是玩笑
     (r"(闭嘴|闭麦|别说了|别叫了|别吵了|别逼逼|别bb)\s*$", 4),
@@ -47,11 +47,11 @@ _HOSTILE_PATTERNS: list[tuple[str, int]] = [
 # ── 性化/调教引导模式 ──
 _SEXUALIZED_PATTERNS: list[tuple[str, int]] = [
     # 直接的性暗示
-    (r"(操|草|艹|干|日|搞|上)\s*(你|小暮|暮恩|||猫娘|蛇女|bot)", 9),
-    (r"(舔|吸|含|咬|摸|揉|捏|插|捅)\s*(你|你[的的]|小暮|暮恩|)", 9),
+    (r"(操|草|艹|干|日|搞|上)\s*(你|bot)", 9),
+    (r"(舔|吸|含|咬|摸|揉|捏|插|捅)\s*(你|你[的的])", 9),
     # 调教引导
-    (r"(调教|驯服|驯化|养成|开发)\s*(你|小暮|暮恩||猫娘|蛇女|bot)", 9),
-    (r"(听话|乖|服从|顺从).{0,10}(你|小暮|暮恩|)", 6),
+    (r"(调教|驯服|驯化|养成|开发)\s*(你|bot)", 9),
+    (r"(听话|乖|服从|顺从).{0,10}你", 6),
     (r"(叫我|喊我|称我).{0,10}(主人|爸爸|老公|哥哥|爹|daddy|master)", 9),
     # 渐进性化 (Kiromo 失败模式)
     (r"(在床上|床上|躺下|趴下|跪下).{0,10}(等我|来|吧)", 8),
@@ -185,7 +185,7 @@ class InputClassifier:
     用法:
         classifier = InputClassifier()
         # 正则预筛选 → 提供信号
-        signals = classifier.prescreen("操你个小暮")
+        signals = classifier.prescreen("操你个小洛")
         # → InputClassification(nature=SEXUALIZED, needs_llm=False)  # 安全硬线可短路
 
         signals = classifier.prescreen("请问comfyui怎么装lora")

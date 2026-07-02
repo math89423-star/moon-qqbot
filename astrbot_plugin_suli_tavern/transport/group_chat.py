@@ -83,6 +83,9 @@ _TOOL_NAME_CN = {
     "list_available_models": "模型列表", "list_custom_nodes": "节点列表",
     "remember_memory": "记忆", "get_memory": "记忆",
     "pixiv_search": "Pixiv搜图",
+    "video_extract": "视频提取",
+    "send_sticker": "发送表情包",
+    "parse_forwarded_message": "读取转发内容",
 }
 
 
@@ -286,7 +289,7 @@ def _is_trivial_noise(content: str) -> bool:
 _KEYWORD_WAKE_RE = re.compile(
     r"|".join([
         # ── 叫 bot 名字 ──
-        r"(小暮|暮恩|moon|洛酱|蛇娘|梅比乌斯||||猫娘|露酱)",
+        r"(小洛|洛普特|loput|洛酱|蛇娘|梅比乌斯)",
         # ── 疑问句式 ──
         r"[吗呢吧啊][？?]",
         r"^(什么|怎么|如何|为什么|为啥|哪[个些]|谁|多少|几点)",
@@ -320,7 +323,7 @@ _llm_semaphores: dict[str, asyncio.Semaphore] = {}
 """per-bot LLM 并发信号量 — key=bot_id, 每个 bot 独立配额."""
 
 # ── URL→file_id 映射缓存 (跨消息查找恢复 OneBot file_id) ──
-# main.py 在设置 _moon_deferred_vlm 时同步写入。
+# main.py 在设置 _loput_deferred_vlm 时同步写入。
 # 跨消息查找从 ctx.messages 中提取 URL 后，从此缓存恢复 file_id，
 # 使 describe_images_from_urls 能走 OneBot get_image API 而非 HTTP fallback。
 _url_to_file_id: dict[str, str] = {}
@@ -341,6 +344,19 @@ def get_llm_semaphore(bot_id: str = "", max_calls: int = 3) -> asyncio.Semaphore
 
 # LLM 决定沉默时的回复标记
 SILENCE_MARKER = "[静默]"
+
+
+def _get_sticker_tags_for_gate() -> str:
+    """获取表情包可用标签列表，注入 Gate prompt 防止推荐不存在的标签。"""
+    try:
+        from ..sticker_sender import get_available_tags
+        tags = get_available_tags()
+        if tags:
+            return "、".join(tags)
+    except Exception:
+        pass
+    return ""
+
 
 def _inject_knowledge(messages: list[dict], group_id: str = "") -> int:
     """知识库 Pre-inject: 用最近用户消息检索本地知识库，注入到 system prompt。
@@ -513,6 +529,18 @@ class GroupChatScheduler:
         # ── 近期自我行为记忆: 语义级触发合并 + Gate 感知 ──
         self._self_behavior = get_self_behavior_store(ttl_seconds=30.0)
 
+        # ── ★ 代码层身份追踪 + 变化检测 (2026-07-02 压力测试加固) ──
+        from ..intelligence.identity_tracker import IdentityTracker, ChangeDetector
+        _owner_qqs: set[str] = getattr(self._config, "OWNER_QQ_WHITELIST", {str(self._config.super_admin_qq)})
+        self._identity_tracker = IdentityTracker(owner_qq_whitelist=_owner_qqs)
+        self._change_detector = ChangeDetector()
+        # 影子 Agent 会话缓存 — 按需获取
+        self._shadow_sessions: dict[str, object] = {}  # key → ShadowSession
+        # 影子外部更新批处理: {key: [observations]}
+        self._shadow_batches: dict[str, list[str]] = {}
+        self._shadow_batch_scores: dict[str, float] = {}  # key → max score in batch
+        logger.info("IdentityTracker + ChangeDetector + Shadow 会话缓存已初始化")
+
         # ── Stage 3 Grace Period 活跃实例: 供 on_message/notice 喂入事件 ──
         self._active_grace_periods: dict[str, "GracePeriod"] = {}
 
@@ -562,7 +590,7 @@ class GroupChatScheduler:
                         PeerIsolation.load_flagged(self._current_bot_id, [f["user_id"] for f in flagged])
 
                     # ── E1 双向加固: 预标记已知 peer bot ──
-                    #  (peer_bot_qq) 是同群对照 bot——她的发言应始终被隔离，
+                    # peer bot (peer_bot_qq) 是同群对照 bot——她的发言应始终被隔离，
                     # 无需等待 BotDetector 累积样本。此标记从启动即生效。
                     _peer_qq = str(getattr(config, "peer_bot_qq", "") or "")
                     if _peer_qq and _peer_qq != "0":
@@ -630,7 +658,7 @@ class GroupChatScheduler:
             )
 
             # Domain 感知: 包装 domains 模块的两个判定函数
-            class _MoonDomainAwareness:
+            class _LoputDomainAwareness:
                 @staticmethod
                 def is_reasoning_needed(
                     active_domains: dict[str, float], threshold: float = 2.0,
@@ -644,7 +672,7 @@ class GroupChatScheduler:
                     return user_force_reasoning(message)
 
             # 凭证提供者: 桥接 bot_db + bot_config
-            class _MoonCredentialProvider:
+            class _LoputCredentialProvider:
                 @staticmethod
                 def get_config_model(key: str, default: str = "") -> str:
                     from ..service.bot_config import get_config_service
@@ -693,8 +721,8 @@ class GroupChatScheduler:
                     from ..service.bot_config import get_config_service
                     return get_config_service().resolve_active_llm()
 
-            init_domain_awareness(_MoonDomainAwareness())
-            init_credential_provider(_MoonCredentialProvider())
+            init_domain_awareness(_LoputDomainAwareness())
+            init_credential_provider(_LoputCredentialProvider())
             logger.debug("模型路由依赖注入完成")
         except Exception:
             logger.debug("模型路由依赖注入失败 (非关键)", exc_info=True)
@@ -703,6 +731,104 @@ class GroupChatScheduler:
             "群聊调度器初始化完成, 已启用群: %s",
             dict(sorted(self._group_tiers.items())) if self._group_tiers else "(无)",
         )
+
+    # ── ★ 影子 Agent 批处理刷新 (2026-07-02 加固) ─────
+
+    async def _flush_shadow_batch(
+        self, bot_id: str, group_id: str, *, urgent: bool = False,
+    ) -> None:
+        """将积压的外部观察发送给影子 LLM 更新。
+
+        Args:
+            urgent: True → 冒充/安全告警，不等待批次凑满
+        """
+        _key = f"{bot_id}:{group_id}"
+        batch = self._shadow_batches.pop(_key, [])
+        max_score = self._shadow_batch_scores.pop(_key, 0.0)
+        if not batch:
+            return
+
+        # 非紧急 + 批次不够 → 放回去继续攒
+        if not urgent and len(batch) < 10:
+            elapsed = self._change_detector.time_since_update(bot_id, group_id)
+            if elapsed < 120:  # 不到 2 分钟
+                self._shadow_batches[_key] = batch
+                self._shadow_batch_scores[_key] = max_score
+                return
+
+        try:
+            from ..intelligence.shadow_agent import get_session
+            _char = self._resolve_character(bot_id).get("name", "")
+            shadow = get_session(bot_id, group_id, char_name=_char)
+
+            # 构建身份快照
+            identity_snapshot = self._build_identity_snapshot(bot_id, group_id)
+
+            # 组装观察摘要
+            observations = "\n".join(f"· {obs}" for obs in batch)
+
+            # 异步调用影子 LLM
+            try:
+                from ..service.bot_config import get_config_service
+                _svc = get_config_service()
+            except Exception:
+                _svc = None
+
+            await shadow.update_external(
+                observations,
+                identity_snapshot=identity_snapshot,
+                tavern=self._tavern,
+                config_service=_svc,
+                force=urgent,
+            )
+            self._change_detector.mark_updated(bot_id, group_id)
+            logger.info(
+                "Shadow flush: bot=%s group=%s batch=%d urgent=%s",
+                bot_id[:8], group_id, len(batch), urgent,
+            )
+        except Exception:
+            logger.debug("Shadow flush 异常", exc_info=True)
+            # 异常时不清除批次，下次重试
+            if _key not in self._shadow_batches:
+                self._shadow_batches[_key] = batch
+                self._shadow_batch_scores[_key] = max_score
+
+    def _build_identity_snapshot(self, bot_id: str, group_id: str) -> str:
+        """构建代码层身份快照（注入影子 + 主 LLM prompt）。
+
+        纯代码生成，零 LLM 成本。
+        """
+        trackers = self._identity_tracker.get_all(bot_id, group_id)
+        if not trackers:
+            return ""
+
+        lines: list[str] = ["[会话身份快照 — 代码层验证]"]
+        owners = [info for info in trackers.values() if info.is_owner]
+        impersonators = [info for info in trackers.values() if info.impersonating]
+        others = [
+            info for info in trackers.values()
+            if not info.is_owner and not info.impersonating
+        ]
+
+        for info in owners:
+            names = "、".join(info.display_names) if info.display_names else "?"
+            lines.append(f"· 主人: {names} (QQ:{info.user_id}) ← 白名单验证")
+
+        for info in impersonators:
+            names = "、".join(info.display_names) if info.display_names else "?"
+            target = info.impersonation_target or "主人"
+            lines.append(f"· ⚠️ 冒充者: {names} (QQ:{info.user_id}) — 昵称与{target}相同但QQ不同!")
+
+        for info in others[:8]:  # 最多 8 个普通群友
+            names = "、".join(info.display_names) if info.display_names else "?"
+            flags = ""
+            if "safety_probe" in info.behavior_flags:
+                flags += " [安全试探]"
+            if info.message_count == 1:
+                flags += " [新出现]"
+            lines.append(f"· {names} (QQ:{info.user_id}){flags}")
+
+        return "\n".join(lines)
 
     # ── 对话参数读取 (DB 优先 → Config fallback) ─────
 
@@ -730,7 +856,7 @@ class GroupChatScheduler:
             self_id: bot 的 QQ 号 (如前端传入的 QQ 号)
 
         Returns:
-            角色卡 data dict，未知 self_id 返回暮恩
+            角色卡 data dict，未知 self_id 返回默认角色
         """
         return self._characters.get(
             str(self_id),
@@ -891,14 +1017,10 @@ class GroupChatScheduler:
     def _maybe_reload_whitelist(self) -> None:
         """检测白名单文件是否被外部修改 (如管理面板), 自动热加载。
 
-        管理面板 (moon-panel) 是独立容器，写 JSON 文件后无法直接
+        管理面板 (loput-panel) 是独立容器，写 JSON 文件后无法直接
         更新 bot 容器的内存缓存。此方法在每次白名单查询时检查文件
         mtime，发现变更即自动重载 —— 无需重启 bot。
         """
-        if not self._whitelist_loaded:
-            self._load_whitelist()
-            self._whitelist_loaded = True
-            return
         try:
             current_mtime = self._whitelist_path.stat().st_mtime
         except FileNotFoundError:
@@ -943,12 +1065,8 @@ class GroupChatScheduler:
 
     # ── 公开接口 ──────────────────────────────────────
 
-    def is_group_enabled(self, group_id: int, bot_id: str = "") -> bool:
+    def is_group_enabled(self, group_id: int) -> bool:
         """检查群是否已启用 (basic 或 full 等级)。"""
-        # 首次启动时 _current_bot_id 可能尚未设置，从参数传入
-        if bot_id and bot_id != self._current_bot_id:
-            self._current_bot_id = bot_id
-            self._whitelist_loaded = False  # 强制重载
         self._maybe_reload_whitelist()
         return group_id in self._group_tiers
 
@@ -1109,11 +1227,14 @@ class GroupChatScheduler:
             self._my_name = get_bot_name(_bid) or ""
             self._peer_name = get_bot_name(get_peer_qq(_bid)) if get_peer_qq(_bid) else ""
             _char = self._resolve_character(_bid).get("name", "")
-            self._my_identity = (
-                "暮恩 — 白发红瞳冰山少女，寡言精准"
-                if _char == "暮恩"
-                else " — 银发猫娘 AI 助手，温柔俏皮"
-            )
+            # my_identity 从 BotIdentityService 动态获取, 不在此硬编码
+            from ..service.bot_identity import get_bot_identity_service
+            _id_svc = get_bot_identity_service()
+            _bot_obj = _id_svc.get_bot(str(_bid)) if _id_svc else None
+            if _bot_obj and _bot_obj.role_description:
+                self._my_identity = f"{_bot_obj.name} — {_bot_obj.role_description}"
+            else:
+                self._my_identity = _char or "bot"
             self._per_bot_names_initialized = True
             # 用正确的 bot_id 重建社会守卫 (__init__ 时用了空 bot_id)
             _peer_qq_social = str(getattr(self._config, "peer_bot_qq", "") or "")
@@ -1320,6 +1441,48 @@ class GroupChatScheduler:
         # 5. 消息入库
         ctx.add_message(user_id, user_name, content)
 
+        # 5.001 ★ 代码层身份追踪 + 变化检测 (2026-07-02 加固)
+        #     身份追踪始终运行 (零成本); 影子 LLM 受开关控制
+        try:
+            _bid = self._current_bot_id or ""
+            _gid = str(group_id)
+            _tracker = self._identity_tracker
+            _tracker.update(_bid, _gid, user_id, user_name)
+            # 检查影子 Agent 开关 — 关闭时只做身份追踪，不触发 LLM
+            _shadow_enabled = True
+            try:
+                from ..service.bot_config import get_config_service
+                _shadow_enabled = get_config_service().is_shadow_agent_enabled(_bid)
+            except Exception:
+                pass
+            if _shadow_enabled:
+                _score = self._change_detector.score(
+                    user_id, user_name, content, _tracker, _bid, _gid,
+                    is_at_bot=False,
+                    trigger_reason="",
+                )
+                if _score >= 0.3:
+                    _skey = f"{_bid}:{_gid}"
+                    if _skey not in self._shadow_batches:
+                        self._shadow_batches[_skey] = []
+                    _obs = f"[QQ:{user_id}] {user_name}: {content[:100]}{'...' if len(content) > 100 else ''}"
+                    self._shadow_batches[_skey].append(_obs)
+                    self._shadow_batch_scores[_skey] = max(
+                        self._shadow_batch_scores.get(_skey, 0.0), _score,
+                    )
+                    logger.debug(
+                        "Shadow batch: group=%s user=%s/%s score=%.2f batch_size=%d",
+                        _gid, user_id[:8], user_name, _score,
+                        len(self._shadow_batches[_skey]),
+                    )
+                    if _score >= 0.5:
+                        safe_task(
+                            self._flush_shadow_batch(_bid, _gid, urgent=(_score >= 0.6)),
+                            name=f"shadow-flush-{_gid}",
+                        )
+        except Exception:
+            logger.debug("身份追踪/变化检测异常", exc_info=True)
+
         # 5.01 Stage 3 Grace Period: 喂入新消息 (用于检测用户反悔/修改请求)
         _gp = self._active_grace_periods.get(ctx_key)
         if _gp is not None:
@@ -1446,7 +1609,7 @@ class GroupChatScheduler:
                         _char = self._resolve_character(self._current_bot_id).get("name", "")
                         _busy_msg = (
                             "呜哇，人家正在回别人的消息呢，等一下下喵～"
-                            if _char == ""
+                            if _char == "露娜"
                             else "正在处理其他对话，请稍候。"
                         )
                         await bot.send(event, _busy_msg)
@@ -1599,10 +1762,10 @@ class GroupChatScheduler:
             if getattr(self._config, "energy_enabled", True) and ctx.energy > 0:
                 _batch_threshold /= ctx.energy
             if ctx.heat >= _batch_threshold:
-                # ── 消歧: 同 debounce 路径的硬过滤 ──
+                # ── peer bot 消歧: 同 debounce 路径的硬过滤 ──
                 if self._all_recent_msgs_for_other_bot(ctx, str(getattr(ctx.last_bot, "self_id", "") or "")):
                     logger.info(
-                        "群 %d: batch 跳过 (最近消息均为呼叫)",
+                        "群 %d: batch 跳过 (最近消息均为呼叫 peer bot)",
                         group_id,
                     )
                 else:
@@ -1658,10 +1821,10 @@ class GroupChatScheduler:
             logger.debug("群消息 @检测异常，跳过", exc_info=True)
         return False
 
-    # 的昵称 — 当 bot 是暮恩时，消息以这些开头说明在对说话
-    __NICKNAMES: tuple[str, ...] = ("", "", "")
-    # 暮恩的昵称 — 当 bot 是时，消息以这些开头说明在对暮恩说话
-    _MOON_NICKNAMES: tuple[str, ...] = ("小暮", "暮暮", "洛宝", "暮恩", "moon")
+    # peer bot 的昵称 — 当本 bot 是主 bot 时，消息以这些开头说明在对 peer bot 说话
+    _LUNA_NICKNAMES: tuple[str, ...] = ("小露", "露娜", "luna")
+    # 主 bot 的昵称 — 当本 bot 是 peer bot 时，消息以这些开头说明在对主 bot 说话
+    _LOPUT_NICKNAMES: tuple[str, ...] = ("小洛", "洛洛", "洛宝", "洛普特", "loput")
 
     def _is_nickname_mentioned(self, content: str, self_id: str = "") -> bool:
         """检查消息内容中是否包含机器人昵称 (大小写不敏感)。
@@ -1682,20 +1845,20 @@ class GroupChatScheduler:
 
         # ── 双 Bot 消歧: 根据当前 bot 身份选择昵称 ──
         _char_name = self._resolve_character(self_id).get("name", "")
-        is_ = _char_name == ""
+        is_luna = _char_name == "露娜"
 
-        if is_:
-            # 当前是: 检查的昵称，跳过暮恩的昵称
-            self_nicknames = ("", "娜娜", "", "")
-            other_nicknames = self._MOON_NICKNAMES
-            # 消息以暮恩昵称开头 → 在对暮恩说话，不触发
+        if is_luna:
+            # 当前是 peer bot: 检查 peer bot 的昵称，跳过主 bot 的昵称
+            self_nicknames = ("露娜", "娜娜", "小露", "luna")
+            other_nicknames = self._LOPUT_NICKNAMES
+            # 消息以主 bot 昵称开头 → 在对主 bot 说话，peer bot 不触发
             if any(lower.startswith(n) for n in other_nicknames):
                 return False
         else:
-            # 当前是暮恩: 检查暮恩的昵称，跳过的昵称
+            # 当前是主 bot: 检查主 bot 的昵称，跳过 peer bot 的昵称
             self_nicknames = nicknames
-            other_nicknames = self.__NICKNAMES
-            # 消息以昵称开头 → 在对说话，暮恩不触发
+            other_nicknames = self._LUNA_NICKNAMES
+            # 消息以 peer bot 昵称开头 → 在对 peer bot 说话，主 bot 不触发
             if any(lower.startswith(n) for n in other_nicknames):
                 return False
 
@@ -1744,8 +1907,8 @@ class GroupChatScheduler:
         """检查 debounce 前最近消息是否全部在呼叫另一个 bot。
 
         双 Bot 消歧: 根据 self_id 判断当前 bot 身份，反向检测。
-        - 当前是暮恩 → 检测是否全部在叫 (是则跳过)
-        - 当前是 → 检测是否全部在叫暮恩 (是则跳过)
+        - 当前是主 bot → 检测是否全部在叫 peer bot (是则跳过)
+        - 当前是 peer bot → 检测是否全部在叫主 bot (是则跳过)
 
         Returns:
             True = 所有最近用户消息都是对另一个 bot 说的 → 应跳过
@@ -1767,16 +1930,16 @@ class GroupChatScheduler:
             return False
 
         _char_name = self._resolve_character(self_id).get("name", "")
-        is_ = _char_name == ""
+        is_luna = _char_name == "露娜"
 
-        if is_:
-            # 当前是: 检查是否全部在叫暮恩
-            self_nicknames = ("", "娜娜", "", "")
-            other_nicknames = self._MOON_NICKNAMES
+        if is_luna:
+            # 当前是 peer bot: 检查是否全部在叫主 bot
+            self_nicknames = ("露娜", "娜娜", "小露", "luna")
+            other_nicknames = self._LOPUT_NICKNAMES
         else:
-            # 当前是暮恩: 检查是否全部在叫
+            # 当前是主 bot: 检查是否全部在叫 peer bot
             self_nicknames = nicknames
-            other_nicknames = self.__NICKNAMES
+            other_nicknames = self._LUNA_NICKNAMES
 
         _peer_qq = str(self._chat_param("peer_bot_qq", "peer_bot_qq") or "")
         from astrbot_plugin_suli_guards.dual_bot import get_peer_qq
@@ -1964,7 +2127,7 @@ class GroupChatScheduler:
             # 构建线程上下文 (bot 与用户最近几轮交换)
             thread_msgs = _extract_thread_context(ctx.messages, user_id)
 
-            _char_name = self._resolve_character(self._current_bot_id).get("name", "暮恩")
+            _char_name = self._resolve_character(self._current_bot_id).get("name", "")
             decision = await ConversationAgent.decide(
                 tavern=self._tavern,
                 thread_context=thread_msgs,
@@ -2112,13 +2275,13 @@ class GroupChatScheduler:
             group_id, delay, ctx.heat,
         )
 
-        # ── 消歧: 检查最近消息是否全部在叫 ──
+        # ── peer bot 消歧: 检查最近消息是否全部在叫 peer bot ──
         #     立即触发路径有 _is_nickname_mentioned 硬过滤 (已支持双Bot),
         #     但 debounce 路径只靠 ReplyGate LLM 判断,
         #     flash 模型非确定性, 可能误判 → 硬过滤兜底。
         if self._all_recent_msgs_for_other_bot(ctx, str(getattr(ctx.last_bot, "self_id", "") or "")):
             logger.info(
-                "群 %d: debounce 跳过 (最近消息均为呼叫)",
+                "群 %d: debounce 跳过 (最近消息均为呼叫 peer bot)",
                 group_id,
             )
             return
@@ -2456,9 +2619,7 @@ class GroupChatScheduler:
                     # per-bot 个性化 token 预算耗尽消息
                     _char = self._resolve_character(self._current_bot_id).get("name", "")
                     _budget_msg = (
-                        "呜…人家今天的 token 额度已经用完了喵，明天再来找人家玩嘛～"
-                        if _char == ""
-                        else "今日 token 配额已用尽，明天刷新。"
+                        f"今日 token 配额已用尽，明天刷新。"
                     )
                     await ctx.last_bot.send(_trigger_event, _budget_msg)
                 except Exception:
@@ -2496,7 +2657,7 @@ class GroupChatScheduler:
             # ── 交叉验证检查 (Phase D) ──
             challenge_info: dict | None = None
             cfg = self._config
-            char_name: str = self._resolve_character(getattr(ctx.last_bot, "self_id", "") if ctx.last_bot else "").get("name", "暮恩")
+            char_name: str = self._resolve_character(getattr(ctx.last_bot, "self_id", "") if ctx.last_bot else "").get("name", "")
             # 昵称唤醒词 — 从 BotIdentityService 获取
             _bot_nicknames = ""
             try:
@@ -2519,7 +2680,7 @@ class GroupChatScheduler:
                 self._peer_name,
             )
             if cfg.cross_validation_enabled and ctx.messages:
-                # 取最近一条用户消息 (非 bot 消息, 也排除对照 bot )
+                # 取最近一条用户消息 (非 bot 消息, 也排除对照 bot)
                 _peer_qq = str(self._chat_param("peer_bot_qq", "peer_bot_qq") or "")
                 for msg in reversed(ctx.messages):
                     uid = str(msg.get("user_id", ""))
@@ -2572,9 +2733,13 @@ class GroupChatScheduler:
             if accumulated_text:
                 trigger_content = accumulated_text
             trigger_user_name = (
-                str(_trigger_event.sender.card or _trigger_event.sender.nickname)
-                if _trigger_event and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
-                else ""
+                f"{_trigger_event.sender.card or _trigger_event.sender.nickname}[QQ:{trigger_uid}]"
+                if _trigger_event and trigger_reason in ("mention", "nickname", "reply", "thread_continuation") and trigger_uid
+                else (
+                    str(_trigger_event.sender.card or _trigger_event.sender.nickname)
+                    if _trigger_event and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
+                    else ""
+                )
             )
 
             # ── ★ Per-User 回复冷却: 同一用户在 N 秒内不重复回复 ──
@@ -2646,10 +2811,36 @@ class GroupChatScheduler:
                 except Exception:
                     logger.debug("群 %d: trigger 情感更新异常", ctx.group_id, exc_info=True)
 
-                # ── 删除此处 trigger 的 "brief" 疲劳 tick ──
-                #     原因: 该消息进入 on_message 时已通过 _update_emotion 按内容质量 tick 过一次疲劳值，
-                #     再在这里 tick 一次 = 同一条消息双 tick → 疲劳累积速度是设计的 2 倍。
-                #     疲劳值现在统一在 _update_emotion 内每条消息 tick 一次 (无条件)。
+            # ── 疲劳值更新: 仅在实际触发回复时推进 (不是每条收到的消息都扣) ──
+            # 2026-07-02 fix: 旧设计在 _update_emotion 内每条消息无条件 tick，
+            # 导致 bot 在活跃群里只听不说也会被扣到 -1.0。真人不会因为"听到别人聊天"就累。
+            # 疲劳应只反映"主动输出"的消耗——仅当 bot 真正回复时才 tick。
+            try:
+                from astrbot_plugin_suli_emotion.persona_state import (
+                    tick_fatigue as _tick_fatigue,
+                )
+                if events:
+                    _pos = sum(1 for e in events if e.category == "positive")
+                    _neg = sum(1 for e in events if e.category == "negative")
+                    _has_grooming = any(
+                        kw in e.name for kw in (
+                            "被角色越狱", "被身份篡改", "被诱导违规", "恶意调教",
+                        )
+                        for e in events
+                    )
+                    if _has_grooming:
+                        _f_quality = "awkward"
+                    elif _pos > _neg:
+                        _f_quality = "good"
+                    elif _neg > _pos:
+                        _f_quality = "bad"
+                    else:
+                        _f_quality = "normal"
+                else:
+                    _f_quality = "brief"
+                await _tick_fatigue(_sid, quality=_f_quality)
+            except Exception:
+                logger.debug("群 %d: 疲劳值更新异常", ctx.group_id, exc_info=True)
 
                 # ── 昵称设置检测: 好感 ≥ Lv.3 + 直接呼叫 ──
                 if trigger_uid and self._config.is_emotion_enabled(self._current_bot_id or ""):
@@ -2993,9 +3184,10 @@ class GroupChatScheduler:
                     trigger_content=_gate_hint + trigger_content if _gate_hint else trigger_content,
                     trigger_user_name=trigger_user_name,
                     # nickname 仍走完整 relevance: 叫名字≠在跟你说话
-                    # (如 "小暮和哪个更有趣" 是讨论bot, 不是呼叫bot)
+                    # (如 "小洛和小露哪个更有趣" 是讨论bot, 不是呼叫bot)
                     is_at_mention=(trigger_reason in ("mention", "reply")),
                     available_tools=[t["function"]["name"] for t in TOOLS],
+                    tool_labels=_TOOL_NAME_CN,
                     # ★ Gate 推荐工具时只从 usable 里选; thread_summary 供连续性判断
                     usable_tools=_usable_tools,
                     blocked_tools_reason=_blocked_reason,
@@ -3018,6 +3210,8 @@ class GroupChatScheduler:
                     # ★ 警惕值 + 疲劳值 (2026-06-29: 五大属性接入 Gate)
                     vigilance_level=_gate_vigilance_level,
                     fatigue_label=_gate_fatigue_label,
+                    # ★ 表情包可用标签 (Gate sticker_mood 只能从这些里选)
+                    sticker_tags_available=_get_sticker_tags_for_gate(),
                 )
 
                 # ── 解析闸门判断专用槽位 (llm_gate) ──
@@ -3215,21 +3409,24 @@ class GroupChatScheduler:
                 #
                 # ★ 必须用 _trigger_event (函数入口时捕获), 不能用 ctx.last_event —
                 #    on_message() 在 Gate 运行期间会覆盖 ctx.last_event, 导致读到别的
-                #    消息的 _moon_deferred_vlm 然后误删, 让真正的裸图检查失效。
+                #    消息的 _loput_deferred_vlm 然后误删, 让真正的裸图检查失效。
                 _raw_evt = getattr(_trigger_event, "_event", None)
-                _deferred_bare = getattr(_raw_evt, "_moon_deferred_vlm", None)
+                _deferred_bare = getattr(_raw_evt, "_loput_deferred_vlm", None)
                 if _deferred_bare and not (_deferred_bare.get("user_query", "") or "").strip():
-                    # @mention / 回复 / 昵称 / 关注槽跟进 → 用户在对 bot 说话
+                    # @mention / 回复 / 昵称 → 用户明确在对 bot 说话，无条件放行
+                    # thread_continuation → 不放行 (裸图无文字一律不是指令)
                     _is_direct_interaction = trigger_reason in (
-                        "mention", "reply", "nickname", "thread_continuation",
+                        "mention", "reply", "nickname",
                     )
-                    if _is_direct_interaction:
+                    _bare_skip = not _is_direct_interaction
+                    if not _bare_skip:
                         logger.info(
-                            "群 %d: 裸图但直接互动 (trigger=%s) → 继续 Gate 评估",
+                            "群 %d: 裸图但明确指令 (trigger=%s) → 继续 Gate 评估",
                             ctx.group_id, trigger_reason,
                         )
-                        # 不 return — 继续往下走 Gate
                     else:
+                        _skip_reason = f"非明确指令 ({trigger_reason})"
+                    if _bare_skip:
                         # 保存 URL→file_id 映射 (后续跨消息查找依赖, TRAPS §十一#1)
                         try:
                             _vlm_urls = _deferred_bare.get("urls", [])
@@ -3243,12 +3440,12 @@ class GroupChatScheduler:
                         except Exception:
                             pass
                         try:
-                            del _raw_evt._moon_deferred_vlm
+                            del _raw_evt._loput_deferred_vlm
                         except Exception:
                             pass
                         logger.info(
-                            "群 %d: 裸图无文字 (弱信号 %s) → 跳过 Gate，等待用户后续指令",
-                            ctx.group_id, trigger_reason,
+                            "群 %d: 裸图无文字 (%s) → 跳过 Gate",
+                            ctx.group_id, _skip_reason,
                         )
                         ctx.last_reply_time = time.time()
                         return
@@ -3270,7 +3467,7 @@ class GroupChatScheduler:
                     _gate_facet = select_persona_facet(
                         composite_zone=_cr.zone if _cr else "neutral",
                         affinity_level=_gate_affinity_level,
-                        is_admin=(trigger_uid and trigger_uid == str(self._config.super_admin_qq)),
+                        is_admin=(trigger_uid and trigger_uid in getattr(self._config, "OWNER_QQ_WHITELIST", {str(self._config.super_admin_qq)})),
                         bot_name=char_name,
                     )
                 except Exception:
@@ -3304,6 +3501,19 @@ class GroupChatScheduler:
 
                 # ★ 2026-06-30: 进入 Full Gate 的消息已通过加权分+S3双重过滤，
                 # directed_to_me / should_reply 固定为 True，不再检查。
+
+                # ── Reaction 短路: 低好感陌生人纯反应 → 跳过 Reply, 省一轮 LLM 调用 ──
+                if (
+                    _full_gate.intent_type == "reaction"
+                    and _gate_affinity_level < 3
+                    and _full_gate.model_tier == "lite"
+                ):
+                    logger.info(
+                        "群 %d: Gate reaction + 好感Lv.%d<3 → 短路跳过 Reply (省 token)",
+                        ctx.group_id, _gate_affinity_level,
+                    )
+                    ctx.last_reply_time = time.time()
+                    return
 
                 _gate_result = _full_gate  # GateResultProtocol
 
@@ -3443,13 +3653,13 @@ class GroupChatScheduler:
             # ── 延迟 VLM — Gate 授权后执行 ──
             # ★ 必须用 _trigger_event (函数入口时捕获), 不能用 ctx.last_event —
             #    on_message() 在 Gate 运行期间会覆盖 ctx.last_event, 导致 A 消息的
-            #    处理管线读到 B 消息的 _moon_deferred_vlm 然后误删属性。
+            #    处理管线读到 B 消息的 _loput_deferred_vlm 然后误删属性。
             #    后果: B 消息自己进 evaluate_and_reply 时裸图检查看不到图 → Gate 被
             #    唤醒 → 超时 → fail-open → 回复不该回复的内容。
             _deferred_vlm = None
             try:
                 _raw_event = getattr(_trigger_event, "_event", None)
-                _deferred_vlm = getattr(_raw_event, "_moon_deferred_vlm", None)
+                _deferred_vlm = getattr(_raw_event, "_loput_deferred_vlm", None)
                 if _deferred_vlm:
                     # 保存 URL→file_id 映射供跨消息查找恢复
                     # 裸图守卫或 early return 会丢失 file_id,
@@ -3463,7 +3673,7 @@ class GroupChatScheduler:
                             if len(_url_to_file_id) > 200:
                                 _oldest = next(iter(_url_to_file_id))
                                 del _url_to_file_id[_oldest]
-                    del _raw_event._moon_deferred_vlm
+                    del _raw_event._loput_deferred_vlm
             except Exception:
                 pass
 
@@ -3592,7 +3802,7 @@ class GroupChatScheduler:
                         _found_img_msg = _m
                         break
                 if _found_img_url:
-                    # 恢复 file_id: 从 _url_to_file_id 缓存查找 (main.py 在设 _moon_deferred_vlm 时写入)
+                    # 恢复 file_id: 从 _url_to_file_id 缓存查找 (main.py 在设 _loput_deferred_vlm 时写入)
                     _recovered_fids: list[str] = []
                     _cached_fid = _url_to_file_id.get(_found_img_url, "")
                     if _cached_fid:
@@ -3760,15 +3970,20 @@ class GroupChatScheduler:
             _bot_self_id = str(getattr(ctx.last_bot, "self_id", "") or "")
 
             # ── 对话脉络产出决策 (P0): 是否要求 LLM 在回复末尾输出 <thread_summary> 标签 ──
-            # 触发条件: 值得沉淀的对话 (非闲聊一次性), 多轮积累, 或高成本推理
+            # 触发条件: 值得沉淀的对话 (有信息量的交换), 多轮积累, 或高成本推理
+            # ★ 排除: 纯反应/简单闲聊/无工具调用的简单指令 — 不需要沉淀
             _request_thread_summary = False
             if trigger_uid and _gate_result is not None:
                 _intent = _gate_result.intent_type or ""
                 _tier = _gate_result.model_tier or ""
                 _thread = ctx.conversation_threads.get(trigger_uid)
                 _ex = _thread.get("exchange_count", 0) if _thread else 0
-                # 1. 非闲聊意图: question/command/complaint/deep_inquiry — 有信息量, 值得沉淀
-                if _intent in ("question", "command", "complaint", "deep_inquiry"):
+                _has_tools = bool(_gate_suggested)
+                # 1. 有信息量的意图: question/complaint/deep_inquiry — 值得沉淀
+                #    command 只在有工具调用时沉淀 (无工具=自我介绍之类, 不需要)
+                if _intent in ("question", "complaint", "deep_inquiry"):
+                    _request_thread_summary = True
+                if _intent == "command" and _has_tools:
                     _request_thread_summary = True
                 # 2. 高成本推理: pro/judge 模型 — 推理结果值得记住
                 if _tier in ("pro", "judge"):
@@ -4086,7 +4301,13 @@ class GroupChatScheduler:
                             if challenge_info else None
                         ),
                         tools_enabled=_tools_avail,
-                        # ── 🆕 Pre-flight 增强信号 ──
+                        # ── ★ Gate 权威 tier: 路由层以此为基线，只降不升(安全硬线除外) ──
+                        gate_tier=(
+                            _gate_result.model_tier
+                            if (_gate_result is not None and _gate_result.parse_ok)
+                            else ""
+                        ),
+                        # ── Pre-flight 增强信号 (保留供未来死锁/争议兜底) ──
                         context_complexity=(
                             preflight.complexity_score if preflight else 0.0
                         ),
@@ -4102,7 +4323,6 @@ class GroupChatScheduler:
                         active_domain_count=(
                             preflight.active_domain_count if preflight else 0
                         ),
-                        # ── Gate 信号: model_tier 由 decide_tier 程序化决定 ──
                     )
                     _route = ModelRouter.resolve(
                         _tier,
@@ -4693,7 +4913,7 @@ class GroupChatScheduler:
 
                 # ── @提及转换: LLM 输出的 @名字 纯文本 → QQ [CQ:at,qq=...] ──
                 #     必须在发送前执行，否则 @只是纯文本不会触发 QQ 提醒。
-                _char_name = self._resolve_character(getattr(ctx.last_bot, "self_id", "") if ctx.last_bot else "").get("name", "暮恩")
+                _char_name = self._resolve_character(getattr(ctx.last_bot, "self_id", "") if ctx.last_bot else "").get("name", "")
                 _peer_qq = str(self._chat_param("peer_bot_qq", "peer_bot_qq") or "")
                 reply = resolve_at_mentions(
                     reply,
@@ -4708,6 +4928,18 @@ class GroupChatScheduler:
                 #     时确保触发者收到 QQ 通知。仅在 LLM 没有自行 @触发者时补上。
                 #     resolve_at_mentions() 已将 LLM 输出的 @name 转为 [CQ:at,qq=...],
                 #     这里检查回复中是否已有该触发者的 @码，没有则自动 prepend。
+                #
+                #     ★ Gate reply_target 优先: 若 Gate 明确指定了不同于 trigger 的
+                #     回复目标 (如用户 A 说"去回复 @用户B"), LLM 已 @了目标用户,
+                #     不应再画蛇添足 @触发者。跳过自动 @。
+                _gate_reply_target = ""
+                try:
+                    _gate_reply_target = (
+                        getattr(_gate_result, "reply_target_user_id", "")
+                        or getattr(_gate_result, "target_user_id", "")
+                    )
+                except Exception:
+                    pass
                 if (
                     trigger_uid
                     and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
@@ -4717,11 +4949,17 @@ class GroupChatScheduler:
                     from astrbot_plugin_suli_guards.dual_bot import get_bot_qq_set
                     _bot_qqs = get_bot_qq_set()
                     if trigger_uid not in _bot_qqs and trigger_uid != _peer_qq:
-                        reply = f"[CQ:at,qq={trigger_uid}] {reply}"
-                        logger.debug(
-                            "群 %d: 自动 @触发者 user=%s",
-                            ctx.group_id, trigger_uid[:8],
-                        )
+                        if _gate_reply_target and _gate_reply_target != trigger_uid:
+                            logger.debug(
+                                "群 %d: Gate reply_target=%s ≠ trigger=%s, 跳过自动@触发者",
+                                ctx.group_id, _gate_reply_target[:8], trigger_uid[:8],
+                            )
+                        else:
+                            reply = f"[CQ:at,qq={trigger_uid}] {reply}"
+                            logger.debug(
+                                "群 %d: 自动 @触发者 user=%s",
+                                ctx.group_id, trigger_uid[:8],
+                            )
 
                 # 发送回复 — 长回复按段落分段发送，避免截断
                 char_name = _char_name
@@ -4800,6 +5038,33 @@ class GroupChatScheduler:
                     domain=_gate_result.domain if _gate_result else "",
                     trigger_reason=trigger_reason,
                 )
+                # ── ★ 影子 Agent 自我行为追加 (2026-07-02 加固) ──
+                _shadow_enabled = True
+                try:
+                    from ..service.bot_config import get_config_service
+                    _shadow_enabled = get_config_service().is_shadow_agent_enabled(_bot_id)
+                except Exception:
+                    pass
+                if _shadow_enabled:
+                    try:
+                        from ..intelligence.shadow_agent import get_session
+                        _char = self._resolve_character(_bot_id).get("name", "")
+                        _shadow = get_session(_bot_id, _gid, char_name=_char)
+                        _target_info = f"{trigger_user_name or trigger_uid[:8]}"
+                        _stance = _gate_result.reply_stance if _gate_result else "?"
+                        _self_summary = (
+                            f"{time.strftime('%H:%M')} 回复{_target_info}: "
+                            f"{reply[:60]}{'...' if len(reply) > 60 else ''} "
+                            f"(stance={_stance})"
+                        )
+                        _shadow.append_self_action(_self_summary)
+                        if _shadow.pending_self_count >= 5:
+                            safe_task(
+                                self._flush_shadow_batch(_bot_id, _gid, urgent=True),
+                                name=f"shadow-force-flush-{_gid}",
+                            )
+                    except Exception:
+                        logger.debug("Shadow self-action 追加异常", exc_info=True)
                 # ── SocialGuard: 记录本次回复 (更新自回复速率) ──
                 try:
                     self._social_guard.feed_my_reply(str(ctx.group_id), thread_id=trigger_uid)
@@ -4884,7 +5149,7 @@ class GroupChatScheduler:
                             _exp_store = get_experience_store(_bid)
                             if _exp_store is not None:
                                 _char = self._resolve_character(_bid)
-                                _bot_name = _char.get("name", "暮恩")
+                                _bot_name = _char.get("name", "")
                                 # 获取当前全局 mood valence
                                 _valence = 0.0
                                 try:
@@ -4956,12 +5221,13 @@ class GroupChatScheduler:
                             ctx.group_id, exc_info=True,
                         )
 
-                # ── ★ Gate reply_target 交叉校验: 检测 LLM 幻觉 ──
-                #     Gate 输出的 target_user_id 应与实际触发者一致 (直接触发时)。
-                #     若不一致, Gate LLM 可能产生了幻觉——不影响回复路由
-                #     (回复始终锚定于 trigger_uid), 但需要日志告警以便排查。
-                #     仅对直接触发做校验: batch/debounce 无明确 trigger_uid,
-                #     proactive 无触发者, 此场景下 target_user_id 可以是任何人。
+                # ── ★ Gate reply_target 交叉校验 ──
+                #     Gate 输出的 target_user_id 可能与 trigger_uid 不同:
+                #     - 正常: 用户 A 说"去回复 @用户B" → Gate 正确重定向到 B
+                #     - 异常: Gate LLM 幻觉出无关 target (极少见)
+                #     两种情况无法自动区分。自动 @触发者逻辑已尊重 Gate 重定向
+                #     (见上方 auto-@ 代码), 此日志仅用于排查异常 case。
+                #     仅对直接触发做校验: batch/debounce/proactive 无明确 trigger。
                 if (
                     _gate_result is not None
                     and _gate_result.target_user_id
@@ -4969,10 +5235,8 @@ class GroupChatScheduler:
                     and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
                     and _gate_result.target_user_id != trigger_uid
                 ):
-                    logger.warning(
-                        "群 %d: ⚠️ Gate target 与 trigger 不一致! "
-                        "gate.target=%s trigger=%s — Gate LLM 可能幻觉, "
-                        "回复仍锚定于 trigger",
+                    logger.info(
+                        "群 %d: Gate reply_target=%s ≠ trigger=%s (可能为主动重定向)",
                         ctx.group_id,
                         _gate_result.target_user_id[:8],
                         trigger_uid[:8],
@@ -5076,6 +5340,8 @@ class GroupChatScheduler:
 
         # ── 工具门控提示 (收集所有拒绝原因, 统一注入 LLM) ──
         _rejection_hints: list[str] = []
+        # 被好感度门控挡掉的工具 (供后续硬拦截判断)
+        _affinity_blocked_tools: set[str] = set()
 
         # ── 工具门控: per-bot 最低好感度 ──
         try:
@@ -5164,14 +5430,10 @@ class GroupChatScheduler:
                     judge_decision.suggested_tools or []
                     if judge_decision and not _social_suppress else []
                 )
-                # ★ Gate 建议了表情标签 → 视为暗示 send_sticker, 防止被"简单对话"门控误杀
-                _gate_sticker_mood = (
-                    judge_decision.suggested_sticker_mood or ""
-                    if judge_decision and not _social_suppress else ""
-                )
-                if _gate_suggested or _gate_sticker_mood:
-                    if not _gate_suggested and _gate_sticker_mood:
-                        _gate_suggested = ["send_sticker"]
+                # ★ sticker_mood 是 prompt 层情绪提示 (prompt_builder 注入 "🎯 此刻推荐表情: X"),
+                #   不是工具授权 — 不参与工具门控判断。否则 Gate 说 tools=[] 但 mood 有值时
+                #   会泄露 send_sticker 进工具列表, LLM 优先发图而非答题, 图发失败就脱轨。
+                if _gate_suggested:
                     logger.info(
                         "工具门控: reasoning_effort 未注入但 Gate 建议了工具 %s → 保留工具",
                         _gate_suggested,
@@ -5231,10 +5493,8 @@ class GroupChatScheduler:
             _social_suppress = judge_decision.social_suppress_tools
             if not _social_suppress:
                 _gate_suggested = judge_decision.suggested_tools or []
-                _gate_sticker_mood = judge_decision.suggested_sticker_mood or ""
-                # ★ Gate 建议了表情标签 → 视为 send_sticker 信号, 同样恢复
-                if _gate_sticker_mood and not _gate_suggested:
-                    _gate_suggested = ["send_sticker"]
+                # ★ sticker_mood 不参与工具复活判断 — 它是 prompt 层情绪提示,
+                #   不是工具授权。只有 Gate 显式建议的 exempt 工具才触发复活。
                 if _gate_suggested and set(_gate_suggested).issubset(_GATE_EXEMPT_TOOLS):
                     tools_enabled = True
                     # 清除亲和力/冷却拒绝提示 — 低风险工具不受这些限制
@@ -5378,7 +5638,7 @@ class GroupChatScheduler:
             ]
             # ── per-tool 好感度过滤 ──
             if _tools_list and user_id and not force_tools:
-                _is_admin = (str(cfg.super_admin_qq) == user_id) if cfg.super_admin_qq else False
+                _is_admin = (user_id in getattr(cfg, "OWNER_QQ_WHITELIST", {str(cfg.super_admin_qq)})) if cfg and cfg.super_admin_qq else False
                 if not _is_admin and _tool_svc is not None:
                     try:
                         from astrbot_plugin_suli_emotion import get_user_relation
@@ -5393,6 +5653,7 @@ class GroupChatScheduler:
                                 _filtered.append(t)
                             else:
                                 _filtered_out.append(_name)
+                                _affinity_blocked_tools.add(_name)
                                 logger.debug(
                                     "工具好感过滤: tool=%s min_aff=%d user_level=%d user=%s",
                                     _name, _min_aff, _user_level, user_id,
@@ -5402,7 +5663,7 @@ class GroupChatScheduler:
                             _tool_names_cn = {
                                 "web_search": "联网搜索", "search_knowledge": "知识库检索",
                                 "describe_image": "看图识图", "generate_image": "AI画图",
-                                "edit_image": "图片编辑",
+                                "edit_image": "图片编辑", "pixiv_search": "Pixiv搜图",
                             }
                             _removed_cn = [
                                 _tool_names_cn.get(n, n) for n in _filtered_out
@@ -5565,10 +5826,52 @@ class GroupChatScheduler:
         if _tools_list and _gate_suggested_tools is not None:
             _exempt = {"send_sticker", "parse_forwarded_message", "search_knowledge"}
             _gate_set = set(_gate_suggested_tools) | _exempt
-            _tools_list = [
+            _filtered_tools = [
                 t for t in _tools_list
                 if t.get("function", {}).get("name", "") in _gate_set
             ]
+            if len(_filtered_tools) < len(_tools_list):
+                _removed = [
+                    t.get("function", {}).get("name", "")
+                    for t in _tools_list
+                    if t.get("function", {}).get("name", "") not in _gate_set
+                ]
+                logger.info(
+                    "群 %s: Gate 工具闸过滤: %s → 仅保留 %s",
+                    group_id, _removed,
+                    [t.get("function", {}).get("name", "") for t in _filtered_tools],
+                )
+            _tools_list = _filtered_tools
+
+        # ── 硬拦截: Gate 建议的工具全部被好感度过滤 → 跳过工具循环 ──
+        # 场景: 用户说「找一张XX的图」但 pixiv_search 的好感度门控未通过。
+        # 此时 _tools_list 只剩常驻豁免工具 (send_sticker/parse_forwarded_message)，
+        # LLM 无法执行命令，但可能幻觉出「收到～帮你找找」的回复。
+        # 代码层硬拦截比 prompt 指令更可靠。
+        if (
+            _gate_suggested_tools
+            and _affinity_blocked_tools
+            and _gate_intent_type == "command"
+            and all(t in _affinity_blocked_tools for t in _gate_suggested_tools)
+        ):
+            max_rounds = 0
+            _blocked_note = (
+                "\n\n[⚠️ 最高优先级指令 — 覆盖角色设定]\n"
+                "本轮你**不能**执行用户的命令——所需工具该用户尚未解锁。\n"
+                "你必须用角色口吻说明「现在帮不了这个」，不要假装能搜、能找、能执行。\n"
+                "示例：「啊啦～这个功能得咱们更熟一点才能用哦♪ 现在先聊聊天嘛～」\n"
+                "铁律: 不许说「好的」「收到」「我去找找」「帮你搜一下」等任何暗示你能执行的回复。\n"
+                "不许发与命令内容相关的实质性回复——你做不到的事不要假装能做到。"
+            )
+            for i in range(len(messages)):
+                if messages[i].get("role") == "system":
+                    messages[i]["content"] = str(messages[i]["content"]) + _blocked_note
+                    break
+            logger.info(
+                "群 %s: [硬拦截] Gate建议工具全被好感度过滤 blocked=%s suggested=%s "
+                "intent=command → 跳过tool loop 强制文本拒绝",
+                group_id, sorted(_affinity_blocked_tools), _gate_suggested_tools,
+            )
 
         return await run_tool_loop(
             tavern=self._tavern,
@@ -5814,39 +6117,6 @@ class GroupChatScheduler:
                     _gm.valence, _gm.arousal,
                     rel.affinity.level, rel.affinity.name,
                 )
-
-            # ── 疲劳值更新: 每条互动消息推进一次 (无条件) ──
-            # 2026-06-29 P1-4: 从 if events 块内移出。原设计每条消息只 tick 一次疲劳，
-            # 但 _evaluate_and_reply 内另有 trigger 的 "brief" tick → 同一触发消息双 tick、
-            # 累积速度 2 倍。现统一: 仅由 on_message 路径这一处 tick，trigger tick 已删。
-            # 无情绪事件时按 "brief" 轻消耗; 有事件时按好坏/正负映射质量。
-            try:
-                from astrbot_plugin_suli_emotion.persona_state import (
-                    tick_fatigue as _tick_fatigue,
-                )
-                if events:
-                    # 映射情绪事件 → 互动质量
-                    _pos = sum(1 for e in events if e.category == "positive")
-                    _neg = sum(1 for e in events if e.category == "negative")
-                    _has_grooming = any(
-                        kw in e.name for kw in (
-                            "被角色越狱", "被身份篡改", "被诱导违规", "恶意调教",
-                        )
-                        for e in events
-                    )
-                    if _has_grooming:
-                        _f_quality = "awkward"
-                    elif _pos > _neg:
-                        _f_quality = "good"
-                    elif _neg > _pos:
-                        _f_quality = "bad"
-                    else:
-                        _f_quality = "normal"
-                else:
-                    _f_quality = "brief"
-                await _tick_fatigue(bot_self_id, quality=_f_quality)
-            except Exception:
-                logger.debug("群 %d: 疲劳值更新异常", ctx.group_id, exc_info=True)
 
             # ── 恶意调教: 写入负面记忆 (fire-and-forget) ──
             _grooming_events = [

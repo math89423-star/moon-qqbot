@@ -5,7 +5,7 @@
 
 用法:
     svc = get_bot_identity_service()
-    bot = svc.get_bot("BOT_QQ_MAIN")
+    bot = svc.get_bot("000000000")
     bots = svc.list_bots(active_only=True)
 """
 
@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 class BotIdentity:
     """单个 bot 的完整身份信息。"""
     bot_id: str                      # QQ 号
-    name: str                        # 显示名 ("暮恩")
-    character_card: str = ""         # 角色卡文件名 ("moon")
-    nicknames: list[str] = field(default_factory=list)   # ["小暮", "暮暮"]
+    name: str                        # 显示名 (如 "暮恩")
+    character_card: str = ""         # 角色卡文件名 ("loput")
+    nicknames: list[str] = field(default_factory=list)   # ["小洛", "洛洛"]
     is_active: bool = True
-    peer_bot_ids: list[str] = field(default_factory=list)  # ["BOT_QQ_ALT"]
+    peer_bot_ids: list[str] = field(default_factory=list)  # 例如 ["123456789"]
     icon: str = "🤖"
     color: str = "#666666"
     role_description: str = ""       # "蛇娘" / "猫娘"
@@ -193,10 +193,11 @@ class BotIdentityService:
                     if personality:
                         role_desc = personality.split("、")[0] if "、" in personality else personality.split(",")[0]
 
-                icon = data.get("icon", "🐍" if "moon" in card_name else "🤖")
-                color = data.get("color", "#4ecca3" if "moon" in card_name else "#666666")
+                icon = data.get("icon", "🐍" if "loput" in card_name else "🤖")
+                color = data.get("color", "#4ecca3" if "loput" in card_name else "#666666")
                 llm_slots = data.get("llm_slots", [])
-                # 单 bot 架构 — moon 不需要额外的 llm_slots 覆盖
+                if not llm_slots and "luna" in card_name:
+                    llm_slots = ["llm_lite", "llm_pro", "llm_gate"]
 
                 metadata = {
                     "icon": icon,
@@ -305,7 +306,7 @@ class BotIdentityService:
         """获取 bot 对应的角色卡文件名。
 
         Returns:
-            角色卡文件名 (如 "moon")，未知 bot 返回空字符串。
+            角色卡文件名 (如 "loput")，未知 bot 返回空字符串。
         """
         bot = self.get_bot(str(bot_id))
         return bot.character_card if bot else ""
@@ -314,7 +315,7 @@ class BotIdentityService:
         """生成 bot 昵称 regex alternation (用于消歧/检测)。
 
         Returns:
-            如 "小暮|暮暮|洛宝|暮恩|moon"
+            如 "昵称1|昵称2"
         """
         bot = self.get_bot(str(bot_id))
         if not bot:
@@ -340,7 +341,7 @@ class BotIdentityService:
 
         用于 input_classifier 等需要全局匹配的场景。
         Returns:
-            如 "小暮|暮恩|moon|||"
+            如 "昵称1|昵称2|昵称3"
         """
         self._check_cache()
         all_names: set[str] = set()

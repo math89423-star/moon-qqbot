@@ -656,7 +656,7 @@ TOOLS: list[dict] = [
             "description": (
                 "检查 L-Port 生图平台是否在线，获取系统状态摘要。"
                 "仅在用户明确询问「L-Port 状态」「生图系统是否正常」「你能生图吗」时调用。"
-                "【注意】此工具只检查 L-Port 自身，不涉及/AstrBot/QQ/其他服务。"
+                "【注意】此工具只检查 L-Port 自身，不涉及其他 bot/AstrBot/QQ/其他服务。"
                 "如果用户问的是其他 bot 或服务的问题，不要调用此工具——它们与 L-Port 无关。"
             ),
             "parameters": {
@@ -814,6 +814,9 @@ TOOLS: list[dict] = [
             "name": "send_sticker",
             "description": (
                 "发送一张表情包图片到聊天中。\n"
+                "★ 如果你决定发本工具——在同一轮把文字回复也一起输出，不要分两轮。"
+                "正确: content=\"喵～好棒♪\" + tool_call send_sticker(tag=\"开心\")。"
+                "不是每条回复都要发图——只在情绪自然流露时才用。\n"
                 f"可用标签: {', '.join(get_available_tags()[:18])}"
             ),
             "parameters": {
@@ -1168,6 +1171,40 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "video_extract",
+            "description": (
+                "📹 提取视频 — 当群友分享 B站/抖音视频链接时调用。\n"
+                "下载视频并直接发送到群聊，群友无需跳转APP即可观看。\n"
+                "限制: ≤20MB 短视频，超限自动降分辨率或提示。\n"
+                "\n"
+                "触发场景:\n"
+                "- 群友发 B站/B23 链接 → 调用此工具提取视频\n"
+                "- 群友发 抖音/v.douyin.com 链接 → 调用此工具提取视频\n"
+                "- 群友说「看看这个视频」「这个好有意思」附带视频链接\n"
+                "- 注意: 不支持快手/小红书等其他平台"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "视频完整 URL。从用户消息中提取，支持:\n"
+                            "- https://www.bilibili.com/video/BV1xx411c7mD\n"
+                            "- https://b23.tv/xxxxx (B站短链，自动展开)\n"
+                            "- https://www.douyin.com/video/7412345678901234567\n"
+                            "- https://v.douyin.com/xxxxx/ (抖音短链，自动展开)\n"
+                            "- 带 query 参数的也支持 (如 ?p=2&t=30)"
+                        ),
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 # ── 工具执行器 ───────────────────────────────────────────
@@ -1363,7 +1400,7 @@ async def execute_describe_image(params: dict, tool_context: dict | None = None)
     """执行 describe_image 工具 — 调用 VLM 解析图片。
 
     bot_id 感知: 通过 tool_context["bot_id"] 解析 per-bot VLM 配置,
-    用 Gemini, 暮恩用 GPT。
+    peer bot 用 Gemini, 主 bot 用 GPT。
 
     VLM 意图门: 必须由 IntentGate 授权 — gate_suggested_tools 含 "describe_image"
     或 gate_intent_type == "image_share"。仅靠 LLM 决定不够。
@@ -1499,7 +1536,7 @@ async def execute_get_memory(params: dict) -> str:
     if hints:
         return f"📝 {hints}"
     name = user_name or user_id
-    return f"📝 目前还没有关于 {name} 的记忆。如果你想让暮恩记住什么，直接告诉她就好～"
+    return f"📝 目前还没有关于 {name} 的记忆。如果你想让我记住什么，直接告诉我就好～"
 
 
 async def execute_generate_image(params: dict, tool_context: dict | None = None) -> str:
@@ -1509,7 +1546,7 @@ async def execute_generate_image(params: dict, tool_context: dict | None = None)
     返回文本描述供 LLM 融入回复。
 
     bot_id 感知: 通过 tool_context["bot_id"] 解析 per-bot 绘图配置,
-    用 Gemini (gemini-3-pro-image-preview), 暮恩用 gpt-image-2。
+    peer bot 用 Gemini (gemini-3-pro-image-preview), 主 bot 用 gpt-image-2。
     """
     prompt = params.get("prompt", "").strip()
     orientation = params.get("orientation", "portrait").strip()
@@ -2091,8 +2128,8 @@ def _fallback_keywords(user_message: str) -> str:
             pass
 
     if not tags:
-        # 真没提取到 → 清理掉"小暮//找一张/搜图"等 bot 专属词后返回剩余中文
-        for noise in ("小暮", "", "去找一张", "找一张", "搜一张", "帮我找", "有没有", "的图", "来一张"):
+        # 真没提取到 → 清理掉 bot 专属词后返回剩余中文
+        for noise in ("找一张", "搜一张", "帮我找", "有没有", "的图", "来一张"):
             user_message = user_message.replace(noise, " ")
         remaining = re.findall(r"[一-鿿]{2,}", user_message)
         tags = remaining[:3] if remaining else [user_message.strip()[:30]]
@@ -2164,7 +2201,7 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
         cleaned = user_message
         for noise in (
             "去找一张", "找一张", "搜一张", "帮我找", "有没有",
-            "的图", "来一张", "小暮", "", "搜图", "查图", "找图",
+            "的图", "来一张", "搜图", "查图", "找图",
         ):
             cleaned = cleaned.replace(noise, " ")
         cleaned = cleaned.strip()
@@ -2463,6 +2500,175 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
     return format_pixiv_results(sent_results, query)
 
 
+async def execute_video_extract(params: dict, tool_context: dict | None = None) -> str:  # noqa: ARG001
+    """执行 video_extract 工具 — 解析B站/抖音链接, 下载视频, 发送到群聊。
+
+    流程:
+      1. URL 校验 (bilibili / douyin)
+      2. 获取元数据 (title/duration/format sizes)
+      3. 检查最优格式是否 ≤20MB, 超限自动降分辨率
+      4. 下载到临时目录
+      5. call_action send_group_msg 发送到群
+      6. 清理临时文件
+    """
+    url_raw = (params.get("url") or "").strip()
+
+    if not url_raw:
+        return "❌ 需要提供视频链接。"
+
+    # ── URL 校验 ──
+    from astrbot_plugin_suli_video.bilibili import is_supported_video_url
+
+    if not is_supported_video_url(url_raw):
+        return (
+            "❌ 只支持 B站和抖音视频链接。\n"
+            "B站: bilibili.com/video/ 或 b23.tv 短链\n"
+            "抖音: douyin.com/video/ 或 v.douyin.com 短链\n"
+            "快手/小红书等其他平台暂不支持。"
+        )
+
+    # ── 获取元数据 ──
+    from astrbot_plugin_suli_video.bilibili import download_video, get_video_info
+
+    try:
+        info = await get_video_info(url_raw)
+    except ValueError as e:
+        return f"❌ {e}"
+    except RuntimeError as e:
+        logger.error("[video_extract] 元数据获取异常: %s", e, exc_info=True)
+        return f"❌ 解析失败: {e}"
+
+    title = info.get("title", "未知标题")
+    duration = int(info.get("duration", 0) or 0)
+    duration_str = f"{duration // 60}:{duration % 60:02d}"
+    formats = info.get("formats", [])
+
+    # ── 检查是否有可用格式 ──
+    formats_with_size = [f for f in formats if f.get("filesize")]
+    if formats_with_size:
+        best = max(formats_with_size, key=lambda f: f.get("height", 0))
+        best_mb = best["filesize"] / 1e6
+        best_height = best.get("height", 0)
+        if best_mb <= 20:
+            logger.info(
+                "[video_extract] %s (%.1fMB, %dp) — 准备下载",
+                title, best_mb, best_height,
+            )
+        else:
+            # 超限 → 找 ≤20MB 的最佳分辨率
+            smaller = [
+                f for f in formats_with_size if f["filesize"] <= 20_000_000
+            ]
+            if smaller:
+                best_small = max(smaller, key=lambda f: f.get("height", 0))
+                logger.info(
+                    "[video_extract] %s 最优格式 %.1fMB > 20MB, 降级至 %dp %.1fMB",
+                    title, best_mb, best_small.get("height", 0),
+                    best_small["filesize"] / 1e6,
+                )
+            else:
+                smallest = min(formats_with_size, key=lambda f: f["filesize"])
+                return (
+                    f"⚠️ 视频太大了——最小可用格式也超过 20MB\n"
+                    f"「{title}」({duration_str})\n"
+                    f"最小格式: {smallest['filesize'] / 1e6:.1f}MB @ {smallest.get('height', '?')}p\n"
+                    f"建议: 自己打开链接看吧 → {info.get('webpage_url', url_raw)}"
+                )
+
+    # ── 下载 ──
+    # ★ 下载到 /AstrBot/data/temp_videos/ (共享卷)
+    # 不能放 /tmp — AstrBot 和 NapCat 是不同容器, /tmp 互不可见。
+    # runtime/data-luna 被双方 mount 到 /AstrBot/data, 文件存在这里 NapCat 才能读到。
+    from pathlib import Path as _Path
+    _shared_dir = _Path("/AstrBot/data/temp_videos")
+    _shared_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        path = await download_video(url_raw, str(_shared_dir), max_mb=20)
+    except ValueError as e:
+        return f"❌ {e}"
+    except RuntimeError as e:
+        logger.error("[video_extract] 下载异常: %s", e, exc_info=True)
+        return f"❌ 下载失败: {e}"
+
+    if path is None:
+        return (
+            f"⚠️ 视频太大了——所有可用格式都超过 20MB\n"
+            f"「{title}」({duration_str})\n"
+            f"建议: 自己打开链接看吧 → {info.get('webpage_url', url_raw)}"
+        )
+
+    actual_mb = path.stat().st_size / 1e6
+    logger.info(
+        "[video_extract] 下载完成: %s (%.1fMB), 准备发送到群",
+        path.name, actual_mb,
+    )
+
+    # ── 发送视频到群 ──
+    # OneBot v11 send_group_msg 支持 video 类型 (NapCat 文档确认)。
+    # 但 AstrBot 的 _from_segment_to_dict 对 Image 做 URI 规范化 (path_obj.as_uri())
+    # 却对 Video 跳过这一步，导致 Video.fromFileSystem() 产生 file:////path (4斜杠)
+    # 而非标准的 file:///path (3斜杠)。直接用 call_action 绕过。
+    from ..service import sticker_sender as _ss
+
+    video_bot = _ss._sticker_bot.get(None)
+    video_event = _ss._sticker_event.get(None)
+    group_id = str(tool_context.get("group_id", "") or "") if tool_context else ""
+
+    if video_bot is None:
+        path.unlink(missing_ok=True)
+        logger.warning("[video_extract] bot/event 上下文未设置, 无法发送视频")
+        return (
+            f"⚠️ 视频已下载 ({path.name}, {actual_mb:.1f}MB) 但无法发送——"
+            "bot 上下文不可用。"
+        )
+
+    if not group_id or not group_id.isdigit():
+        path.unlink(missing_ok=True)
+        logger.warning("[video_extract] group_id 无效: %s", group_id)
+        return f"⚠️ 无法确定群号，视频未发送。「{title}」({duration_str})"
+
+    send_ok = False
+    try:
+        await video_bot.call_action(
+            "send_group_msg",
+            group_id=int(group_id),
+            message=[
+                {
+                    "type": "video",
+                    "data": {"file": str(path)},
+                }
+            ],
+        )
+        send_ok = True
+        logger.info("[video_extract] 视频已发送到群: %s (group=%s)", path.name, group_id)
+    except Exception as e:
+        logger.error("[video_extract] 发送视频失败: %s", e, exc_info=True)
+
+    if not send_ok:
+        path.unlink(missing_ok=True)
+        return f"❌ 视频下载成功但发送失败"
+
+    # ── 清理 ──
+    path.unlink(missing_ok=True)
+
+    # 抖音: 从文件名提取真实标题 (videofetch 用视频标题命名文件)
+    platform_label = info.get("platform", "视频")
+    platform_name = "B站" if platform_label == "bilibili" else "抖音"
+    if platform_label == "douyin":
+        # videofetch 文件名格式: /path/ParserName/标题.mp4
+        raw_name = path.stem  # 去掉 .mp4
+        # 清理路径和解析器目录前缀
+        if "/SnapAnyVideoClient/" in str(path) or "/VideoFKVideoClient/" in str(path):
+            title = raw_name
+        duration_str = ""
+
+    return (
+        f"✅ 已发送{platform_name}视频到群聊\n"
+        f"「{title}」({duration_str})"
+    )
+
+
 # ── 执行器注册表 ─────────────────────────────────────────
 
 TOOL_EXECUTORS: dict[str, callable] = {
@@ -2479,6 +2685,7 @@ TOOL_EXECUTORS: dict[str, callable] = {
     "edit_image": execute_edit_image,
     "parse_forwarded_message": execute_parse_forwarded_message,
     "pixiv_search": execute_pixiv_search,
+    "video_extract": execute_video_extract,
 }
 
 
@@ -2703,7 +2910,7 @@ async def run_tool_loop(
     admin_qq: int | None = None,
     bot_id: str = "",
     tool_context: dict | None = None,  # 透传给 executor(args, tool_context=...)
-    executors: dict[str, object] | None = None,  # 覆盖 TOOL_EXECUTORS (注入)
+    executors: dict[str, object] | None = None,  # 覆盖 TOOL_EXECUTORS (peer bot 注入)
 ) -> str:
     """通用的 function calling 工具调用循环。
 
@@ -3023,6 +3230,20 @@ async def _run_tool_loop_impl(
                 tool_msg = _compress_tool_result(tool_msg, messages)
                 messages.append(tool_msg)
 
+                # ★ 工具失败兜底: 本地工具返回空/失败时注入提示,
+                #   防止 LLM 下一轮抱怨工具失败而非回答用户问题。
+                _tool_content = tool_msg.get("content", "")
+                if _func_name == "send_sticker" and (
+                    "暂无" in _tool_content or "❌" in _tool_content
+                ):
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "[系统提示] 表情包发送未成功——不要抱怨或再试。"
+                            "直接用文字表达你想传达的情绪，自然接上对话。"
+                        ),
+                    })
+
             continue
 
         # 文本回复 — tavern.get_last_usage() 已存储最后一轮的 usage
@@ -3303,7 +3524,7 @@ async def execute_tool(tool_call: dict, tool_context: dict | None = None, execut
     Args:
         tool_call: {"id": "call_xxx", "function": {"name": "...", "arguments": "..."}}
         tool_context: 透传给 executor 的上下文字典 (如 event / plugin 引用)
-        executors: 覆盖 TOOL_EXECUTORS (注入合并执行器)
+        executors: 覆盖 TOOL_EXECUTORS (peer bot 注入合并执行器)
 
     Returns:
         {"role": "tool", "tool_call_id": "...", "content": "..."}

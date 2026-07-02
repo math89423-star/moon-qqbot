@@ -187,7 +187,16 @@ class KnowledgeBase:
         if self._init_http_embedding():
             return True
 
-        # 回退：本地加载 SentenceTransformer (Docker 内 CPU)
+        # HTTP 服务配置了但不可达 → 不 fallback CPU，避免 497 章节 CPU 嵌入打满核心
+        if self._embedding_service_url:
+            logger.warning(
+                "HTTP embedding 服务不可达 (%s)，跳过向量索引构建，使用关键词检索",
+                self._embedding_service_url,
+            )
+            self._use_embedding = False
+            return False
+
+        # 未配置 HTTP 服务 → 本地加载 SentenceTransformer (Docker 内 CPU)
         try:
             from sentence_transformers import SentenceTransformer
             import torch
@@ -226,13 +235,14 @@ class KnowledgeBase:
             req = urllib.request.Request(url, method="GET")
             with opener.open(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
-            if data.get("status") == "ok" and data.get("model_loaded") is True:
+            if data.get("status") in ("ok", "unloaded"):
                 self._http_embedding_ok = True
                 logger.info(
-                    "HTTP embedding 服务就绪: %s (device=%s, dim=%s)",
+                    "HTTP embedding 服务就绪: %s (device=%s, dim=%s, loaded=%s)",
                     self._embedding_service_url,
                     data.get("device", "?"),
                     data.get("dimension", "?"),
+                    data.get("model_loaded", False),
                 )
                 return True
             logger.warning(

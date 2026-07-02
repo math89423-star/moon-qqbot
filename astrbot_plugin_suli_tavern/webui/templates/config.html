@@ -3,16 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>配置面板 — 暮恩 &amp; </title>
+<title>配置面板 — 洛普特 &amp; 露娜</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.slate.min.css">
 <style>
   :root {
     --pico-font-size: 92.5%;
     --pico-border-radius: 0.5rem;
-    --bot-moon: #4ecca3;
-    --bot-: #e94560;
-    --bot-moon-bg: rgba(78, 204, 163, 0.12);
-    --bot--bg: rgba(233, 69, 96, 0.12);
+    --bot-loput: #4ecca3;
+    --bot-luna: #e94560;
+    --bot-loput-bg: rgba(78, 204, 163, 0.12);
+    --bot-luna-bg: rgba(233, 69, 96, 0.12);
   }
   body { min-height: 100vh; display: flex; flex-direction: column; }
   .app-header {
@@ -34,8 +34,8 @@
   }
   .bot-switch button:hover { background: var(--pico-dropdown-hover-background-color); }
   .bot-switch button.active { color: #fff; }
-  .bot-switch button.active.moon { background: var(--bot-moon); }
-  .bot-switch button.active. { background: var(--bot-); }
+  .bot-switch button.active.loput { background: var(--bot-loput); }
+  .bot-switch button.active.luna { background: var(--bot-luna); }
   .tab-bar {
     display: flex; gap: 0; padding: 0 1.5rem;
     border-bottom: 1px solid var(--pico-muted-border-color);
@@ -63,7 +63,7 @@
   th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
   .badge-llm { background: rgba(91, 155, 213, 0.18); color: #5b9bd5; }
   .badge-vlm { background: rgba(176, 91, 213, 0.18); color: #b05bd5; }
-  .badge-active { background: rgba(78, 204, 163, 0.18); color: var(--bot-moon); }
+  .badge-active { background: rgba(78, 204, 163, 0.18); color: var(--bot-loput); }
   .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; }
   .stat-card { text-align: center; padding: 1rem 0.5rem; }
   .stat-card .val { font-size: 1.7rem; font-weight: 700; color: var(--pico-primary); }
@@ -86,8 +86,8 @@
     padding: 0.6rem 1.2rem; border-radius: 0.4rem; font-size: 0.85rem; font-weight: 500;
     animation: slideIn 0.25s ease; max-width: 360px;
   }
-  .toast-ok { background: #1a3c2a; border: 1px solid var(--bot-moon); color: var(--bot-moon); }
-  .toast-err { background: #3c1a1a; border: 1px solid var(--bot-); color: var(--bot-); }
+  .toast-ok { background: #1a3c2a; border: 1px solid var(--bot-loput); color: var(--bot-loput); }
+  .toast-err { background: #3c1a1a; border: 1px solid var(--bot-luna); color: var(--bot-luna); }
   @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
   /* SVG icon sizing */
@@ -117,7 +117,7 @@
   .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1.2rem; }
   .modal-actions button { min-width: 5rem; }
   .btn-sm { font-size: 0.78rem; padding: 0.25rem 0.55rem; }
-  .btn-danger { background: var(--bot-); border-color: var(--bot-); color: #fff; }
+  .btn-danger { background: var(--bot-luna); border-color: var(--bot-luna); color: #fff; }
   .btn-danger:hover { background: #c0392b; }
   .table-actions { display: flex; gap: 4px; }
   .add-btn-row { margin-bottom: 0.75rem; }
@@ -137,13 +137,13 @@
   <h1>配置面板</h1>
   <span class="subtitle">LLM / VLM / 参数 / 用量</span>
   <div class="bot-switch" id="bot-switch">
-    <button class="active moon" data-bot="BOT_QQ_MAIN">
+    <button class="active loput" data-bot="3581173900">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><path d="M12 8v5M9 21c0-2 1.5-5 3-5s3 3 3 5"/></svg>
-      暮恩
+      洛普特
     </button>
-    <button class="" data-bot="BOT_QQ_ALT">
+    <button class="luna" data-bot="3969478803">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2c-1 4-1 8 0 12s4 6 8 0c-3 1-6 0-8-4s-2.5-8 0-12Z"/></svg>
-      
+      露娜
     </button>
   </div>
 </header>
@@ -162,8 +162,8 @@
   <div class="panel active" id="panel-llm">
     <article id="bot-status-card">
       <div class="bot-status-row">
-        <strong id="bot-status-name">暮恩</strong>
-        <small style="color:var(--pico-muted-color)" id="bot-status-qq">BOT_QQ_MAIN</small>
+        <strong id="bot-status-name">洛普特</strong>
+        <small style="color:var(--pico-muted-color)" id="bot-status-qq">3581173900</small>
         <div class="toggle-row">
           <label><input type="checkbox" id="toggle-group-chat" onchange="saveBotToggle('group_chat_enabled',this.checked)"> 群聊</label>
           <label><input type="checkbox" id="toggle-private-chat" onchange="saveBotToggle('private_chat_enabled',this.checked)"> 私聊</label>
@@ -230,15 +230,15 @@
         <small style="color:var(--pico-muted-color)">硬上限 = 全部拒绝；软上限 = 低优先级延后</small>
       </hgroup>
       <div class="stats-grid" style="grid-template-columns:1fr 1fr">
-        <fieldset style="border-color:var(--bot-moon)">
-          <legend style="color:var(--bot-moon);font-weight:600">🟢 暮恩</legend>
-          <label>硬上限 <input type="number" id="moon-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
-          <label>软上限 <input type="number" id="moon-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
+        <fieldset style="border-color:var(--bot-loput)">
+          <legend style="color:var(--bot-loput);font-weight:600">🟢 洛普特</legend>
+          <label>硬上限 <input type="number" id="loput-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
+          <label>软上限 <input type="number" id="loput-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
         </fieldset>
-        <fieldset style="border-color:var(--bot-)">
-          <legend style="color:var(--bot-);font-weight:600">🔴 </legend>
-          <label>硬上限 <input type="number" id="-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
-          <label>软上限 <input type="number" id="-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
+        <fieldset style="border-color:var(--bot-luna)">
+          <legend style="color:var(--bot-luna);font-weight:600">🔴 露娜</legend>
+          <label>硬上限 <input type="number" id="luna-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
+          <label>软上限 <input type="number" id="luna-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
         </fieldset>
       </div>
       <button id="save-budget-btn" style="margin-top:0.5rem">保存预算</button>
@@ -317,17 +317,63 @@
 const API = '/api/config';
 
 const BOTS = {
-  'BOT_QQ_MAIN': { name: '暮恩', cssClass: 'moon' },
-  'BOT_QQ_ALT': { name: '', cssClass: '' },
+  '3581173900': { name: '洛普特', cssClass: 'loput' },
+  '3969478803': { name: '露娜', cssClass: 'luna' },
 };
-let CURRENT_BOT = sessionStorage.getItem('selected_bot') || 'BOT_QQ_MAIN';
+let CURRENT_BOT = sessionStorage.getItem('selected_bot') || '3581173900';
 
 // ── Auth ─────────────────────────────────────────────────
 
-let AUTH_TOKEN = sessionStorage.getItem('admin_token') || 'anonymous';
+let AUTH_TOKEN = sessionStorage.getItem('admin_token') || null;
+
+async function login(token) {
+  const r = await fetch(API + '/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token}),
+  });
+  return r.ok;
+}
+
+function showLoginScreen() {
+  document.body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;">
+      <article style="max-width:400px;width:100%;text-align:center;">
+        <h2>配置面板</h2>
+        <p style="color:var(--pico-muted-color)">admin_token 在 <code>none_qqbot.db</code> 首次启动时自动生成。</p>
+        <form id="login-form">
+          <input name="token" type="password" placeholder="admin_token..." autofocus
+                 style="text-align:center">
+          <button type="submit" style="width:100%">验证</button>
+          <small class="login-error" style="color:var(--bot-luna);display:none">认证失败，请检查 token</small>
+        </form>
+      </article>
+    </div>`;
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const token = e.target.elements.token.value.trim();
+    if (!token) return;
+    const ok = await login(token);
+    if (ok) {
+      sessionStorage.setItem('admin_token', token);
+      AUTH_TOKEN = token;
+      location.reload();
+    } else {
+      const el = document.querySelector('.login-error');
+      el.style.display = 'block';
+      e.target.elements.token.value = '';
+      e.target.elements.token.focus();
+    }
+  });
+}
+
+(function initAuth() {
+  if (!AUTH_TOKEN) { showLoginScreen(); return; }
+})();
+if (!AUTH_TOKEN) throw new Error('Not authenticated');
 
 function authHeaders() {
-  return {};
+  return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {};
 }
 
 // ── Helpers ───────────────────────────────────────────────
@@ -372,7 +418,7 @@ function switchBot(id) {
   });
   document.getElementById('bot-status-name').textContent = meta.name;
   document.getElementById('bot-status-qq').textContent = id;
-  document.getElementById('bot-status-card').style.borderLeft = '3px solid ' + (id==='BOT_QQ_MAIN'?'var(--bot-moon)':'var(--bot-)');
+  document.getElementById('bot-status-card').style.borderLeft = '3px solid ' + (id==='3581173900'?'var(--bot-loput)':'var(--bot-luna)');
   loadBotSettings();
   loadLLM(); loadVLM();
 }
@@ -744,13 +790,13 @@ async function loadTokens() {
     // Per-bot 消耗卡片
     const bots = s.by_bot || [];
     const botCards = bots.length ? bots.map(b => {
-      const name = b.bot_id === 'BOT_QQ_MAIN' ? '暮恩' : b.bot_id === 'BOT_QQ_ALT' ? '' : b.bot_id;
-      const cssColor = b.bot_id === 'BOT_QQ_MAIN' ? 'var(--bot-moon)' : 'var(--bot-)';
+      const name = b.bot_id === '3581173900' ? '洛普特' : b.bot_id === '3969478803' ? '露娜' : b.bot_id;
+      const cssColor = b.bot_id === '3581173900' ? 'var(--bot-loput)' : 'var(--bot-luna)';
       const total = (b.input_tokens||0) + (b.output_tokens||0);
-      const hardKey = b.bot_id === 'BOT_QQ_MAIN' ? 'moon_hard_limit_m' : '_hard_limit_m';
+      const hardKey = b.bot_id === '3581173900' ? 'loput_hard_limit_m' : 'luna_hard_limit_m';
       const limitM = budget[hardKey] || 3;
       const pct = limitM > 0 ? Math.round(total / (limitM * 1e6) * 100) : 0;
-      const barColor = pct > 90 ? 'var(--bot-)' : pct > 70 ? '#f0ad4e' : 'var(--bot-moon)';
+      const barColor = pct > 90 ? 'var(--bot-luna)' : pct > 70 ? '#f0ad4e' : 'var(--bot-loput)';
       return `<div class="stat-card" style="border-left:3px solid ${cssColor}">
         <div class="val" style="font-size:1.1rem;color:${cssColor}">${name}</div>
         <div style="margin:0.3rem 0;background:var(--pico-muted-border-color);border-radius:4px;height:6px">
@@ -792,20 +838,20 @@ async function loadTokens() {
 async function loadBudget() {
   try {
     const b = await apiGet('/token-budget');
-    document.getElementById('moon-hard-m').value = b.moon_hard_limit_m;
-    document.getElementById('moon-soft-m').value = b.moon_soft_limit_m;
-    document.getElementById('-hard-m').value = b._hard_limit_m;
-    document.getElementById('-soft-m').value = b._soft_limit_m;
+    document.getElementById('loput-hard-m').value = b.loput_hard_limit_m;
+    document.getElementById('loput-soft-m').value = b.loput_soft_limit_m;
+    document.getElementById('luna-hard-m').value = b.luna_hard_limit_m;
+    document.getElementById('luna-soft-m').value = b.luna_soft_limit_m;
   } catch(e) { console.error(e); }
 }
 
 document.getElementById('save-budget-btn').addEventListener('click', async () => {
   try {
     await apiPost('/token-budget', {
-      daily_token_limit_moon_m: parseFloat(document.getElementById('moon-hard-m').value)||3,
-      daily_token_soft_limit_moon_m: parseFloat(document.getElementById('moon-soft-m').value)||2.4,
-      daily_token_limit__m: parseFloat(document.getElementById('-hard-m').value)||3,
-      daily_token_soft_limit__m: parseFloat(document.getElementById('-soft-m').value)||2.4,
+      daily_token_limit_loput_m: parseFloat(document.getElementById('loput-hard-m').value)||3,
+      daily_token_soft_limit_loput_m: parseFloat(document.getElementById('loput-soft-m').value)||2.4,
+      daily_token_limit_luna_m: parseFloat(document.getElementById('luna-hard-m').value)||3,
+      daily_token_soft_limit_luna_m: parseFloat(document.getElementById('luna-soft-m').value)||2.4,
     });
     toast('Token 预算已保存');
     loadTokens();

@@ -1,4 +1,4 @@
-"""暮恩双轨情感系统 — 已提取至 astrbot_plugin_suli_emotion。
+"""Bot 双轨情感系统 — 已提取至 astrbot_plugin_suli_emotion。
 
 本文件保持向后兼容 — 外部 import 路径不变。
 """

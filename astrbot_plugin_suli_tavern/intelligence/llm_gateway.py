@@ -148,9 +148,9 @@ class LLMGateway:
                 from ..service.bot_identity import get_bot_identity_service
                 _svc_b = get_bot_identity_service()
                 _bot = _svc_b.get_bot(str(bot_id))
-                bot_key = _bot.character_card.lower() if _bot else "moon"
+                bot_key = _bot.character_card.lower() if _bot else "default"
             except Exception:
-                bot_key = "moon"
+                bot_key = "default"
             hard_limit = int(budget_cfg.get(f"{bot_key}_hard_limit", 3_000_000))
             soft_limit = int(budget_cfg.get(f"{bot_key}_soft_limit", 2_400_000))
 

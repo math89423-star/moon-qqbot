@@ -1,4 +1,4 @@
-"""暮恩长期好感 (Affinity) — 离散等级 + 硬门控。
+"""Bot 长期好感 (Affinity) — 离散等级 + 硬门控。
 
 从 emotion.py 拆分出的独立模块。依赖 mood.py (MoodState)。
 
@@ -262,8 +262,6 @@ FORBIDDEN_NICKNAMES: set[str] = {
     "主人", "管理员", "admin", "主人大人", "master",
     "爸爸", "妈妈", "爹", "娘", "父亲", "母亲",
     "老公", "老婆", "亲爱的", "宝贝",
-    "暮恩", "moon", "小暮",
-    "", "", "", "",
 }
 
 NICKNAME_MAX_LEN = 8  # 昵称最长字符数
@@ -487,7 +485,7 @@ class AffinityState:
 
 @dataclass
 class UserRelation:
-    """暮恩对一个用户的完整情感状态 (不含全局 mood)。
+    """Bot 对一个用户的完整情感状态 (不含全局 mood)。
 
     mood 已提升为 per-bot 全局单例 (见 global_mood.py)。
     此类仅保留 per-user 维度: affinity + nickname + 工具冷却。

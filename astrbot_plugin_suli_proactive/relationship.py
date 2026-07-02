@@ -1,6 +1,6 @@
 """关系状态机 — 角色系统 + 情感门控。
 
-从 core_store.py + proactive_engine.py 提取的 persona-agnostic 模式。
+从社区插件 core_store.py + proactive_engine.py 提取的 persona-agnostic 模式。
 零硬编码角色文本 — 所有标签/阈值来自 Config。
 """
 

@@ -18,11 +18,12 @@
 """
 
 from .cache_optimizer import CacheOptimizer, ContextCompressor
-from .knowledge_base import KnowledgeBase, Section, get_knowledge_base, init_knowledge_dir, tokenize
+from .knowledge_base import KnowledgeBase, Section, add_web_result, get_knowledge_base, init_knowledge_dir, tokenize
 from .pixiv_search import format_pixiv_results, mark_illust_shown, search_pixiv
 from .web_search import format_web_results, web_search
 
 __all__ = [
+    "add_web_result",
     "CacheOptimizer",
     "ContextCompressor",
     "KnowledgeBase",

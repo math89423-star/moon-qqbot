@@ -8,6 +8,7 @@ AstrBot 原生插件 — 保留全部自研基础设施：
 
 from __future__ import annotations
 
+import json as _json
 import os
 import re as _re
 import sys
@@ -359,13 +360,182 @@ async def _extract_reply_image_urls(event: AstrMessageEvent) -> tuple[list[str],
 
 
 def _extract_card_info(event: AstrMessageEvent) -> str:
-    raw = getattr(event, "message_str", "") or ""
+    """从 CQ 分享/JSON/XML 卡片中提取元数据。
+
+    两条提取路径:
+      Path 1 — message_str 中的 [CQ:share/json/xml,...] 正则匹配 (文本消息中的卡片)
+      Path 2 — message_obj.message 原始 OneBot 段: {"type":"json"|"share","data":{...}}
+              (QQ 分享卡作为独立 ComponentType.Json 到达时 message_str 为空，len=0)
+
+    关键设计: URL 提取到最前面 ([分享链接] 前缀)，确保即使上下文截断
+    (Gate 150 字符 / prompt_builder 197 字符) URL 也在前 40 字符内可见。
+    否则长分享卡 JSON (title + content + image URL) 轻松 300-500 字符，
+    URL 埋在 JSON 深处 → 两层截断全裁掉 → LLM 看不到链接。
+    """
     parts: list[str] = []
+
+    # ── Path 1: CQ code in message_str ──
+    raw = getattr(event, "message_str", "") or ""
     for m in _re.finditer(r"\[CQ:(?:json|xml|share),[^\]]*?data=([^\]]+)", raw):
         data = m.group(1)
         if data:
-            parts.append(data[:500])
+            _append_card_data(data, parts)
+
+    # ── Path 2: AstrBot message components (JSON/share 组件 message_str 为空) ──
+    if not parts:
+        try:
+            components = event.get_messages()
+            for comp in components:
+                comp_type = str(getattr(comp, "type", ""))
+                # 只处理 Share / Json 组件 (Plain/Image/Reply/At 不记录)
+                if comp_type == "ComponentType.Share":
+                    url = str(getattr(comp, "url", "") or "")
+                    if url.startswith("http"):
+                        parts.append(f"[分享链接] {url}")
+                    parts.append(str({
+                        "url": url,
+                        "title": getattr(comp, "title", ""),
+                        "content": getattr(comp, "content", ""),
+                    })[:500])
+                    break
+                # Json 组件: data 字段是已解析的 dict
+                if comp_type == "ComponentType.Json":
+                    json_data = getattr(comp, "data", None)
+                    if isinstance(json_data, dict):
+                        logger.info(
+                            "%s [CARD DEBUG] Json data keys=%s full=%s",
+                            _bot_tag("?"), list(json_data.keys())[:20],
+                            _json.dumps(json_data, ensure_ascii=False)[:2000],
+                        )
+                        _extract_url_from_json_dict(json_data, parts)
+                        if not parts:
+                            parts.append(_json.dumps(json_data, ensure_ascii=False)[:500])
+                    break
+        except Exception as e:
+            logger.info("%s [CARD DEBUG] get_messages 异常: %s", _bot_tag("?"), e)
+        # ── Path 2b: 兜底 — message_obj.message 原始 OneBot 段 (某些适配器版本) ──
+        if not parts:
+            msg_obj = getattr(event, "message_obj", None)
+            raw_message: Any = getattr(msg_obj, "message", None) if msg_obj is not None else None
+            if isinstance(raw_message, list):
+                for seg in raw_message:
+                    seg_type = seg.get("type", "") if isinstance(seg, dict) else ""
+                    seg_data = seg.get("data", {}) if isinstance(seg, dict) else {}
+                    if seg_type == "share":
+                        url = seg_data.get("url", "")
+                        if url and isinstance(url, str) and url.startswith("http"):
+                            parts.append(f"[分享链接] {url}")
+                        parts.append(str(seg_data)[:500])
+                    elif seg_type == "json":
+                        json_str = seg_data.get("data", "")
+                        if json_str:
+                            _append_card_data(json_str, parts)
+                    if parts:
+                        break
+
     return "\n".join(parts)
+
+
+def _extract_url_from_json_dict(obj: dict, parts: list[str]) -> None:
+    """从已解析的 JSON dict 中提取 URL (AstrBot Json 组件 data 字段)。"""
+    url = ""
+    # 常见 URL 字段路径 (按优先级)
+    url = (
+        obj.get("url", "")
+        or obj.get("jumpUrl", "")
+        or obj.get("share_url", "")
+        or obj.get("link", "")
+    )
+    # structmsg: meta.news.jumpUrl / meta.music.jumpUrl
+    if not url:
+        meta = obj.get("meta", {})
+        if isinstance(meta, dict):
+            for section in ("news", "music", "detail_1", "detail"):
+                section_data = meta.get(section, {})
+                if isinstance(section_data, dict):
+                    url = section_data.get("jumpUrl", "") or section_data.get("url", "")
+                    if url:
+                        break
+    # QQ 小程序卡片: 递归搜整个 JSON 找第一个 http URL (兜底)
+    if not url or not (isinstance(url, str) and url.startswith("http")):
+        url = _find_first_url(obj)
+    if url and isinstance(url, str) and url.startswith("http"):
+        parts.append(f"[分享链接] {url}")
+
+
+def _find_first_url(obj: Any, _depth: int = 0) -> str:
+    """递归搜索 JSON 结构中第一个 http URL。最大深度 6，防栈溢出。"""
+    if _depth > 6:
+        return ""
+    if isinstance(obj, dict):
+        # 优先查常见 URL 字段名 (含 QQ 小程序特有 qqdocurl)
+        for key in ("url", "jumpUrl", "share_url", "link", "src", "href",
+                     "redirect_url", "qqdocurl"):
+            val = obj.get(key, "")
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        # 遍历所有值: 字符串直接匹配 → 容器递归
+        for val in obj.values():
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+            if isinstance(val, (dict, list)):
+                found = _find_first_url(val, _depth + 1)
+                if found:
+                    return found
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, str) and item.startswith("http"):
+                return item
+            if isinstance(item, (dict, list)):
+                found = _find_first_url(item, _depth + 1)
+                if found:
+                    return found
+    return ""
+
+
+def _append_card_data(data_str: str, parts: list[str]) -> None:
+    """解析卡片 JSON 数据，提取 URL 到最前面，其余内容追加。
+
+    QQ 分享卡有多种 JSON 结构:
+      - share 类型: {"url": "https://...", "title": "...", ...}
+      - structmsg (B站/小程序): {"app":"com.tencent.structmsg","meta":{"news":{"jumpUrl":"..."}}}
+      - 其他嵌套格式: URL 可能在任意深度
+
+    策略: 先按常见路径提取 → 失败则正则搜任意 http URL。
+    """
+    url = ""
+    try:
+        obj = _json.loads(data_str)
+        # 常见 URL 字段路径 (按优先级)
+        if isinstance(obj, dict):
+            url = (
+                obj.get("url", "")
+                or obj.get("jumpUrl", "")
+                or obj.get("share_url", "")
+                or obj.get("link", "")
+            )
+            # structmsg: meta.news.jumpUrl / meta.music.jumpUrl
+            if not url:
+                meta = obj.get("meta", {})
+                if isinstance(meta, dict):
+                    for section in ("news", "music", "detail_1", "detail"):
+                        section_data = meta.get(section, {})
+                        if isinstance(section_data, dict):
+                            url = section_data.get("jumpUrl", "") or section_data.get("url", "")
+                            if url:
+                                break
+    except (_json.JSONDecodeError, TypeError):
+        pass
+
+    # JSON 解析未找到 → 正则兜底: 从原始字符串中搜 http URL
+    if not url or not (isinstance(url, str) and url.startswith("http")):
+        m = _re.search(r'https?://[^\s"\'\\,\}\]\)>]+', data_str)
+        if m:
+            url = m.group(0).rstrip(".")
+
+    if url and isinstance(url, str) and url.startswith("http"):
+        parts.append(f"[分享链接] {url}")
+    parts.append(data_str[:500])
 
 
 async def _extract_forward_content(event: AstrMessageEvent) -> str:
@@ -504,7 +674,7 @@ async def _extract_forward_content(event: AstrMessageEvent) -> str:
 
         # ── 场景 4: 用户提及"转发"但未在任何消息段中找到 → 查缓存 ──
         # 典型场景: 用户先发了一条合并转发 (无 @/昵称, bot 不回复)，
-        # 然后发 "@暮恩 看看这个转发" → 转发内容在之前的消息中。
+        # 然后发 "@bot 看看这个转发" → 转发内容在之前的消息中。
         if not parts:
             raw_text = str(getattr(event, "message_str", "") or "")
             if any(kw in raw_text for kw in ("转发", "合并", "聊天记录")):
@@ -552,7 +722,7 @@ def _is_bot_replied(event: AstrMessageEvent) -> bool:
 def _message_targets_bot(content: str, config: Any) -> bool:
     if not content:
         return False
-    nicknames = getattr(config, "bot_nicknames", ["暮恩", "小暮", "moon", "绿蛇"])
+    nicknames = getattr(config, "bot_nicknames", [])
     content_lower = content.lower()
     return any(n.lower() in content_lower for n in nicknames if n)
 
@@ -676,8 +846,8 @@ PLUGIN_NAME = "astrbot_plugin_suli_tavern"
     "暮恩：角色扮演 + 群聊自然对话 + L-Port 生图 + 三层记忆 + 意图门控 + VLM 识图",
     "1.0.0",
 )
-class MoonTavernPlugin(Star):
-    """暮恩 · 无限之蛇 — AstrBot 版。"""
+class LoputTavernPlugin(Star):
+    """暮恩 · 无限之蛇 — AstrBot 版。"暮恩 (Moon)" 开源项目。
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
@@ -704,7 +874,8 @@ class MoonTavernPlugin(Star):
         self.group_chat_ctl: Optional[GroupChatScheduler] = None
         if self.tavern is not None:
             WHITELIST_FILE = (
-                Path("data") / "shared_db" / "group_chat_whitelist.json"
+                Path(__file__).resolve().parent.parent.parent.parent
+                / "data" / "shared_db" / "group_chat_whitelist.json"
             )
             try:
                 self.group_chat_ctl = GroupChatScheduler(
@@ -747,19 +918,6 @@ class MoonTavernPlugin(Star):
         _identity_svc.init_db(_bot_db)
         _bot_count = _bot_db.bot_identity_count()
         logger.info("BotIdentity 注册中心已初始化: %d bots", _bot_count)
-
-        # ── 加载管理员 QQ 配置 (覆盖 config.py 硬编码默认值) ──
-        _db_admin_qq = _config_svc.get_super_admin_qq()
-        _db_admin_ids = _config_svc.get_admin_qq_ids()
-        if _db_admin_qq:
-            self._lport_config.super_admin_qq = _db_admin_qq
-        if _db_admin_ids:
-            self._lport_config.admin_qq_ids = _db_admin_ids
-        if _db_admin_qq or _db_admin_ids:
-            logger.info("管理员 QQ 配置已加载: super_admin=%d, admins=%s",
-                        self._lport_config.super_admin_qq, self._lport_config.admin_qq_ids)
-        else:
-            logger.warning("管理员 QQ 未配置！请在管理面板 http://localhost:5190 设置")
 
         # ── 知识库迁移修复: 之前因路径未注入导致静默失败, 重置 flag 重跑 ──
         try:
@@ -864,6 +1022,7 @@ class MoonTavernPlugin(Star):
         SLOT_LABELS = {
             "llm_lite": "闲聊", "llm_pro": "推理",
             "llm_gate": "意图闸", "llm_judge": "仲裁",
+            "shadow_agent": "影子Agent",
             "vlm_primary": "识图", "vlm_secondary": "绘图VLM",
         }
 
@@ -873,7 +1032,7 @@ class MoonTavernPlugin(Star):
         for bot in _bots:
             bot_id = bot.bot_id
             label = bot.name
-            # per-bot LLM 槽位 (不同 bot 有不同槽位: 无仲裁)
+            # per-bot LLM 槽位 (不同 bot 有不同槽位: peer bot 无仲裁)
             llm_slots = config_svc.get_display_llm_slots(bot_id)
             logger.info(
                 "═══ %s (%s) — %d LLM + %d VLM ═══",
@@ -911,6 +1070,8 @@ class MoonTavernPlugin(Star):
                     logger.warning(
                         "  VLM %-12s [%-4s] → ⚠️ 未配置", slot, purpose,
                     )
+
+            # ★ 影子 Agent (2026-07-02) — 已作为正式 LLM 槽位，会在上方的循环中打印
 
     async def _inject_proactive_deps(self) -> None:
         """向主动行为插件注入 GroupChatScheduler + TavernClient。
@@ -1044,7 +1205,7 @@ class MoonTavernPlugin(Star):
         if not self_id or self_id not in get_bot_qq_set():
             return
 
-        if not group_id or not self.group_chat_ctl.is_group_enabled(int(group_id), bot_id=self_id):
+        if not group_id or not self.group_chat_ctl.is_group_enabled(int(group_id)):
             _txt_len = len(str(getattr(event, "message_str", "") or ""))
             logger.info("%s 白名单拦截: group=%s sender=%s msg_len=%d", _bot_tag(self_id), group_id, user_id[:8], _txt_len)
             event.stop_event()
@@ -1069,7 +1230,13 @@ class MoonTavernPlugin(Star):
 
         card_info = _extract_card_info(event)
         if card_info:
+            _was_empty = not content
             content = content + "\n" + card_info if content else card_info
+            if _was_empty:
+                logger.info(
+                    "%s 分享卡提取 (消息文本为空, 从 OneBot 段恢复): %s",
+                    _bot_tag(self_id), card_info[:120],
+                )
 
         forward_info = await _extract_forward_content(event)
         if forward_info:
@@ -1161,7 +1328,7 @@ class MoonTavernPlugin(Star):
         if image_urls and _vlm_allowed:
             if len(image_urls) > MAX_VLM_IMAGES:
                 await event.send(MessageChain([Plain(
-                    f"✨ 一下子发这么多图暮恩看不过来啦…最多只能仔细看 {MAX_VLM_IMAGES} 张～"
+                    f"✨ 一下子发这么多图我看不过来啦…最多只能仔细看 {MAX_VLM_IMAGES} 张～"
                 )]))
                 image_urls = image_urls[:MAX_VLM_IMAGES]
 
@@ -1169,7 +1336,7 @@ class MoonTavernPlugin(Star):
             # 此前 VLM 在这里直接调用 describe_images_from_urls(),
             # 完全绕过意图门授权。现在改为标记延迟 VLM 请求,
             # 由 _evaluate_and_reply 在 Gate 通过后执行。
-            event._moon_deferred_vlm = {
+            event._loput_deferred_vlm = {
                 "urls": list(image_urls),
                 "file_ids": list(image_file_ids) if image_file_ids else [],
                 "user_id": user_id,
@@ -1204,9 +1371,9 @@ class MoonTavernPlugin(Star):
             #   裸图 + 弱信号 (batch/debounce/proactive) → 静默等待, 不调 VLM
             #   裸图 + 强信号 (mention/reply/nickname/thread_continuation) → 放行 Gate 评估
             #   有文字指令 → Gate 判断是否授权 describe_image
-            # 不设 _moon_deferred_vlm 的后果: 跨消息查找会在 ctx.messages 中
+            # 不设 _loput_deferred_vlm 的后果: 跨消息查找会在 ctx.messages 中
             # 扫到当前消息自己的 [图片 URL: ...], 构造伪 deferred_vlm → 裸图守卫被绕过。
-            event._moon_deferred_vlm = {
+            event._loput_deferred_vlm = {
                 "urls": list(image_urls),
                 "file_ids": list(image_file_ids) if image_file_ids else [],
                 "user_id": user_id,
@@ -1359,7 +1526,7 @@ class MoonTavernPlugin(Star):
             # ────────────────────────────────────────────
             if len(image_urls) > MAX_VLM_IMAGES:
                 await event.send(MessageChain([Plain(
-                    f"✨ 一下子发这么多图暮恩看不过来啦…最多只能仔细看 {MAX_VLM_IMAGES} 张～"
+                    f"✨ 一下子发这么多图我看不过来啦…最多只能仔细看 {MAX_VLM_IMAGES} 张～"
                 )]))
                 image_urls = image_urls[:MAX_VLM_IMAGES]
             _reset_vlm_usage()
@@ -1417,7 +1584,7 @@ class MoonTavernPlugin(Star):
     @filter.command("role")
     async def on_role_command(self, event: AstrMessageEvent):
         # ── /role 命令已禁用 ──
-        await event.send(MessageChain([Plain("❌ /role 命令已禁用。请直接发送消息与暮恩对话。")]))
+        await event.send(MessageChain([Plain("❌ /role 命令已禁用。请直接发送消息进行角色扮演。")]))
         return
 
     async def _on_role_command_disabled(self, event: AstrMessageEvent):
@@ -1540,7 +1707,7 @@ class MoonTavernPlugin(Star):
 
         await _maybe_compress_role_history(session, self.tavern, _bot_self_id)
 
-        # 根据 self_id 解析角色卡 (双 Bot: 暮恩 vs )
+        # 根据 self_id 解析角色卡 (双 Bot: 主 bot vs 对照 bot)
         _bot_self_id = self._self_id(event)
         _char = get_character_for_self_id(_bot_self_id)
 
@@ -1586,7 +1753,7 @@ class MoonTavernPlugin(Star):
             _priv_max = 50  # 每人每天最多 50 轮私聊对话
             if _priv_count >= _priv_max and user_id != str(self._lport_config.super_admin_qq):
                 await event.send(MessageChain([Plain(
-                    "✨ 今天已经聊了很多了呢…明天再来找暮恩玩吧 (´・ω・`)"
+                    "✨ 今天已经聊了很多了呢…明天再来找我玩吧 (´・ω・`)"
                 )]))
                 session.history.pop()
                 return
@@ -1650,7 +1817,7 @@ class MoonTavernPlugin(Star):
 
 
 def _bot_tag(bot_id: str) -> str:
-    """返回 bot 日志标签, 如 [暮恩]。从 BotIdentityService 查询。"""
+    """返回 bot 日志标签。从 BotIdentityService 查询。"""
     try:
         from .service.bot_identity import get_bot_identity_service
         svc = get_bot_identity_service()

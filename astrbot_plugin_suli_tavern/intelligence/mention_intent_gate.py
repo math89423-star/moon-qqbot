@@ -32,7 +32,7 @@ class MentionIntentGate:
         )
         ctx = GateContext(
             messages=[{"user_id": "", "user_name": sender_name, "content": content}],
-            bot_name=getattr(config, "bot_name", "暮恩"),
+            bot_name=getattr(config, "bot_name", ""),
             peer_bot_name=getattr(config, "peer_bot_name", ""),
             is_at_mention=False,
         )

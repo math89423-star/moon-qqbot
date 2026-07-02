@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _CHAR_DIR = Path(__file__).resolve().parent.parent / "characters"
 
 
-def _load_character_card(name: str = "moon") -> dict:
+def _load_character_card(name: str = "") -> dict:
     """加载 JSON 角色卡文件。
 
     system_prompt 支持 txt 文件覆盖:
@@ -72,11 +72,11 @@ def _load_character_card(name: str = "moon") -> dict:
 # 配置方式 (优先级从高到低):
 #   1. 环境变量 BOT_QQ_MAIN + BOT_CHAR_MAIN / BOT_QQ_ALT + BOT_CHAR_ALT (精确指定)
 #   2. 自动扫描 characters/ 目录，按文件名排序依次分配给 QQ 号
-#   3. 硬编码默认值 (暮恩/ — 开发环境)
+#   3. 硬编码默认值 (通用回退)
 import os as _os
 
 
-def _builtin_fallback(name: str = "moon") -> dict:
+def _builtin_fallback(name: str = "") -> dict:
     """最小后备角色卡 — 确保不会空启动。
 
     所有角色卡内容应从 JSON 文件加载。此函数仅提供最小骨架，
@@ -136,8 +136,8 @@ _main_qq = _os.getenv("BOT_QQ_MAIN", "")
 _alt_qq = _os.getenv("BOT_QQ_ALT", "")
 _BOT_CARDS = _discover_characters()
 
-_MOON_QQ = _main_qq or ""  # 向后兼容 (deprecated)
-__QQ = _alt_qq or ""     # 向后兼容 (deprecated)
+_LOPUT_QQ = _main_qq or ""  # 向后兼容 (deprecated)
+_LUNA_QQ = _alt_qq or ""     # 向后兼容 (deprecated)
 
 CHARACTERS: dict[str, dict] = {}
 if _BOT_CARDS:
@@ -154,8 +154,8 @@ else:
 DEFAULT_CHARACTER: dict = (
     CHARACTERS.get(_main_qq) or
     CHARACTERS.get(_alt_qq) or
-    next(iter(CHARACTERS.values()), _builtin_fallback("moon")) if CHARACTERS
-    else _builtin_fallback("moon")
+    next(iter(CHARACTERS.values()), _builtin_fallback("character")) if CHARACTERS
+    else _builtin_fallback("character")
 )
 
 
@@ -206,7 +206,7 @@ _WB_ENTRIES: dict[str, list[WorldBookEntry]] = {}  # {bot_id: [WorldBookEntry]}
 _WB_SCAN_DEPTH = DEFAULT_SCAN_DEPTH
 
 # 模块加载时加载世界书 — 跟随角色卡映射
-for _wb_qq, _wb_card_name in (_BOT_CARDS.items() if _BOT_CARDS else [(_main_qq, "moon"), (_alt_qq, "")]):
+for _wb_qq, _wb_card_name in (_BOT_CARDS.items() if _BOT_CARDS else []):
     _wb_path = _CHAR_DIR / f"{_wb_card_name}_world_book.json"
     if _wb_path.exists():
         _WB_ENTRIES[_wb_qq] = load_world_book(str(_wb_path))
@@ -220,7 +220,7 @@ def _scan_world_book(messages: list[dict[str, str]], bot_id: str = "") -> list[s
     用于私聊/角色扮演等不需要状态追踪的场景。
     群聊请使用 WorldBookBuffer (有状态: sticky/cooldown/delay)。
     """
-    _entries = _WB_ENTRIES.get(str(bot_id), _WB_ENTRIES.get(_MOON_QQ, []))
+    _entries = _WB_ENTRIES.get(str(bot_id), _WB_ENTRIES.get(_LOPUT_QQ, []))
     return scan_world_book_static(
         messages,
         entries=_entries,
@@ -440,22 +440,23 @@ class TavernClient:
         """绕过酒馆，直接调用 OpenAI 兼容 API (三方代理)。"""
         # ── 动态 max_tokens 双护栏: 地板 + 天花板 ──
         #     地板: 输入长时确保输出预算不枯竭 (TRAPS §八#7 旧修复)
-        #     天花板: 输入+输出不超模型上下文窗口 (TRAPS §八#7 延续 —
-        #             工具循环检索结果累积 30k+ chars → 公式算出 10k+ 输出 →
-        #             总请求超 flash 模型 32k 上下文 → finish=length / 截断)
-        #     保守估计: flash ~32k, pro ~128k (中文 ~1 tok/char, 10% 开销)
+        #     天花板: 输入+输出不超模型上下文窗口 (TRAPS §八#7 延续)
+        #     DeepSeek v4: flash/pro 均为 128K 上下文 (之前按 v3 flash 32K 保守估计,
+        #     导致 40K chars 输入时天花板压制到 512 → finish=length + 空 content)
+        #     估算: 中文 ~1 tok/char, 10% 元数据开销
         _input_chars = sum(
             len(m.get("content") or "") for m in optimized
         )
-        # 地板: 取 max_tokens 和 输入*0.15 的较大值, 但绝不超过 4096
-        _min_tokens = min(max(256, max_tokens, int(_input_chars * 0.15)), 4096)
+        # 地板: 取 max_tokens 和 输入*0.15 的较大值, 上限按 reasoning_effort 调整
+        #     CoT 思考 token 计入 max_tokens — 需要更大的地板才能容纳思考+输出
+        _effort = extra_params.get("reasoning_effort") if extra_params else None
+        _floor_cap = 8192 if _effort in ("high", "max", "xhigh") else 4096
+        _min_tokens = min(max(256, max_tokens, int(_input_chars * 0.15)), _floor_cap)
         _safe_max_tokens = _min_tokens
 
         # ── 天花板: 确保 estimated_input + max_tokens ≤ 模型上下文 ──
         _est_input_tokens = int(_input_chars * 1.1)  # 10% 元数据开销
-        _ctx_ceiling = 131072  # pro 默认
-        if "flash" in model.lower():
-            _ctx_ceiling = 32768
+        _ctx_ceiling = 131072  # DeepSeek v4 pro/flash 均为 128K 上下文
         _max_safe_output = max(512, _ctx_ceiling - _est_input_tokens)
         _safe_max_tokens = min(_safe_max_tokens, _max_safe_output)
         if _safe_max_tokens < max_tokens:
@@ -464,24 +465,29 @@ class TavernClient:
                 max_tokens, _safe_max_tokens, _est_input_tokens, model, _ctx_ceiling,
             )
 
-        # ── reasoning_effort 保护: 输出预算<2048 时自动剥离 ──
+        # ── reasoning_effort 保护: 输出预算不足时自动剥离 ──
         #    推理模型 (v4-pro/flash with reasoning_effort) 的 CoT 思考 token
-        #    计入 max_tokens。上下文接近满载时 max_tokens 被天花板压制到 ~800,
+        #    计入 max_tokens。上下文接近满载时 max_tokens 被天花板压制,
         #    CoT 吃掉全部预算 → finish=length + 空 content (TRAPS §八#7 延续)。
-        #    此时剥离 reasoning_effort — 思考换不来输出就没意义了。
+        #    剥离 reasoning_effort — 思考换不来输出就没意义了。
+        #    CoT 开销: medium≈1500 tokens, high+≈3000+ tokens
         _reasoning_stripped = False
+        _protection_threshold = 2048  # 默认: 至少留 2048 给输出
+        if _effort == "medium":
+            _protection_threshold = 3072  # CoT 1500 + 输出 1500
+        elif _effort in ("high", "max", "xhigh"):
+            _protection_threshold = 5120  # CoT 3000 + 输出 2000
         if (
-            _safe_max_tokens < 2048
-            and extra_params
-            and extra_params.get("reasoning_effort")
+            _safe_max_tokens < _protection_threshold
+            and _effort
         ):
             _stripped_effort = extra_params.get("reasoning_effort")
             extra_params = {k: v for k, v in extra_params.items() if k != "reasoning_effort"}
             _reasoning_stripped = True
             logger.warning(
-                "reasoning 预算保护: 剥离 reasoning_effort=%s (输出预算=%d < 2048, "
+                "reasoning 预算保护: 剥离 reasoning_effort=%s (输出预算=%d < %d, "
                 "输入估算=%d, 模型=%s)",
-                _stripped_effort, _safe_max_tokens, _est_input_tokens, model,
+                _stripped_effort, _safe_max_tokens, _protection_threshold, _est_input_tokens, model,
             )
 
         url = api_base.rstrip("/")
@@ -592,7 +598,7 @@ class TavernClient:
             完整的 messages 列表
         """
         char = character or DEFAULT_CHARACTER
-        char_name = char.get("name", "暮恩")
+        char_name = char.get("name", "AI")
 
         # 解析用户称呼: 超级管理员 → 主人, 其他 → 小可爱
         if user_id and super_admin_qq is not None:

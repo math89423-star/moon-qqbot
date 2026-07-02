@@ -33,8 +33,8 @@ class Config(BaseModel):
 
     # 昵称唤醒: 消息中包含这些关键词 → 视为 @提及 立即触发
     group_chat_nicknames: list[str] = Field(
-        default_factory=lambda: ["小暮", "暮暮", "洛宝", "暮恩", "moon"],
-        description="消息中包含这些昵称时立即触发回复",
+        default_factory=list,
+        description="消息中包含这些昵称时立即触发回复（为空时从角色卡 nicknames 字段读取）",
     )
 
     # 上下文窗口: 最多保留 N 条群聊消息
@@ -300,7 +300,7 @@ class Config(BaseModel):
         description="是否启用情感曲线系统 (双 bot 总开关)",
     )
 
-    # peer bot () 是否启用情感系统 — emotion_enabled 为 False 时此字段无效
+    # peer bot 是否启用情感系统 — emotion_enabled 为 False 时此字段无效
     emotion_enabled_peer: bool = Field(
         default=True,
         description="对照 bot (peer_bot_qq) 是否启用情感系统",
@@ -851,21 +851,31 @@ class Config(BaseModel):
     # ── 管理员 ─────────────────────────────────────────
 
     # 全局管理员 QQ 号列表
+    # 请通过环境变量 BOT_ADMIN_QQ / BOT_QQ_MAIN / BOT_QQ_PEER 配置
     admin_qq_ids: list[int] = Field(
-        default_factory=list,
-        description="全局管理员 QQ 号列表 (通过 Web 管理面板 /api/admin/admin-qq 配置)",
+        default_factory=lambda: [0],
+        description="全局管理员 QQ 号列表，请通过环境变量 BOT_ADMIN_QQ 配置",
     )
 
     # 唯一超级管理员 QQ 号 (角色扮演中称呼为「主人」，其他用户称呼为「小可爱」)
     super_admin_qq: int = Field(
         default=0,
-        description="唯一超级管理员 QQ 号 (通过 Web 管理面板 /api/admin/admin-qq 配置)，角色扮演中享有「主人」称呼特权",
+        description="唯一超级管理员 QQ 号，请通过环境变量 BOT_ADMIN_QQ 配置。角色扮演中享有「主人」称呼特权",
     )
 
-    # 同群对照 bot () 的 QQ 号 — 其消息不应触发暮恩的管线
+    # ★ 主人 QQ 号白名单 — 身份验证唯一真相源
+    # display name / nickname 仅用于角色扮演语气，绝不用于鉴权。
+    # 任何人自称"主人"但其 QQ 号不在此集合中 = 冒充。
+    # 请通过环境变量 BOT_ADMIN_QQ 配置 (支持多个, 逗号分隔)。
+    OWNER_QQ_WHITELIST: set[str] = Field(
+        default_factory=lambda: set(),
+        description="主人 QQ 号白名单。display name 可伪造，QQ 号不可。鉴权只用此集合。请通过环境变量 BOT_ADMIN_QQ 配置。",
+    )
+
+    # 同群对照 bot 的 QQ 号 — 其消息不应触发本 bot 的管线
     peer_bot_qq: int = Field(
         default=0,
-        description="同群对照 bot 的 QQ 号，其消息不会触发本 bot 回复",
+        description="同群对照 bot 的 QQ 号，其消息不会触发本 bot 回复。请通过环境变量 BOT_QQ_PEER 配置。",
     )
 
     # ── 辅助方法 ──────────────────────────────────────

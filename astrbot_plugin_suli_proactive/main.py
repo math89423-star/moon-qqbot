@@ -36,10 +36,10 @@ _BOT_QQ_SET: set[str] = set()  # 运行时从 dual_bot 读取
 
 
 @register("astrbot_plugin_suli_proactive", "暮恩", "主动行为引擎 (双Bot通用)", "1.0.0")
-class MoonProactivePlugin(Star):
+class LoputProactivePlugin(Star):
     """主动行为引擎 — 私聊/群聊主动交互调度 (双 Bot 通用)。
 
-    提取自 private_companion proactive 核心模式, 全部参数化。
+    提取自社区插件 private_companion proactive 核心模式, 全部参数化。
     零硬编码 persona 文本 — 所有角色内容来自 per-bot Config。
     self_id gate 使用 _BOT_QQ_SET 白名单, 双方各自独立调度。
     """
@@ -83,7 +83,7 @@ class MoonProactivePlugin(Star):
     async def initialize(self) -> None:
         """插件启动 — 启动主动调度循环。"""
         if not self._config.enabled:
-            logger.info("[MoonProactive] 总开关已关闭, 不启动调度器")
+            logger.info("[LoputProactive] 总开关已关闭, 不启动调度器")
             return
         await self._scheduler.start()
 

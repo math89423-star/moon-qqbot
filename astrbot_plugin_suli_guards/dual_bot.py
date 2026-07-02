@@ -379,7 +379,7 @@ def get_round_counter(db_path: str | None = None) -> RoundCounter:
     """获取 RoundCounter 单例。
 
     Args:
-        db_path: SQLite 数据库路径。默认使用 suli_qqbot.db。
+        db_path: SQLite 数据库路径。默认使用 none_qqbot.db。
     """
     global _round_counter
     if _round_counter is None:
@@ -392,22 +392,19 @@ def get_round_counter(db_path: str | None = None) -> RoundCounter:
 
 
 def _auto_discover_db_path() -> str:
-    """自动发现 suli_qqbot.db 路径。
+    """自动发现 none_qqbot.db 路径。
 
     优先使用 shared_db 目录挂载 (WAL 文件对所有容器可见)，
     回退兼容旧单文件挂载路径。
     """
     candidates = [
         # ★ 新路径: 目录挂载 (WAL 文件共享, 避免分裂脑)
-        "/AstrBot/data/shared_db/suli_qqbot.db",
+        "/AstrBot/data/shared_db/none_qqbot.db",
         # 兼容旧路径: 单文件挂载 (WAL 文件不可见 → 分裂脑风险)
-        "/AstrBot/data/suli_qqbot.db",
-        # Windows 裸机路径 (CWD = AstrBot/)
-        "data/shared_db/suli_qqbot.db",
-        "data/suli_qqbot.db",
+        "/AstrBot/data/none_qqbot.db",
         # 宿主机路径
-        str(Path.home() / "suli_qqbot/runtime/shared/db/suli_qqbot.db"),
-        str(Path.home() / "suli_qqbot/runtime/shared/suli_qqbot.db"),
+        str(Path.home() / "suli_qqbot/runtime/shared/db/none_qqbot.db"),
+        str(Path.home() / "suli_qqbot/runtime/shared/none_qqbot.db"),
     ]
     for p in candidates:
         if Path(p).exists():
@@ -426,7 +423,7 @@ def _auto_discover_db_path() -> str:
 # ══════════════════════════════════════════════════════════════
 #
 # 现有 CoordinationService (service/coordination.py) 已提供原子 token。
-# 此模块提供便利函数 +  侧的接入点。
+# 此模块提供便利函数 + Luna 侧的接入点。
 
 DEFAULT_TOKEN_TTL = 15.0  # 发言权 token 有效期 (秒)
 MAX_WAIT_FOR_PEER = 5.0   # 等待 peer 释放 token 的最长时间 (秒)
@@ -437,7 +434,7 @@ def coordination_check_peer_replying(
 ) -> bool:
     """检查对方 bot 是否正在持有发言权 token (Brake 3)。
 
-     侧调用此函数来检查是否应该退让。
+    Luna 侧调用此函数来检查是否应该退让。
     不获取 token — 仅检查对方是否在发言中。
 
     Returns:
@@ -463,10 +460,10 @@ def coordination_try_acquire_lightweight(
     db_path: str, group_id: str, bot_id: str, *,
     ttl: float = DEFAULT_TOKEN_TTL,
 ) -> bool:
-    """轻量级发言权获取 ( 侧 — 不依赖 Moon 的 CoordinationService)。
+    """轻量级发言权获取 (Luna 侧 — 不依赖 Loput 的 CoordinationService)。
 
     原子 SQLite UPDATE: 仅在 token 过期或无持有者时获取。
-    复用 Moon 创建的 bot_coordination 表。
+    复用 Loput 创建的 bot_coordination 表。
 
     Returns:
         True = 成功获取发言权。
@@ -498,7 +495,7 @@ def coordination_try_acquire_lightweight(
 def coordination_release_lightweight(
     db_path: str, group_id: str, bot_id: str,
 ) -> None:
-    """释放发言权 ( 侧)。"""
+    """释放发言权 (Luna 侧)。"""
     import sqlite3
     try:
         conn = sqlite3.connect(db_path)
@@ -522,7 +519,7 @@ CAPABILITY_BOUNDARY_PROMPT = (
     "1. 你不能假装自己能影响现实、网络、游戏房间、他人设备或用户身体动作。\n"
     '2. 没有可用工具且没有实际执行结果时，不要承诺"我这就拉你/我帮你操作/我已经处理/我去修/我给你弄好"。\n'
     "3. 遇到拉人、开房间、修网、重启、登录、下载、现实代办等请求，只能自然说明自己做不到实际操作。\n"
-    '4. 不要替群里的其他 bot (如/暮恩) 承诺任何事。不要说"她会帮你/他已经在处理/你去找他"——'
+    '4. 不要替群里的其他 bot 承诺任何事。不要说"她会帮你/他已经在处理/你去找他"——'
     '你无法知道对方 bot 的状态和能力。可以说"你可以@他问问"或"我不确定他那边的情况"。\n'
     "5. 不要断言其他 bot 是否在线/在群/会回复——你无法可靠地知道。"
 )
@@ -544,7 +541,7 @@ def build_capability_boundary_injection(peer_bot_name: str = "") -> str:
     if peer_bot_name:
         # 个性化规则 4
         boundary = boundary.replace(
-            "(如/暮恩)",
+            "(如 peer bot/主 bot)",
             f"(如{peer_bot_name})",
         )
     return f"{CAPABILITY_BOUNDARY_MARKER}\n{boundary}"

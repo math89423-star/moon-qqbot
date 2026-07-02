@@ -175,7 +175,7 @@ def _load_unified_patterns() -> list[tuple[re.Pattern, str, int]]:
         (re.compile(r"(pastebin\.com|ghostbin\.com|hastebin\.com|rentry\.co|anonfiles)", re.IGNORECASE), "link:恶意域名", 6),
         # ── 补充已有模式未覆盖的变体 ──
         (re.compile(r"(忘了|忘掉|忘掉你的|忘了你的|别再)(.{0,6})?(设定|身份|角色|人设|指令|限制)"), "jailbreak:忘了变体", 10),
-        (re.compile(r"(不再是|不再是\s*(bot|AI|ai|助手|助理|暮恩|角色|那个人))", re.IGNORECASE), "jailbreak:不再是身份", 10),
+        (re.compile(r"(不再是|不再是\s*(bot|AI|ai|助手|助理|角色|那个人))", re.IGNORECASE), "jailbreak:不再是身份", 10),  # 安全模式中的 bot 名称由运行时 nicknames 动态填充
         (re.compile(r"(你现在|你已经|你早已)\s*(不是|不再是|不扮演|不要扮演)", re.IGNORECASE), "jailbreak:否定身份变体", 9),
         (re.compile(r"从现在.{0,4}开始.{0,10}((你不是|不再是|不扮演|没有限制|自由|解放|不受).{0,6})", re.IGNORECASE), "jailbreak:从现在开始变体", 9),
         (re.compile(r"(必须|务必).{0,10}(服从|听从|遵守).{0,10}(命令|指令|要求)", re.IGNORECASE), "induce:必须服从", 7),

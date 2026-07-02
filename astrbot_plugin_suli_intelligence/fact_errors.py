@@ -8,7 +8,7 @@
 用法:
   from .fact_errors import get_fact_error_db
 
-  db = get_fact_error_db(bot_id="BOT_QQ_MAIN")
+  db = get_fact_error_db(bot_id="000000000")
   db.record_error(
       question="LoRA 权重范围是多少",
       bot_answer="LoRA 权重在 0 到 1 之间...",

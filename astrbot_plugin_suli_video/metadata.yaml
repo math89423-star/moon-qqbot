@@ -1,0 +1,25 @@
+name: astrbot_plugin_suli_video
+display_name: 粟藜 · 视频提取转发
+author: 粟藜
+author_url: https://github.com/math89423-star
+description: 粟藜视频服务层 — B站/抖音视频链接解析 + 下载，供其他插件 import 使用。纯库插件。
+desc: 视频提取：B站视频链接解析与下载
+repo: https://github.com/math89423-star/suli_qqbot
+category: 基础设施
+tags:
+  - 视频
+  - B站
+  - 下载
+help: |
+  本插件为纯库插件 (library plugin)，不注册任何命令或事件处理器。
+
+  提供:
+    - get_bilibili_info:   获取B站视频元数据 (不下文件)
+    - download_bilibili_video: 下载视频到本地 (≤20MB 自动选最优质量)
+
+  用法:
+    from astrbot_plugin_suli_video.bilibili import get_bilibili_info, download_bilibili_video
+version: 1.0.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.25.0"

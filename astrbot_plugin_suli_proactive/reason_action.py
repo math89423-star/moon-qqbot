@@ -1,6 +1,6 @@
 """主动行为原因/动作框架 — 时段窗口 + 权重选择 + 亲密度过滤。
 
-从 constants.py + proactive_engine.py 提取, zero persona hardcoding。
+从社区插件 constants.py + proactive_engine.py 提取, zero persona hardcoding。
 """
 
 from __future__ import annotations

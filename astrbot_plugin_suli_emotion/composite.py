@@ -98,7 +98,10 @@ def compute_composite(
 
     # ── 两维度 ──
     warmth = affinity_norm * 0.65 + valence * 0.35
-    energy = arousal * 0.5 + (1.0 - fatigue_norm) * 0.5
+    # ★ fatigue_norm: 疲劳值越高(fatigue→+1)=精力越充沛→能量贡献越大
+    #   fatigue_norm=-1.0(筋疲力尽)→0.0, 0.0(正常)→0.5, +1.0(精力充沛)→1.0
+    #   直接用 fatigue_norm，不再反转——反转会导致越累 energy 越高。
+    energy = arousal * 0.5 + fatigue_norm * 0.5
 
     # clamp
     warmth = max(-1.0, min(1.0, warmth))
@@ -121,6 +124,10 @@ def compute_composite(
         zone = zkey
         zone_label = zlabel
         break
+
+    # ★ 疲劳联动: fatigue 严重时 zone_label 追加标记，消除「高能/低能」与疲劳的矛盾
+    if fatigue_value < -0.50:
+        zone_label = f"{zone_label}（疲惫）"
 
     return CompositeResult(
         warmth=round(warmth, 4),

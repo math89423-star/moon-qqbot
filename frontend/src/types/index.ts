@@ -237,6 +237,9 @@ export interface BotSettings {
   group_chat_enabled: boolean
   private_chat_enabled: boolean
   reasoning_enabled: boolean
+  shadow_agent_enabled: boolean
+  shadow_agent_model: string
+  owner_qq: string
   llm_slots: Record<string, number | null>
   vlm_slots: Record<string, number | null>
 }
@@ -312,7 +315,7 @@ export interface ToolConfig {
   name: string
   label: string
   category: string
-  bot: 'moon' | 'both'
+  bot: 'loput' | 'luna' | 'both'
   desc: string
   enabled: boolean
   min_affinity: number

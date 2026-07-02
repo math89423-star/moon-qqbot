@@ -17,7 +17,8 @@ const loggingIn = ref(false)
 
 // ── 全局 Bot 上下文 — 从 API 动态加载 ──
 const FALLBACK_BOTS: BotMeta[] = [
-  { id: '3581173900', name: '暮恩', icon: '', color: '#4ecca3', avatar: '', character_card: 'moon', nicknames: [], is_active: true, peer_bot_ids: [], role_description: '蛇娘', rejection_style: { style_label: '', pronoun: '', tone_hint: '' }, llm_slots: [] },
+  { id: '3581173900', name: '洛普特', icon: '', color: '#4ecca3', avatar: '', character_card: 'loput', nicknames: [], is_active: true, peer_bot_ids: [], role_description: '蛇系', rejection_style: { style_label: '', pronoun: '', tone_hint: '' }, llm_slots: [] },
+  { id: '3969478803', name: '露娜', icon: '', color: '#e94560', avatar: '', character_card: 'luna', nicknames: [], is_active: true, peer_bot_ids: [], role_description: '猫娘', rejection_style: { style_label: '', pronoun: '', tone_hint: '' }, llm_slots: [] },
 ]
 const bots = ref<BotMeta[]>(FALLBACK_BOTS)
 const currentBot = ref(localStorage.getItem('selected_bot') || '3581173900')

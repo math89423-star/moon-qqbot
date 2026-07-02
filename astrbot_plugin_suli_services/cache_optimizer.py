@@ -43,7 +43,7 @@ _COMPRESS_THRESHOLD = 0.82
 _FALLBACK_TURNS = 3
 
 # 稳定缓存锚点版本 (修改锚点内容时递增)
-_ANCHOR_VERSION = "moon-v1"
+_ANCHOR_VERSION = "loput-v1"
 
 # 支持 prompt_cache_retention 的 GPT 模型前缀
 _GPT_CACHE_RETENTION_MODELS = (
@@ -174,14 +174,14 @@ class CacheOptimizer:
         这个锚点放在 system_prompt 最前面，确保每次请求的第一段文本相同。
         """
         lines = [
-            "<moon_cache_anchor>",
+            "<loput_cache_anchor>",
             f"version={_ANCHOR_VERSION}",
             "purpose=stable_prefix_for_prompt_cache",
         ]
         lines.extend(
             f"anchor_{i:03d}=stable_cache_no_instruction" for i in range(5)
         )
-        lines.append("</moon_cache_anchor>")
+        lines.append("</loput_cache_anchor>")
         return "\n".join(lines)
 
     @staticmethod
@@ -256,7 +256,7 @@ class CacheOptimizer:
             return system_prompt
         anchor = cls.deepseek_anchor()
         # 避免重复注入
-        if "<moon_cache_anchor>" in system_prompt:
+        if "<loput_cache_anchor>" in system_prompt:
             return system_prompt
         return f"{anchor}\n\n{system_prompt}"
 

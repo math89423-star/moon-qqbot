@@ -84,7 +84,7 @@ get_login_info()
 
 | CQ 码 | 含义 | 示例 |
 |------|------|------|
-| `[CQ:at,qq=123]` | @某人 | `[CQ:at,qq=BOT_QQ_MAIN]` (暮恩) |
+| `[CQ:at,qq=123]` | @某人 | `[CQ:at,qq=3581173900]` (洛普特) |
 | `[CQ:image,file=xxx]` | 图片 | 文件路径/base64/URL |
 | `[CQ:reply,id=123]` | 引用回复 | 回复某条消息 |
 | `[CQ:face,id=123]` | QQ 表情 | 系统自带表情 |
@@ -151,7 +151,7 @@ AstrBot 支持同一实例管理多个 QQ 号，每个 QQ 号可独立配置:
 - **插件开关**: 每个 bot 可选择启用哪些插件
 - **工具注册**: 工具可限定哪些 bot 可用
 
-本项目: 暮恩 +  双 bot 一个 AstrBot 实例管理。
+本项目: 洛普特 + 露娜 双 bot 一个 AstrBot 实例管理。
 
 ---
 
@@ -224,7 +224,7 @@ class AstrMessageEvent:
     at_list: list[int]        # 被 @ 的 QQ 号列表
 ```
 
-### 消息链路 (暮恩)
+### 消息链路 (洛普特)
 
 ```
 QQ 消息 → NapCat 接收 → WebSocket → AstrBot
@@ -312,13 +312,13 @@ QQ 消息 → NapCat 接收 → WebSocket → AstrBot
 宿主机 (Windows/WSL2)
 │
 ├── Docker: astrbot-compare/
-│   ├── NapCat (主号 BOT_QQ_MAIN)  → 电动糕手群 (711600211)
-│   ├── NapCat ( BOT_QQ_ALT)  → 同一群聊
+│   ├── NapCat (主号 3581173900)  → 电动糕手群 (711600211)
+│   ├── NapCat (露娜 3969478803)  → 同一群聊
 │   └── AstrBot Core (WebUI :6185, WS :6199)
-│       ├── suli_tavern     (暮恩主插件)
+│       ├── suli_tavern     (洛普特主插件)
 │       ├── suli_bridge     (L-Port LLM 桥接)
 │       ├── astrbot_plugin_suli_draw       (生图插件)
-│       ├── private_companion (陪伴)
+│       ├── private_companion (露娜陪伴)
 │       └── 社区插件         (Heartflow/meme/self_evolution)
 │
 └── SillyTavern (宿主机 127.0.0.1:8000)

@@ -101,22 +101,56 @@ class BotConfigService:
         self._db.set_config(key, "true" if enabled else "false")
         logger.info("Bot %s gate_thinking_enabled = %s", bot_id, enabled)
 
+    # ── ★ 影子 Agent 配置 (2026-07-02 压力测试加固) ──
+
+    def is_shadow_agent_enabled(self, bot_id: str) -> bool:
+        """检查指定 bot 的影子 Agent 是否启用。默认 true。"""
+        key = self._bot_key(bot_id, "shadow_agent_enabled")
+        val = self._db.get_config(key, "")
+        if val == "":
+            return True  # 默认启用
+        return val.lower() == "true"
+
+    def set_shadow_agent_enabled(self, bot_id: str, enabled: bool) -> None:
+        """设置指定 bot 的影子 Agent 开关。"""
+        key = self._bot_key(bot_id, "shadow_agent_enabled")
+        self._db.set_config(key, "true" if enabled else "false")
+        logger.info("Bot %s shadow_agent_enabled = %s", bot_id, enabled)
+
     def resolve_background_llm(
         self, bot_id: str, purpose: str = "background",
     ) -> dict:
         """解析背景任务 LLM 配置 — 统一入口。
 
         背景任务 (总结/建档/记忆提取) 默认走 llm_lite 槽位,
+        影子 Agent (purpose="shadow_agent") 走自己的 shadow_agent 槽位,
+        未配置时 fallback 到 llm_lite。
         thinking 跟随 gate_thinking_enabled 开关。
 
         Returns:
             {"model": str, "api_base": str, "api_key": str, "extra_params": dict|None}
-            解析失败返回空 dict (调用方 fallback 到 tavern 默认模型)
+            解析失败返回空 dict
         """
+        # 影子 Agent: 优先走专属槽位
+        if purpose == "shadow_agent":
+            slot = self.resolve_llm_slot(bot_id, "shadow_agent")
+            if slot:
+                logger.debug(
+                    "resolve_background_llm: bot=%s shadow_agent → %s",
+                    bot_id, slot.model_name,
+                )
+                return {
+                    "model": slot.model_name,
+                    "api_base": slot.normalized_base_url,
+                    "api_key": slot.api_key,
+                    "extra_params": None,
+                }
+
+        # 默认: llm_lite 槽位
         slot = self.resolve_llm_slot(bot_id, "llm_lite") \
             or self.resolve_llm_slot(bot_id, "llm_primary")
         if not slot:
-            logger.debug("resolve_background_llm: bot=%s 无 llm_lite 槽位", bot_id)
+            logger.debug("resolve_background_llm: bot=%s 无可用槽位", bot_id)
             return {}
 
         extra = None
@@ -210,7 +244,7 @@ class BotConfigService:
 
     # ── LLM/VLM 槽位 (多模型支持) ───────────────────────
 
-    LLM_SLOTS = ("llm_lite", "llm_pro", "llm_gate")  # 日常闲聊 / 推理增强 / 意图闸
+    LLM_SLOTS = ("llm_lite", "llm_pro", "llm_gate", "shadow_agent")  # 闲聊 / 推理 / 意图闸 / 情景意识
     VLM_SLOTS = ("vlm_primary", "vlm_secondary")
 
     # ── 向后兼容: 旧槽名 → 新槽名 ──
@@ -559,29 +593,29 @@ class BotConfigService:
 
     # ── 统一工具注册表 ─────────────────────────────────────
     # (name, label, category, bot, desc)
-    # bot: "moon" = 暮恩, "" = , "both" = 双 bot 共享
+    # bot: "loput" = 主 bot (tavern), "luna" = peer bot (companion), "both" = 双 bot 共享
 
     _UNIFIED_TOOLS: tuple[dict, ...] = (
-        # ═══ 暮恩专属 (tavern) — L-Port / ComfyUI 生态 ═══
-        {"name": "check_lport_status",    "label": "L-Port 状态",     "category": "系统", "bot": "moon", "desc": "检查 L-Port 生图平台是否在线", "min_affinity": 2},
-        {"name": "list_available_models", "label": "模型列表",         "category": "系统", "bot": "moon", "desc": "获取 ComfyUI 可用 AI 模型列表", "min_affinity": 2},
-        {"name": "list_custom_nodes",     "label": "自定义节点",       "category": "系统", "bot": "moon", "desc": "获取 ComfyUI 自定义节点列表", "min_affinity": 2},
+        # ═══ 主 bot (tavern) — L-Port / ComfyUI 生态 ═══
+        {"name": "check_lport_status",    "label": "L-Port 状态",     "category": "系统", "bot": "loput", "desc": "检查 L-Port 生图平台是否在线", "min_affinity": 2},
+        {"name": "list_available_models", "label": "模型列表",         "category": "系统", "bot": "loput", "desc": "获取 ComfyUI 可用 AI 模型列表", "min_affinity": 2},
+        {"name": "list_custom_nodes",     "label": "自定义节点",       "category": "系统", "bot": "loput", "desc": "获取 ComfyUI 自定义节点列表", "min_affinity": 2},
         {"name": "search_knowledge",      "label": "知识库搜索",       "category": "知识", "bot": "both", "desc": "搜索本地 ComfyUI/AI绘画知识库", "min_affinity": 1},
         {"name": "send_sticker",          "label": "发送表情",         "category": "社交", "bot": "both", "desc": "按情绪标签发送表情包到群聊", "min_affinity": 1},
         {"name": "remember_memory",       "label": "记住信息",         "category": "记忆", "bot": "both", "desc": "将用户提供的信息存入长期记忆", "min_affinity": 1},
         {"name": "get_memory",            "label": "查询记忆",         "category": "记忆", "bot": "both", "desc": "查询已记住的用户信息", "min_affinity": 1},
-        # ═══ 专属 (companion) — QZone / 转发 ═══
-        {"name": "pc_qzone_view_feed",    "label": "QQ空间动态",   "category": "QZone", "bot": "", "desc": "查看 QQ 空间动态 (可选点赞/评论)", "min_affinity": 1},
-        {"name": "pc_qzone_publish_feed", "label": "发表空间说说",  "category": "QZone", "bot": "", "desc": "发布 QQ 空间说说", "min_affinity": 1},
-        {"name": "pc_relay_message",      "label": "统一转发",      "category": "转发", "bot": "", "desc": "转发消息到群/私聊 (统一入口)", "min_affinity": 1},
-        {"name": "pc_send_to_group",      "label": "发群消息",      "category": "转发", "bot": "", "desc": "发送消息到指定群聊", "min_affinity": 1},
-        {"name": "pc_send_to_private_user","label": "发私聊消息",   "category": "转发", "bot": "", "desc": "发送消息到指定用户私聊", "min_affinity": 1},
-        {"name": "pc_send_to_groups",     "label": "批量发群",     "category": "转发", "bot": "", "desc": "同一消息广播到多个群", "min_affinity": 1},
-        {"name": "pc_send_to_private_users","label": "批量发私聊", "category": "转发", "bot": "", "desc": "同一消息广播到多个用户", "min_affinity": 1},
-        {"name": "pc_schedule_group_relay","label": "预约转发",    "category": "转发", "bot": "", "desc": "目标出现时延迟转发消息", "min_affinity": 1},
+        # ═══ peer bot (companion) — QZone / 转发 ═══
+        {"name": "pc_qzone_view_feed",    "label": "QQ空间动态",   "category": "QZone", "bot": "luna", "desc": "查看 QQ 空间动态 (可选点赞/评论)", "min_affinity": 1},
+        {"name": "pc_qzone_publish_feed", "label": "发表空间说说",  "category": "QZone", "bot": "luna", "desc": "发布 QQ 空间说说", "min_affinity": 1},
+        {"name": "pc_relay_message",      "label": "统一转发",      "category": "转发", "bot": "luna", "desc": "转发消息到群/私聊 (统一入口)", "min_affinity": 1},
+        {"name": "pc_send_to_group",      "label": "发群消息",      "category": "转发", "bot": "luna", "desc": "发送消息到指定群聊", "min_affinity": 1},
+        {"name": "pc_send_to_private_user","label": "发私聊消息",   "category": "转发", "bot": "luna", "desc": "发送消息到指定用户私聊", "min_affinity": 1},
+        {"name": "pc_send_to_groups",     "label": "批量发群",     "category": "转发", "bot": "luna", "desc": "同一消息广播到多个群", "min_affinity": 1},
+        {"name": "pc_send_to_private_users","label": "批量发私聊", "category": "转发", "bot": "luna", "desc": "同一消息广播到多个用户", "min_affinity": 1},
+        {"name": "pc_schedule_group_relay","label": "预约转发",    "category": "转发", "bot": "luna", "desc": "目标出现时延迟转发消息", "min_affinity": 1},
         # ═══ 双 bot 共享 — 搜索 ═══
-        # 注: recall_long_term_memory 已移除 — 暮恩侧无 schema/executor,
-        #     侧无实现, 属悬空注册 (违反单一真相源)。记忆检索统一用 get_memory。
+        # 注: recall_long_term_memory 已移除 — 主 bot 侧无 schema/executor,
+        #     peer bot 侧无实现, 属悬空注册 (违反单一真相源)。记忆检索统一用 get_memory。
         {"name": "web_search",            "label": "联网搜索",     "category": "搜索", "bot": "both", "desc": "SearXNG 联网搜索", "min_affinity": 1},
         {"name": "pixiv_search",         "label": "Pixiv 搜图",    "category": "搜索", "bot": "both", "desc": "Pixiv 插画搜索 (需 refresh_token)", "min_affinity": 1},
         # ═══ 双 bot 共享 — 视觉+生图 ═══
@@ -592,6 +626,8 @@ class BotConfigService:
         {"name": "pc_get_group_id_by_name","label": "群名查ID",    "category": "查询", "bot": "both", "desc": "根据群名称关键词查找群号", "min_affinity": 1},
         {"name": "pc_get_user_id_by_name","label": "昵称查QQ",     "category": "查询", "bot": "both", "desc": "根据昵称/别名/群名片解析 QQ 号", "min_affinity": 1},
         {"name": "pc_get_specified_group_members","label":"群成员查询","category":"查询","bot":"both","desc":"查询指定群的成员列表 (按关系筛选)","min_affinity":1},
+        # ═══ 双 bot 共享 — 媒体 ═══
+        {"name": "video_extract",          "label": "视频提取",       "category": "媒体", "bot": "both", "desc": "提取B站/抖音视频直接发到群聊 (≤20MB)", "min_affinity": 1},
     )
 
     # 好感等级显示名 (与 emotion 插件 affinity.py 对齐)
@@ -673,8 +709,8 @@ class BotConfigService:
         """判断工具是否属于指定 bot。
 
         "both" = 所有 bot 共享。
-        其他值 (如 "moon"/"") 匹配 bot 的 character_card 字段。
-        bot_id 未知时 fallback 到 "moon"。
+        其他值 (如 "loput"/"luna") 匹配 bot 的 character_card 字段。
+        bot_id 未知时 fallback 到 "loput"。
         """
         if tool_bot == "both":
             return True
@@ -686,7 +722,7 @@ class BotConfigService:
                 return tool_bot == bot.character_card.lower()
         except Exception:
             pass
-        return tool_bot == "moon"  # fallback
+        return tool_bot in ("both", "default")  # fallback: both=共享, default=主 bot
 
     def get_disabled_tools(self, bot_id: str) -> set[str]:
         """获取指定 bot 已禁用的工具名集合 (供运行时过滤)。
@@ -799,42 +835,6 @@ class BotConfigService:
     def get_tool_cooldown_seconds(self, bot_id: str) -> int:
         """获取指定 bot 的工具冷却秒数 (per-bot 可配, 默认 60)。"""
         return int(self.get_tool_setting(bot_id, "tool_cooldown_seconds") or 60)
-
-    # ── 管理员 QQ ──────────────────────────────────────────
-
-    def get_super_admin_qq(self) -> int:
-        """获取超级管理员 QQ 号。未配置时返回 0。"""
-        val = self._db.get_config("super_admin_qq", "0")
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            return 0
-
-    def set_super_admin_qq(self, qq: int) -> None:
-        """设置超级管理员 QQ 号。"""
-        self._db.set_config("super_admin_qq", str(qq))
-        logger.info("超级管理员 QQ 已更新: %d", qq)
-
-    def get_admin_qq_ids(self) -> list[int]:
-        """获取全局管理员 QQ 号列表。未配置时返回空列表。"""
-        val = self._db.get_config("admin_qq_ids", "")
-        if not val:
-            return []
-        ids: list[int] = []
-        for part in val.split(","):
-            part = part.strip()
-            if part:
-                try:
-                    ids.append(int(part))
-                except (ValueError, TypeError):
-                    pass
-        return ids
-
-    def set_admin_qq_ids(self, qq_ids: list[int]) -> None:
-        """设置全局管理员 QQ 号列表。"""
-        val = ",".join(str(q) for q in qq_ids)
-        self._db.set_config("admin_qq_ids", val)
-        logger.info("全局管理员 QQ 列表已更新: %s", val)
 
     # ── 通用配置 ──────────────────────────────────────────
 

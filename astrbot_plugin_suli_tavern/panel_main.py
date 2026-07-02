@@ -1,10 +1,10 @@
 """管理面板独立容器入口 — 不依赖 AstrBot 框架, 仅需 aiohttp + sqlite3。
 
 用法:
-    python panel_main.py --port 5190 --host 0.0.0.0
+    python panel_main.py --port 6190 --host 0.0.0.0
 
 依赖: aiohttp (Web 服务器), sqlite3 (标准库)
-DB:   data/shared_db/suli_qqbot.db (需挂载)
+DB:   data/shared_db/none_qqbot.db (需挂载)
 SPA:  static/ (同目录下的 Vue 3 构建产物)
 """
 
@@ -27,12 +27,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [Panel] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("moon-panel")
+logger = logging.getLogger("loput-panel")
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="暮恩管理面板 — 独立容器")
-    parser.add_argument("--port", type=int, default=5190, help="监听端口 (默认 5190)")
+    parser.add_argument("--port", type=int, default=6190, help="监听端口 (默认 6190)")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     args = parser.parse_args()
 
@@ -41,7 +41,7 @@ async def main() -> None:
     from astrbot_plugin_suli_tavern.service.bot_config import BotConfigService
     from astrbot_plugin_suli_tavern.webui.server import ConfigWebUI
 
-    # 初始化 DB (路径: data/shared_db/suli_qqbot.db — 由容器 WORKDIR + volume 决定)
+    # 初始化 DB (路径: data/shared_db/none_qqbot.db — 由容器 WORKDIR + volume 决定)
     db = get_bot_db()
     logger.info("DB 已连接: %d 条 llm_config", len(db.list_llm_configs()))
 
@@ -58,13 +58,11 @@ async def main() -> None:
     await webui.start()
     logger.info("管理面板已就绪: http://localhost:%d", args.port)
 
+    # 保持运行直到收到 SIGTERM
     stop_event = asyncio.Event()
-    try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop_event.set)
-    except NotImplementedError:
-        pass
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop_event.set)
     await stop_event.wait()
 
     logger.info("正在关闭...")

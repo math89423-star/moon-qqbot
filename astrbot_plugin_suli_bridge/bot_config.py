@@ -185,7 +185,7 @@ class BotConfigService:
         "group_chat_batch_size": 12,
         "group_chat_cooldown_seconds": 60,
         "group_chat_max_context": 30,
-        "group_chat_nicknames": ["小暮", "暮暮", "洛宝", "暮恩", "moon"],
+        "group_chat_nicknames": [],
         "group_chat_talkativeness": 0.5,
         "proactive_enabled": False,
         "model_router_flash": "deepseek-v4-pro",

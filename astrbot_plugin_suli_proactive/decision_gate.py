@@ -1,6 +1,6 @@
 """决策门控 — 决定"现在应该主动发消息吗？"
 
-从 proactive_engine.py 的 _should_send() ~30 检查中提取 10 个核心检查。
+从社区插件 proactive_engine.py 的 _should_send() ~30 检查中提取 10 个核心检查。
 全部参数化, 零 persona 硬编码。
 
 检查链 (按顺序, 短路返回):

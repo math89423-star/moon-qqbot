@@ -21,14 +21,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录 (astrbot_plugin_suli_tavern/service/ → ../../ = 项目根)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DB_DIR = _PROJECT_ROOT / "data"
-DB_PATH = DB_DIR / "shared_db" / "suli_qqbot.db"
+DB_DIR = Path("data")
+DB_PATH = DB_DIR / "shared_db" / "none_qqbot.db"
 
 # ── Provider 分组 — 与 L-Port llm_config_service.py 一致 ──
 VLM_PROVIDERS = frozenset({"gpt4v", "claude", "gemini", "nano_banana", "llama"})
 LOCAL_PROVIDERS = frozenset({"llama", "ollama"})
+
+# 默认主 bot QQ 号，从环境变量读取（所有模块应统一走 BotIdentityService）
+DEFAULT_BOT = os.environ.get("BOT_QQ_MAIN", "")
 
 
 @dataclass
@@ -424,7 +425,7 @@ class BotDatabase:
                 "UPDATE bot_config SET value = ?, updated_at = ? WHERE key = 'admin_token'",
                 (token, now),
             )
-            # admin_token 已生成，不打印到日志
+            logger.info("Admin token 已自动生成 (掩码: %s****)", token[:4])
 
         self.conn.commit()
 
@@ -452,7 +453,7 @@ class BotDatabase:
         except Exception:
             pass
 
-        main_bot = known_bots[0] if known_bots else "BOT_QQ_MAIN"
+        main_bot = known_bots[0] if known_bots else DEFAULT_BOT
 
         # 现有数据默认归入主 bot
         self.conn.execute(
@@ -915,19 +916,19 @@ class BotDatabase:
                 return int(default_m * 1_000_000)
 
         return {
-            "moon_hard_limit": _read_m("daily_token_limit_moon_m", 3.0),
-            "moon_soft_limit": _read_m("daily_token_soft_limit_moon_m", 2.4),
-            "_hard_limit": _read_m("daily_token_limit__m", 3.0),
-            "_soft_limit": _read_m("daily_token_soft_limit__m", 2.4),
+            "loput_hard_limit": _read_m("daily_token_limit_loput_m", 3.0),
+            "loput_soft_limit": _read_m("daily_token_soft_limit_loput_m", 2.4),
+            "luna_hard_limit": _read_m("daily_token_limit_luna_m", 3.0),
+            "luna_soft_limit": _read_m("daily_token_soft_limit_luna_m", 2.4),
         }
 
     def set_token_budget_config(self, data: dict) -> None:
         """保存 per-bot token 预算配置（前端传 M 为单位）。"""
         for key in (
-            "daily_token_limit_moon_m",
-            "daily_token_soft_limit_moon_m",
-            "daily_token_limit__m",
-            "daily_token_soft_limit__m",
+            "daily_token_limit_loput_m",
+            "daily_token_soft_limit_loput_m",
+            "daily_token_limit_luna_m",
+            "daily_token_soft_limit_luna_m",
         ):
             val = data.get(key)
             if val is not None:
@@ -1140,7 +1141,7 @@ class BotDatabase:
 
     # ── cmd_config.json 同步 ─────────────────────────────
     # AstrBot 核心从 cmd_config.json 的 provider_sources 段读取 API key。
-    # 暮恩前端保存到 bot_db 后必须同步写回 cmd_config.json，
+    # AstrBot 管理前端保存到 bot_db 后必须同步写回 cmd_config.json，
     # 否则 AstrBot 核心看到的仍是旧 key → 401 Authentication Fails。
 
     _CMD_CONFIG_PATH = Path("data") / "cmd_config.json"
@@ -1666,13 +1667,13 @@ class BotDatabase:
     # {bot_id: {group_id: tier}}。文件放在 shared_db/ 目录以确保
     # ADR-001 双实例容器间共享。
 
-    _WHITELIST_PATH = _PROJECT_ROOT / "data" / "shared_db" / "group_chat_whitelist.json"
+    _WHITELIST_PATH = Path("data") / "shared_db" / "group_chat_whitelist.json"
 
     def _read_whitelist_raw(self) -> dict:
         """读取原始白名单 JSON，自动处理旧格式迁移。
 
         返回 {bot_id: {group_id: tier}} 结构。
-        旧格式 (list 或非嵌套 dict) 自动包装为 Moon bot 名下。
+        旧格式 (list 或非嵌套 dict) 自动包装为 Loput bot 名下。
         若新路径 (shared_db/) 不存在但旧路径存在，自动迁移。
         """
         try:
@@ -1687,9 +1688,9 @@ class BotDatabase:
                 if isinstance(old_data, dict) and not isinstance(
                     next(iter(old_data.values()), None), dict
                 ):
-                    # 旧格式 → per-bot (暮恩名下)
+                    # 旧格式 → per-bot (主 bot 名下)
                     old_data = {
-                        "BOT_QQ_MAIN": {str(k): v for k, v in old_data.items()
+                        DEFAULT_BOT: {str(k): v for k, v in old_data.items()
                                        if v in ("basic", "full")}
                     }
                 self._WHITELIST_PATH.write_text(
@@ -1704,23 +1705,23 @@ class BotDatabase:
                 self._WHITELIST_PATH.read_text(encoding="utf-8")
             )
             if isinstance(data, list):
-                # 旧格式: [123, 456] → 全部迁移为 Moon basic
+                # 旧格式: [123, 456] → 全部迁移为 Loput basic
                 migrated = {str(g): "basic" for g in data}
-                logger.info("白名单旧格式(list)→迁移到 Moon: %d 个群", len(data))
-                return {"BOT_QQ_MAIN": migrated}
+                logger.info("白名单旧格式(list)→迁移到 Loput: %d 个群", len(data))
+                return {DEFAULT_BOT: migrated}
             if not isinstance(data, dict):
                 return {}
             # 判断是否已为 per-bot 嵌套格式: 值是 dict → 新格式
             sample_val = next(iter(data.values()), None)
             if isinstance(sample_val, dict):
                 return data  # 已是 per-bot 格式
-            # 旧格式: {group_id: tier} → 包装为 Moon
+            # 旧格式: {group_id: tier} → 包装为 Loput
             migrated = {
                 int(k): v for k, v in data.items()
                 if v in ("basic", "full")
             }
-            logger.info("白名单旧格式(dict)→迁移到 Moon: %d 个群", len(migrated))
-            return {"BOT_QQ_MAIN": {str(k): v for k, v in migrated.items()}}
+            logger.info("白名单旧格式(dict)→迁移到 Loput: %d 个群", len(migrated))
+            return {DEFAULT_BOT: {str(k): v for k, v in migrated.items()}}
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.warning("白名单文件损坏，返回空列表", exc_info=True)
             return {}
@@ -1772,11 +1773,11 @@ class BotDatabase:
     ) -> None:
         """添加/更新 per-bot 群聊白名单条目并持久化。
 
-        bot_id 为空时默认写入 DEFAULT_BOT (BOT_QQ_MAIN)。
+        bot_id 为空时默认写入 DEFAULT_BOT (来自环境变量 BOT_QQ_MAIN)。
         """
         if tier not in ("basic", "full"):
             raise ValueError(f"无效的对话等级: {tier} (仅支持 basic/full)")
-        bot_id = str(bot_id) if bot_id else "BOT_QQ_MAIN"
+        bot_id = str(bot_id) if bot_id else DEFAULT_BOT
         raw = self._read_whitelist_raw()
         raw.setdefault(bot_id, {})[str(group_id)] = tier
         self._write_whitelist_raw(raw)
@@ -1785,9 +1786,9 @@ class BotDatabase:
     def remove_whitelist_entry(self, group_id: int, bot_id: str = "") -> bool:
         """从 per-bot 白名单移除一个群。返回是否成功删除。
 
-        bot_id 为空时默认从 DEFAULT_BOT (BOT_QQ_MAIN) 移除。
+        bot_id 为空时默认从 DEFAULT_BOT (来自环境变量 BOT_QQ_MAIN) 移除。
         """
-        bot_id = str(bot_id) if bot_id else "BOT_QQ_MAIN"
+        bot_id = str(bot_id) if bot_id else DEFAULT_BOT
         raw = self._read_whitelist_raw()
         bot_entries = raw.get(bot_id, {})
         gid_key = str(group_id)

@@ -125,23 +125,23 @@ class EmotionEngine:
             EmotionEvent("被夸聪明", "positive", +0.14, +0.05, +0.08),
         ),
         (
-            ["谢谢暮恩", "谢谢小暮", "多谢", "感谢暮恩", "谢谢bot"],
+            ["谢谢bot", "多谢", "谢谢", "感谢"],
             EmotionEvent("被感谢", "positive", +0.10, +0.03, +0.08),
         ),
         (
-            ["暮恩说得对", "暮恩说对了", "暮恩厉害", "暮恩懂"],
+            ["说得对", "说对了", "好厉害", "懂我"],
             EmotionEvent("被认同", "positive", +0.12, +0.08, +0.10),
         ),
         (
-            ["好想暮恩", "想暮恩", "暮恩在吗", "暮恩呢"],
+            ["好想你", "想你", "在吗", "呢"],
             EmotionEvent("被想念", "positive", +0.16, +0.12, +0.10),
         ),
         (
-            ["暮恩最好", "暮恩最棒", "最爱暮恩", "暮恩赛高"],
+            ["最好", "最棒", "最爱", "赛高"],
             EmotionEvent("被偏爱", "positive", +0.20, +0.15, +0.15),
         ),
         (
-            ["有暮恩真好", "还好有暮恩", "暮恩帮大忙"],
+            ["有你在真好", "还好有你", "帮大忙"],
             EmotionEvent("被需要", "positive", +0.14, +0.10, +0.12),
         ),
         # === 负向 ===
@@ -298,7 +298,7 @@ class EmotionEngine:
 
     @staticmethod
     def make_late_night_event(hour: int) -> EmotionEvent | None:
-        """深夜陪伴 — 凌晨 0-5 点有人还在和暮恩聊天。"""
+        """深夜陪伴 — 凌晨 0-5 点有人还在和 bot 聊天。"""
         if 0 <= hour < 5:
             return EmotionEvent("深夜陪伴", "positive", +0.05, +0.08, +0.03)
         return None
@@ -316,7 +316,7 @@ class EmotionEngine:
         """动态获取其他 bot 的名称关键词集 (含昵称变体)。
 
         当前 bot 不应为其他 bot 的名字触发情绪事件。
-        例如 「谢谢暮恩」→ 不应认为自己被感谢。
+        例如 「谢谢主bot」→ peer bot 不应认为自己被感谢。
         """
         keywords: set[str] = set()
         try:
@@ -349,7 +349,7 @@ class EmotionEngine:
 
         Args:
             self_id: 当前 bot 的 QQ 号。用于跳过针对其他 bot 的关键词
-                     (如 "谢谢暮恩" 不应为触发情绪事件)
+                     (如带其他 bot 名字的关键词不应为当前 bot 触发情绪事件)
         """
         if now is None:
             now = time.time()
@@ -398,7 +398,7 @@ class EmotionEngine:
         for keywords, event in cls.EVENT_DEFS:
             for kw in keywords:
                 if kw in lower:
-                    # 跳过针对其他 bot 的关键词 (如「谢谢暮恩」不应为触发)
+                    # 跳过针对其他 bot 的关键词 (含其他 bot 名字的短语不应为当前 bot 触发)
                     if _other_bot_kws and any(
                         other_name in kw for other_name in _other_bot_kws
                     ):

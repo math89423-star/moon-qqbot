@@ -174,6 +174,7 @@ class ModelRoutingStep(PipelineStep):
                 _tools_avail = False
 
         try:
+            _gate_result = ctx.get("judge_decision")
             _tier = ModelRouter.decide_tier(
                 trigger_reason=ctx.get("trigger_reason", ""),
                 active_domains=gctx.active_domains or None,
@@ -185,6 +186,12 @@ class ModelRoutingStep(PipelineStep):
                     if challenge_info else None
                 ),
                 tools_enabled=_tools_avail,
+                # ── ★ Gate 权威 tier ──
+                gate_tier=(
+                    _gate_result.model_tier
+                    if (_gate_result is not None and getattr(_gate_result, "parse_ok", False))
+                    else ""
+                ),
                 context_complexity=(
                     preflight.complexity_score if preflight else 0.0
                 ),
@@ -324,7 +331,7 @@ class PostProcessStep(PipelineStep):
         cfg = ctx.get("config")
         trigger_uid = ctx.get("trigger_user_id", "")
         trigger_reason = ctx.get("trigger_reason", "")
-        char_name = ctx.get("char_name", "暮恩")
+        char_name = ctx.get("char_name", "")
 
         try:
             from ..group_chat import (
@@ -382,7 +389,7 @@ class PostProcessStep(PipelineStep):
                 from emotion import get_user_relation
             try:
                 _sched = ctx.get("scheduler")
-                _bot_id = getattr(_sched, "_current_bot_id", "") or "BOT_QQ_MAIN"
+                _bot_id = getattr(_sched, "_current_bot_id", "") or ""
                 rel = get_user_relation(trigger_uid, self_id=_bot_id, peer_bot_qq=cfg.peer_bot_qq)
                 from astrbot_plugin_suli_emotion import get_global_mood
                 global_mood = get_global_mood(_bot_id)
@@ -425,7 +432,7 @@ class SendReplyStep(PipelineStep):
         trigger_uid = ctx.get("trigger_user_id", "")
         trigger_reason = ctx.get("trigger_reason", "")
         trigger_user_name = ctx.get("trigger_user_name", "")
-        char_name = ctx.get("char_name", "暮恩")
+        char_name = ctx.get("char_name", "")
         scheduler = ctx.get("scheduler")
 
         # ── ★ 触发事件: 优先从 pipeline context 读取快照, fallback 到 gctx.last_event ──
@@ -447,7 +454,7 @@ class SendReplyStep(PipelineStep):
                 try:
                     from astrbot_plugin_suli_emotion import get_global_mood
                     _sched = ctx.get("scheduler")
-                    _bot_id = getattr(_sched, "_current_bot_id", "") or "BOT_QQ_MAIN"
+                    _bot_id = getattr(_sched, "_current_bot_id", "") or ""
                     global_mood = get_global_mood(_bot_id)
                     if global_mood.arousal > 0.5:
                         delay *= 0.5
@@ -468,7 +475,7 @@ class SendReplyStep(PipelineStep):
         if get_reverse_prompt_cache:
             try:
                 _sched = ctx.get("scheduler")
-                _bid = getattr(_sched, "_current_bot_id", "") or "BOT_QQ_MAIN"
+                _bid = getattr(_sched, "_current_bot_id", "") or ""
                 _vlm_cached = get_reverse_prompt_cache(f"{_bid}:g{gctx.group_id}")
                 if _vlm_cached:
                     reply = _vlm_cached + "\n\n---\n\n" + reply
@@ -499,6 +506,17 @@ class SendReplyStep(PipelineStep):
             pass
 
         # ── 自动 @触发者: 直接触发时确保触发者收到 QQ 通知 ──
+        #     ★ Gate reply_target 优先: 若 Gate 明确指定了不同于 trigger 的
+        #     回复目标, LLM 已 @了目标用户, 跳过自动 @触发者。
+        _gate_reply_target2 = ""
+        try:
+            _jd = ctx.get("judge_decision")
+            _gate_reply_target2 = (
+                getattr(_jd, "reply_target_user_id", "")
+                or getattr(_jd, "target_user_id", "")
+            )
+        except Exception:
+            pass
         if (
             trigger_uid
             and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
@@ -519,7 +537,16 @@ class SendReplyStep(PipelineStep):
             except Exception:
                 pass
             if trigger_uid not in _bot_qqs and trigger_uid != _peer_qq2:
-                reply = f"[CQ:at,qq={trigger_uid}] {reply}"
+                if _gate_reply_target2 and _gate_reply_target2 != trigger_uid:
+                    try:
+                        logger.debug(
+                            "群 %s: Gate reply_target=%s ≠ trigger=%s, 跳过自动@触发者",
+                            gctx.group_id, _gate_reply_target2[:8], trigger_uid[:8],
+                        )
+                    except Exception:
+                        pass
+                else:
+                    reply = f"[CQ:at,qq={trigger_uid}] {reply}"
 
         # ── QQ 引用: 直接触发时 reply_message=True 锚定原消息 ──
         _reply_message = trigger_reason in ("mention", "nickname", "reply",

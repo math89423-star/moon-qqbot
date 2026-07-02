@@ -87,8 +87,8 @@ _AT_NAME_RE = re.compile(
     r']{1,20})'
 )
 
-# peer bot 的常见昵称 — 用于将 @/@ 等映射到 peer_bot_qq
-_PEER_BOT_NAMES: tuple[str, ...] = ("", "", "娜娜", "", "")
+# peer bot 的常见昵称 — 用于将 @peer_bot 等映射到 peer_bot_qq
+_PEER_BOT_NAMES: tuple[str, ...] = ()  # 由调用方从 BotIdentityService 动态获取
 
 
 def resolve_at_mentions(
@@ -156,7 +156,6 @@ def resolve_at_mentions(
     bot_skip_names = {
         bot_name,
         bot_name.lower(),
-        "小暮", "暮暮", "暮恩", "moon", "Moon",
     }
 
     # ── ★ 最大 @提及数: 防止 LLM 滥 @ 多人 ──
@@ -208,9 +207,11 @@ def resolve_at_mentions(
 
 # ── 反臃肿过滤器 (Anti-Bloat) ─────────────────────────
 
-# 第三人称自称 → 第一人称
+# 第三人称自称 → 第一人称 (由调用方根据角色卡注入 bot_name 前缀模式)
+# 匹配 "[任意名字]觉得/认为/感觉..." 等第三人称自称，替换为"我觉得/认为..."
+# 调用方应通过 filter_narration 的 bot_name 参数注入角色名模式
 _SELF_REFERENCE_RE = re.compile(
-    r"暮恩(觉得|认为|感觉|知道|想|猜|表示|建议|推荐|告诉|"
+    r"\w+(觉得|认为|感觉|知道|想|猜|表示|建议|推荐|告诉|"
     r"来说|想说|回答|解释|补充|确认|提醒|问一下|说一句)"
 )
 
@@ -228,9 +229,9 @@ _NARRATION_PHRASES = [
     r"她[歪着][了]?头",
     r"她叹了口气",
     r"她[无奈宠溺]地[笑摇了]",
-    r"暮恩眨[了]?眨(?:眼|眼睛|竖瞳|眸子)",
-    r"暮恩[微微温柔]?[一地]?笑",
-    r"暮恩[轻轻无奈]地",
+    r"\w+眨[了]?眨(?:眼|眼睛|竖瞳|眸子)",
+    r"\w+[微微温柔]?[一地]?笑",
+    r"\w+[轻轻无奈]地",
     r"少女托着腮",
     r"翡翠绿的眸[子了]",
     r"竖瞳微微(?:一)?(?:收|闪)?缩",

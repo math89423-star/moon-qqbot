@@ -3,79 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>suli_qqbot 管理面板</title>
-    <script type="module" crossorigin src="/assets/index-BPX1972I.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-BBUNJkky.css">
-    <style>
-      #admin-qq-bar {
-        position: fixed; bottom: 0; left: 0; right: 0; z-index: 9999;
-        background: #1a1a24; border-top: 1px solid #2a2a3a;
-        padding: 8px 16px; display: flex; align-items: center; gap: 12px;
-        font-size: 13px; color: #aaa;
-      }
-      #admin-qq-bar input {
-        width: 140px; padding: 4px 8px; border-radius: 6px;
-        border: 1px solid #333; background: #121218; color: #e0e0e0;
-        font-size: 13px; outline: none;
-      }
-      #admin-qq-bar input:focus { border-color: #7c5cfc; }
-      #admin-qq-bar .lbl { font-weight: 600; color: #888; }
-      #admin-qq-bar .btn {
-        padding: 4px 14px; border-radius: 6px; border: none; font-size: 13px;
-        cursor: pointer; font-weight: 600; transition: all .2s;
-      }
-      #admin-qq-bar .btn-save { background: #7c5cfc; color: #fff; }
-      #admin-qq-bar .btn-save:hover { background: #6a4af0; }
-      #admin-qq-bar .msg { font-size: 12px; padding: 2px 8px; border-radius: 4px; }
-      #admin-qq-bar .msg.ok { color: #4ade80; }
-      #admin-qq-bar .msg.err { color: #f87171; }
-      body { padding-bottom: 40px; }
-    </style>
+    <title>none_qqbot 管理面板</title>
+    <script type="module" crossorigin src="/assets/index-Bd0jL4iJ.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Dye7CQmu.css">
   </head>
   <body>
-    <script>localStorage.setItem('admin_token','anonymous')</script>
     <div id="app"></div>
-    <div id="admin-qq-bar">
-      <span style="color:#7c5cfc;font-weight:700;">管理员QQ</span>
-      <span class="lbl">超管 (主人):</span>
-      <input id="aq-super" type="number" placeholder="QQ号">
-      <span class="lbl">管理员列表:</span>
-      <input id="aq-ids" type="text" placeholder="QQ1, QQ2, ..." style="width:200px">
-      <button class="btn btn-save" onclick="saveAdminQQ()">保存</button>
-      <span id="aq-msg" class="msg"></span>
-      <span style="font-size:12px;color:#666;">保存后重启 AstrBot 生效</span>
-    </div>
-    <script>
-      async function loadAdminQQ() {
-        try {
-          const r = await fetch('/api/admin/admin-qq');
-          const d = await r.json();
-          document.getElementById('aq-super').value = d.super_admin_qq || '';
-          document.getElementById('aq-ids').value = (d.admin_qq_ids || []).join(', ');
-        } catch(e) { console.warn('加载管理员QQ配置失败:', e); }
-      }
-      async function saveAdminQQ() {
-        const m = document.getElementById('aq-msg');
-        m.className = 'msg';
-        const sq = parseInt(document.getElementById('aq-super').value) || 0;
-        const ids = document.getElementById('aq-ids').value
-          .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
-        try {
-          const r = await fetch('/api/admin/admin-qq', {
-            method: 'PUT', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({super_admin_qq: sq, admin_qq_ids: ids})
-          });
-          if (r.ok) {
-            m.className = 'msg ok'; m.textContent = '已保存！';
-          } else {
-            const e = await r.json();
-            m.className = 'msg err'; m.textContent = e.message || '失败';
-          }
-        } catch(e) {
-          m.className = 'msg err'; m.textContent = '网络错误';
-        }
-      }
-      loadAdminQQ();
-    </script>
   </body>
 </html>

@@ -1,6 +1,6 @@
 """候选池 — 主动行为候选的收集、评分、去重、TTL 管理。
 
-从 proactive_engine.py 的 candidate_pool 逻辑提取。
+从社区插件 proactive_engine.py 的 candidate_pool 逻辑提取。
 """
 
 from __future__ import annotations

@@ -418,7 +418,7 @@ def _detect_social_bot_mention(content: str, ctx) -> list[tuple[str, float]]:
     at_self = False  # 是否 @了 bot 自己
     for target_uid in at_targets:
         if target_uid.startswith("bot_"):
-            at_self = True  # @暮恩 你是bot → 身份挑战, 不产生社交信号
+            at_self = True  # @bot 你是bot → 身份挑战, 不产生社交信号
             continue
         results.append((target_uid, intent_strength))
 
@@ -492,7 +492,7 @@ def _calc_social_mention_score(bot_id: str, user_id: str) -> float:
 
 # 身份挑战关键词 — 群友对本 bot 的 AI/bot 身份提出质疑
 # 注意: 这些与 _BOT_ACCUSATION_STRONG 不同 —
-#       这里是"你是bot"(指向暮恩), 不是"X是bot"(指向别人)
+#       这里是"你是bot"(指向本 bot), 不是"X是bot"(指向别人)
 _IDENTITY_CHALLENGE_PATTERNS: list[str] = [
     # 直接说"你"
     "你是bot", "你是机器人", "你是ai", "你是人机", "你是入机",
@@ -501,9 +501,9 @@ _IDENTITY_CHALLENGE_PATTERNS: list[str] = [
     "你是不是bot", "你是不是机器人", "你是不是ai",
     "你是不是人机", "你是不是入机",
     "你是不是程序", "你是不是脚本", "你是不是大模型",
-    # 暮恩变体
-    "暮恩.*bot", "暮恩.*机器人", "暮恩.*ai", "暮恩.*人机",
-    "moon.*bot", "moon.*ai",
+    # 以下为示例模式 — 实际部署时 bot 名称应从 config nicknames 动态填充
+    "洛普特.*bot", "洛普特.*机器人", "洛普特.*ai", "洛普特.*人机",
+    "loput.*bot", "loput.*ai",
     # "这个/那个 bot"
     "这个bot", "这bot", "那个bot",
     "这个机器人", "这个人机", "这个ai",
@@ -543,8 +543,8 @@ def _detect_identity_challenge(content: str, user_id: str, user_name: str) -> bo
             #   "你是X"/"你是不是X" → 天然指向本bot
             if pat.startswith("你是") or pat.startswith("你是不是"):
                 return True
-            #   "暮恩/moon" → 直接点名本bot
-            if "暮恩" in pat or "moon" in pat:
+            #   模式包含 bot 特定名称 (如 洛普特/loput) → 直接点名本bot
+            if "洛普特" in pat or "loput" in pat:
                 return True
             #   "这个/那个 bot/机器人/人机/ai" → 大概率指本bot
             if pat.startswith("这个") or pat.startswith("那个") or pat.startswith("这bot"):
@@ -1192,7 +1192,7 @@ def _load_gate_state() -> dict | None:
 def generate_social_play_hint(
     suspicion: BotSuspicion,
     target_name: str = "",
-    char_name: str = "暮恩",
+    char_name: str = "",
 ) -> str:
     """根据嫌疑状态生成人格化应对提示。
 
@@ -1392,15 +1392,15 @@ if __name__ == "__main__":
     print(f"  pattern_regularity (变化大): {s4:.2f} (期望 < 0.3)")
 
     # summon_echo 提示
-    hint = _build_summon_echo_hint("小明", "暮恩", 0.85)
+    hint = _build_summon_echo_hint("小明", "BotName", 0.85)
     print(f"  summon_echo hint: {len(hint)} chars ✓")
 
     # delegate_chore 提示
-    hint2 = _build_delegate_chore_hint("小红", "暮恩", 0.90)
+    hint2 = _build_delegate_chore_hint("小红", "BotName", 0.90)
     print(f"  delegate_chore hint: {len(hint2)} chars ✓")
 
     # callout 提示
-    hint3 = _build_callout_hint("小刚", "暮恩", 0.75)
+    hint3 = _build_callout_hint("小刚", "BotName", 0.75)
     print(f"  callout hint: {len(hint3)} chars ✓")
 
     print("bot_detector smoketests passed ✓")
