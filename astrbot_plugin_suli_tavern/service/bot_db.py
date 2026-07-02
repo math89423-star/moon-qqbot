@@ -729,7 +729,7 @@ class BotDatabase:
         每次启动运行，幂等：按 provider + model_name 去重。
         这样 WebUI 配置面板可以直接列出 AstrBot 中配置的模型。
         """
-        cmd_config_path = "/AstrBot/data/cmd_config.json"
+        cmd_config_path = str(DB_DIR / "cmd_config.json")
         if not os.path.exists(cmd_config_path):
             logger.info("AstrBot cmd_config.json 不存在，跳过 provider 同步")
             return

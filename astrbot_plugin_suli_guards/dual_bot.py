@@ -397,11 +397,13 @@ def _auto_discover_db_path() -> str:
     优先使用 shared_db 目录挂载 (WAL 文件对所有容器可见)，
     回退兼容旧单文件挂载路径。
     """
+    _project_root = Path(__file__).resolve().parent.parent
+    _astrbot_data = _project_root / "AstrBot" / "data"
     candidates = [
         # ★ 新路径: 目录挂载 (WAL 文件共享, 避免分裂脑)
-        "/AstrBot/data/shared_db/none_qqbot.db",
+        str(_astrbot_data / "shared_db" / "none_qqbot.db"),
         # 兼容旧路径: 单文件挂载 (WAL 文件不可见 → 分裂脑风险)
-        "/AstrBot/data/none_qqbot.db",
+        str(_astrbot_data / "none_qqbot.db"),
         # 宿主机路径
         str(Path.home() / "suli_qqbot/runtime/shared/db/none_qqbot.db"),
         str(Path.home() / "suli_qqbot/runtime/shared/none_qqbot.db"),

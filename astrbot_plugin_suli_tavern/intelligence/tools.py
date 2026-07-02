@@ -2576,11 +2576,11 @@ async def execute_video_extract(params: dict, tool_context: dict | None = None) 
                 )
 
     # ── 下载 ──
-    # ★ 下载到 /AstrBot/data/temp_videos/ (共享卷)
+    # ★ 下载到 AstrBot/data/temp_videos/ (共享卷)
     # 不能放 /tmp — AstrBot 和 NapCat 是不同容器, /tmp 互不可见。
-    # runtime/data-luna 被双方 mount 到 /AstrBot/data, 文件存在这里 NapCat 才能读到。
+    # runtime/data-luna 被双方 mount 到 AstrBot/data, 文件存在这里 NapCat 才能读到。
     from pathlib import Path as _Path
-    _shared_dir = _Path("/AstrBot/data/temp_videos")
+    _shared_dir = _Path(__file__).resolve().parent.parent.parent / "AstrBot" / "data" / "temp_videos"
     _shared_dir.mkdir(parents=True, exist_ok=True)
 
     try:
