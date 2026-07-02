@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import os as _os
+
 import asyncio
 import json
 import random
@@ -973,12 +975,15 @@ class GroupChatScheduler:
                 # ── 重启窗口: _current_bot_id 尚未设置 → 读缓存 ──
                 bot_id = self._read_cached_bot_id()
                 if not bot_id:
+                    # ── 最后 fallback: 环境变量 BOT_QQ_MAIN ──
+                    bot_id = _os.getenv("BOT_QQ_MAIN", "")
+                if not bot_id:
                     logger.warning(
                         "白名单加载: bot_id 未知且无缓存, 保持空白 (fail-closed)"
                     )
                     return
                 logger.info(
-                    "白名单加载: bot_id 从缓存恢复 → %s", bot_id,
+                    "白名单加载: bot_id 从缓存/环境恢复 → %s", bot_id,
                 )
             # 新格式: {bot_id: {group_id: tier}}
             if isinstance(data, dict) and isinstance(

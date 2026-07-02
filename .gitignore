@@ -8,8 +8,8 @@ build/
 .env.local
 .distill_config.json
 # 角色卡: 普瑞赛斯 (赛博幽灵 — 社区专属)
-astrbot_plugin_suli_tavern/characters/普瑞赛斯.json
-astrbot_plugin_suli_tavern/characters/普瑞赛斯.png
+astrbot_plugin_suli_tavern/characters/priestess.json
+astrbot_plugin_suli_tavern/characters/priestess.png
 # 蒸馏研究材料 (普瑞赛斯)
 research/priestess_*
 data/

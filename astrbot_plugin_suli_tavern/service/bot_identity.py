@@ -157,12 +157,11 @@ class BotIdentityService:
         qq_slots = [q for q in (main_qq, alt_qq) if q and q not in mapping]
         for card_name in discovered:
             if card_name in assigned_cards:
-                continue  # 已通过 env var 映射
+                continue
             assigned_cards.add(card_name)
             if qq_slots:
                 mapping[qq_slots.pop(0)] = card_name
-            else:
-                mapping[f"auto_{card_name}"] = card_name
+            # 无可用 QQ 槽位时跳过 — 不自动注册，需在管理面板手动创建
 
         if not mapping:
             logger.info("BotIdentity: 无环境变量且无角色卡，跳过自动注册（需在管理面板手动创建）")

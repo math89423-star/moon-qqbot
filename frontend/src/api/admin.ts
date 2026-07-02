@@ -147,7 +147,7 @@ export async function getBotSettings(botId: string): Promise<BotSettings> {
 
 export async function updateBotSettings(
   botId: string,
-  settings: Record<string, boolean>,
+  settings: Record<string, unknown>,
 ): Promise<void> {
   await api.post('/bot-settings', { bot_id: botId, ...settings })
 }

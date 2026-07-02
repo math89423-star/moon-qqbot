@@ -47,10 +47,19 @@ provide('currentBot', currentBot)
 provide('bots', bots)
 provide('switchBot', switchBot)
 
-onMounted(() => {
+onMounted(async () => {
   if (getToken()) {
     authed.value = true
     loadBots()
+  } else {
+    // 本地访问 → 自动登录
+    try {
+      const ok = await login('local')
+      if (ok) {
+        authed.value = true
+        loadBots()
+      }
+    } catch { /* 保持登录页 */ }
   }
 })
 

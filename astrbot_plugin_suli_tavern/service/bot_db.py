@@ -21,7 +21,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_DIR = Path("data")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DB_DIR = _PROJECT_ROOT / "AstrBot" / "data"
 DB_PATH = DB_DIR / "shared_db" / "none_qqbot.db"
 
 # ── Provider 分组 — 与 L-Port llm_config_service.py 一致 ──
@@ -1144,7 +1145,7 @@ class BotDatabase:
     # AstrBot 管理前端保存到 bot_db 后必须同步写回 cmd_config.json，
     # 否则 AstrBot 核心看到的仍是旧 key → 401 Authentication Fails。
 
-    _CMD_CONFIG_PATH = Path("data") / "cmd_config.json"
+    _CMD_CONFIG_PATH = DB_DIR / "cmd_config.json"
 
     def _sync_provider_to_cmd_config(
         self, provider: str, api_key: str, base_url: str = "",
@@ -1667,7 +1668,10 @@ class BotDatabase:
     # {bot_id: {group_id: tier}}。文件放在 shared_db/ 目录以确保
     # ADR-001 双实例容器间共享。
 
-    _WHITELIST_PATH = Path("data") / "shared_db" / "group_chat_whitelist.json"
+    _WHITELIST_PATH = (
+        Path(__file__).resolve().parent.parent.parent
+        / "AstrBot" / "data" / "shared_db" / "group_chat_whitelist.json"
+    )
 
     def _read_whitelist_raw(self) -> dict:
         """读取原始白名单 JSON，自动处理旧格式迁移。
@@ -1678,7 +1682,7 @@ class BotDatabase:
         """
         try:
             # 旧 → 新路径迁移
-            _OLD_PATH = Path("data") / "group_chat_whitelist.json"
+            _OLD_PATH = DB_DIR / "group_chat_whitelist.json"
             if not self._WHITELIST_PATH.exists() and _OLD_PATH.exists():
                 logger.info("检测到旧白名单文件，迁移到 shared_db/ 目录")
                 self._WHITELIST_PATH.parent.mkdir(parents=True, exist_ok=True)

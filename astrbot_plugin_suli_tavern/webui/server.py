@@ -78,9 +78,11 @@ def _json_error(message: str, status=400):
 async def auth_middleware(request: web.Request, handler) -> web.Response:
     """对所有 /api/ 路由进行 Bearer token 认证。
 
-    白名单: /api/admin/login 和 /api/config/login 无需认证。
+    白名单:
+      - 非 API 路由: 直接放行
+      - /api/*/login: 登录端点无需认证
+      - 本地访问 (127.0.0.1 / localhost / ::1 / 192.168.x.x): 跳过认证
     其余 /api/ 路由需 Authorization: Bearer <admin_token>。
-    静态文件和非 API 路由不检查。
     """
     path = request.path
 
@@ -91,6 +93,13 @@ async def auth_middleware(request: web.Request, handler) -> web.Response:
     # 登录端点白名单
     if path in (_API_PREFIX + "/login", _API_LEGACY_PREFIX + "/login") and request.method == "POST":
         return await handler(request)
+
+    # 本地/局域网访问 — 跳过认证 (开发 & 自托管场景)
+    peer = request.transport.get_extra_info("peername")
+    if peer:
+        host = peer[0]
+        if host in ("127.0.0.1", "::1", "localhost") or host.startswith("192.168."):
+            return await handler(request)
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -427,6 +436,13 @@ class ConfigWebUI:
             return _json_error("请求格式错误", 400)
         if not token:
             return _json_error("缺少 token", 400)
+
+        # 本地访问 + token="local" → 免密登录
+        if token == "local":
+            peer = request.transport.get_extra_info("peername")
+            if peer and peer[0] in ("127.0.0.1", "::1", "localhost"):
+                return _json({"ok": True})
+
         if self.config_service.verify_token(token):
             return _json({"ok": True})
         return _json_error("认证失败", 401)

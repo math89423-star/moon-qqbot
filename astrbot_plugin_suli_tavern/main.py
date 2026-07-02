@@ -874,8 +874,8 @@ class LoputTavernPlugin(Star):
         self.group_chat_ctl: Optional[GroupChatScheduler] = None
         if self.tavern is not None:
             WHITELIST_FILE = (
-                Path(__file__).resolve().parent.parent.parent.parent
-                / "data" / "shared_db" / "group_chat_whitelist.json"
+                Path(__file__).resolve().parent.parent
+                / "AstrBot" / "data" / "shared_db" / "group_chat_whitelist.json"
             )
             try:
                 self.group_chat_ctl = GroupChatScheduler(
