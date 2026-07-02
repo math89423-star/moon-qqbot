@@ -847,7 +847,7 @@ PLUGIN_NAME = "astrbot_plugin_suli_tavern"
     "1.0.0",
 )
 class LoputTavernPlugin(Star):
-    """暮恩 · 无限之蛇 — AstrBot 版。"暮恩 (Moon)" 开源项目。
+    """暮恩 · 无限之蛇 — AstrBot 版。"暮恩 (Moon)" 开源项目。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
