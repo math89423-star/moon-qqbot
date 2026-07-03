@@ -242,6 +242,20 @@ class BotConfigService:
             logger.warning("活跃 VLM config_id=%d 无法解析", vlm_id, exc_info=True)
             return None
 
+    def get_first_available_llm(self) -> LLMConfigRO | None:
+        """最终兜底: 从 llm_config 表直接取第一个活跃且有 API key 的 LLM。
+
+        不依赖 active_llm_id — 用于 active_llm_id 未设置但槽位已配的场景。
+        """
+        try:
+            configs = self._db.list_llm_configs()
+            for cfg in configs:
+                if cfg.is_llm and cfg.is_active and cfg.api_key:
+                    return cfg
+        except Exception:
+            pass
+        return None
+
     # ── LLM/VLM 槽位 (多模型支持) ───────────────────────
 
     LLM_SLOTS = ("llm_lite", "llm_pro", "llm_gate", "shadow_agent")  # 闲聊 / 推理 / 意图闸 / 情景意识

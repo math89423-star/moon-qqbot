@@ -3004,6 +3004,7 @@ async def _run_tool_loop_impl(
     _total_input_tokens = 0  # 累计输入 token
     _total_cache_hit = 0  # 累计缓存命中 token
     _total_output_tokens = 0  # 累计输出 token
+    _intermediate_texts: list[str] = []  # 工具轮中 assistant 同时产出的文本 (clean synthesis 时保留)
 
     # ── 防阻塞: 总超时 + 每轮超时 ──
     # deepseek-v4-pro 每轮 25-40s, 4+ 轮工具调用 → 120s 不够
@@ -3207,9 +3208,12 @@ async def _run_tool_loop_impl(
                     logger.debug("工具用量记录失败", exc_info=True)
 
             # 追加 assistant 消息 (含 tool_calls)
+            _assistant_content = result.get("content") or ""
+            if _assistant_content.strip():
+                _intermediate_texts.append(_assistant_content)
             messages.append({
                 "role": "assistant",
-                "content": result.get("content") or "",
+                "content": _assistant_content,
                 "tool_calls": tool_calls,
             })
 
@@ -3398,16 +3402,28 @@ async def _run_tool_loop_impl(
 
         # Phase 4: 干净上下文合成
         _synthesis_msgs = copy.deepcopy(_entry_messages)
+        # 如果中间轮次 LLM 已经产出了文字回复 (例如排序正文 + 工具调用),
+        # 将其作为上下文注入, 让 clean synthesis 在此基础上补充而非从零重写。
+        _synthesis_hint_parts: list[str] = []
+        if _intermediate_texts:
+            _joined_intermediate = "\n---\n".join(_intermediate_texts)
+            _synthesis_hint_parts.append(
+                "你在前一轮工具调用时已经写了以下文字。"
+                "这是你已经说出口的内容——不要重写或推翻它。"
+                "基于它继续补充、修正或追问即可:\n\n"
+                f"=== 你刚才说的话 ===\n{_joined_intermediate}"
+            )
+        _synthesis_hint_parts.append(
+            "以下是本轮搜索的汇总结果。"
+            "请基于这些信息回答用户的问题。\n"
+            "如果信息不足，请诚实告知用户，不要编造。"
+            "保持角色性格和语气。\n\n"
+            "=== 检索结果汇总 ===\n"
+            f"{_compressed}"
+        )
         _synthesis_msgs.append({
             "role": "system",
-            "content": (
-                "[系统提示] 以下是本轮搜索的汇总结果。"
-                "请基于这些信息回答用户的问题。\n"
-                "如果信息不足，请诚实告知用户，不要编造。"
-                "保持角色性格和语气。\n\n"
-                "=== 检索结果汇总 ===\n"
-                f"{_compressed}"
-            ),
+            "content": "\n\n".join(_synthesis_hint_parts),
         })
 
         try:
@@ -3486,9 +3502,14 @@ async def _run_tool_loop_impl(
 
         # 合成失败 → 回落: 用干净上下文 + 压缩结果做紧急汇总
         _emergency_msgs = copy.deepcopy(_entry_messages)
+        _emergency_hint = ""
+        if _intermediate_texts:
+            _emergency_hint = (
+                "你刚才已经说了:\n" + "\n---\n".join(_intermediate_texts) + "\n\n"
+            )
         _emergency_msgs.append({
             "role": "system",
-            "content": f"以下是搜索结果 (可能不完整):\n{_compressed[:3000]}",
+            "content": f"{_emergency_hint}以下是搜索结果 (可能不完整):\n{_compressed[:3000]}",
         })
         _emergency = await _try_emergency_summary(
             tavern, _emergency_msgs, model or "deepseek-v4-pro",

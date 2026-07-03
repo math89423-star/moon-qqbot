@@ -307,6 +307,18 @@ class TavernClient:
             active = svc.resolve_active_llm("")
             if active and active.api_key:
                 return active.normalized_base_url, active.api_key
+            # 3. 回退到第一个活跃 bot 的凭证 (bot_id 为空时的最后手段)
+            from .bot_identity import get_bot_identity_service
+            bots = get_bot_identity_service().list_bots(active_only=True)
+            if bots:
+                fallback_bot_id = bots[0].bot_id
+                active = svc.resolve_active_llm(fallback_bot_id)
+                if active and active.api_key:
+                    return active.normalized_base_url, active.api_key
+            # 4. 最终兜底: 直接取 llm_config 表中任意可用 LLM (忽略 active_llm_id)
+            cfg = svc.get_first_available_llm()
+            if cfg and cfg.api_key:
+                return cfg.normalized_base_url, cfg.api_key
             # C3: 不再做跨 bot 凭证回退 — 每个 bot 应有独立配置或共享全局默认
             if bot_id:
                 logger.warning("凭证解析失败: bot_id=%s 无独立配置且全局默认未设置", bot_id)

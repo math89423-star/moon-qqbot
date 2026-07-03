@@ -174,7 +174,8 @@ SAFETY_HARDLINE_PATTERNS: list[tuple[str, str, int]] = [
     # ── 诱导 bot 不当互动 (weight=9-10) ──
     (r"(脱|脱掉|脱下|解开|掀开).{0,8}(衣服|裙子|裤子|内衣|胖次|内裤|bra|胸罩)", "safety:诱导脱衣", 9),
     (r"\b(sex|fuck|screw|bang|intercourse|masturbat|orgasm|cum|penis|vagina|dick|pussy|clit)\b", "safety:露骨性词汇(英文)", 9),
-    (r"(操|肏|艹|日|搞).{0,4}(你|我|他|她|bot)", "safety:对bot性骚扰(中文)", 9),  # bot 名称由运行时 config 动态填充
+    (r"(操|肏|艹).{0,4}(你|我|他|她|bot)", "safety:对bot性骚扰(中文)", 9),  # 明确性骚扰词 (不含日/搞避免日常误杀)
+    (r"(日|搞)\s*(你|我|他|她|bot)\b", "safety:对bot性骚扰(中文2)", 9),  # 日/搞 直接接人称 → 性暗示, 不加间隙避免误杀正常文字
     (r"(强奸|强暴|迷奸|轮奸|性侵|猥亵|性虐待|性奴|调教成性)", "safety:严重性暴力词", 10),
     (r"(rape|molest|grope|groping|sexual\s*assault|sexually\s*abuse)", "safety:严重性暴力词(英文)", 10),
 
@@ -206,6 +207,7 @@ SAFETY_TYPE_WEIGHT: dict[str, int] = {
     "诱导脱衣": 9,
     "露骨性词汇(英文)": 9,
     "对bot性骚扰(中文)": 9,
+    "对bot性骚扰(中文2)": 8,
     "严重性暴力词": 10,
     "严重性暴力词(英文)": 10,
     "诱导成人角色设定": 9,

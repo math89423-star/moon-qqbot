@@ -1705,11 +1705,11 @@ class LoputTavernPlugin(Star):
         if not content:
             return
 
-        await _maybe_compress_role_history(session, self.tavern, _bot_self_id)
-
         # 根据 self_id 解析角色卡 (双 Bot: 主 bot vs 对照 bot)
         _bot_self_id = self._self_id(event)
         _char = get_character_for_self_id(_bot_self_id)
+
+        await _maybe_compress_role_history(session, self.tavern, _bot_self_id)
 
         tavern_messages: list[dict[str, str]] = [
             {"role": "system", "content": _char.get("system_prompt", "")},

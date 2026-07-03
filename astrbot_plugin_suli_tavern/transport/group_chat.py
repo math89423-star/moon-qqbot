@@ -1805,11 +1805,12 @@ class GroupChatScheduler:
         自己的 at 段，导致 segment 遍历永远找不到。因此同时检查 raw JSON。
         """
         try:
+            bot_id = str(bot.self_id)
             # 方法 1: 遍历 segments (标准路径)
             for seg in event.get_message():
                 if seg.type == "at":
                     qq = str(seg.data.get("qq", ""))
-                    if qq == str(bot.self_id):
+                    if qq == bot_id:
                         return True
             # 方法 2: 检查 raw_message (NapCat/LLOneBot fallback)
             raw = ""
@@ -1818,9 +1819,19 @@ class GroupChatScheduler:
             except Exception:
                 pass
             if raw:
-                bot_id = str(bot.self_id)
-                # raw_message 格式示例: [CQ:at,qq={bot_id},name=BotName] 出来
                 if f"[CQ:at,qq={bot_id}" in raw:
+                    return True
+            # 方法 3: 纯文本 fallback — @段被剥离时通过 QQ 内置格式 "@昵称" 检测
+            plaintext = event.get_plaintext()
+            if plaintext:
+                # 从 BotIdentity 获取 bot 显示名
+                try:
+                    from ..service.bot_identity import get_bot_identity_service
+                    bot_obj = get_bot_identity_service().get_bot(bot_id)
+                    bot_name = bot_obj.name if bot_obj else ""
+                except Exception:
+                    bot_name = ""
+                if bot_name and f"@{bot_name}" in plaintext:
                     return True
         except Exception:
             logger.debug("群消息 @检测异常，跳过", exc_info=True)
@@ -3506,6 +3517,11 @@ class GroupChatScheduler:
 
                 # ★ 2026-06-30: 进入 Full Gate 的消息已通过加权分+S3双重过滤，
                 # directed_to_me / should_reply 固定为 True，不再检查。
+
+                # ── Personal domain 强制 pro: 角色身份问题需要深度扮演 ──
+                if _full_gate.domain == "personal" and _full_gate.model_tier == "lite":
+                    _full_gate.model_tier = "pro"
+                    logger.info("群 %d: personal domain → 强制 pro (角色一致性)", ctx.group_id)
 
                 # ── Reaction 短路: 低好感陌生人纯反应 → 跳过 Reply, 省一轮 LLM 调用 ──
                 if (

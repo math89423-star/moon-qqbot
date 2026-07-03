@@ -25,3 +25,13 @@ Thumbs.db
 *.db-wal
 模拟新用户部署测试/
 docs/
+# 嵌入式依赖 (不由本仓库管理)
+AstrBot/
+NapCatQQ/
+# 本地数据与缓存
+plugins/
+prompts/
+loadNapCat.js
+astrbot_plugin_suli_tavern/characters/*.json
+astrbot_plugin_suli_tavern/knowledge/_web_cache/
+astrbot_plugin_suli_tavern/knowledge/*.md

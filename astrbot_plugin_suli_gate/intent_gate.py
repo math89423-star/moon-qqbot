@@ -2083,6 +2083,25 @@ def _repair_truncated_json(raw: str) -> dict | None:
     return None
 
 
+def _repair_inline_quotes(raw: str) -> str:
+    """修复 LLM 在 JSON 字符串值内输出的未转义中文引号。
+
+    例如: "summary":"他叫"深蓝计划"" → 内部 ASCII 引号替换为 「」
+    """
+    import re as _re
+    # 匹配 JSON 字符串值内部出现的成对裸引号: 值内 "xxx" 模式
+    # 在 :" 和 ", 或 "} 之间搜索成对的裸引号并替换
+    def _fix_value(m: _re.Match) -> str:
+        key = m.group(1)
+        val = m.group(2)
+        # 将值内的成对裸引号替换为 「」
+        val = _re.sub(r'"([^"]{1,20}?)"', r'「\1」', val)
+        return f'"{key}":"{val}"'
+    # 匹配 "key":"value" 模式 (value 中可能包含未转义引号)
+    raw = _re.sub(r'"(summary|main_topic|reasoning|gist)":"(.*?)"(?=\s*[,}])', _fix_value, raw, flags=_re.DOTALL)
+    return raw
+
+
 def _parse_full_gate(raw: str) -> FullGateResult:
     """从容错 JSON 解析 FullGateResult — 新四职责 schema (2026-06-30)。"""
     raw = raw.strip()
@@ -2092,12 +2111,26 @@ def _parse_full_gate(raw: str) -> FullGateResult:
             return json.loads(raw)
         except json.JSONDecodeError:
             pass
-        m = _JSON_EXTRACT_RE.search(raw)
-        if m:
+        # ── 修复 LLM 未转义中文引号 ──
+        _raw2 = _repair_inline_quotes(raw)
+        if _raw2 != raw:
             try:
-                return json.loads(m.group(0))
+                return json.loads(_raw2)
             except json.JSONDecodeError:
                 pass
+        m = _JSON_EXTRACT_RE.search(raw)
+        if m:
+            _extracted = m.group(0)
+            try:
+                return json.loads(_extracted)
+            except json.JSONDecodeError:
+                pass
+            _ext2 = _repair_inline_quotes(_extracted)
+            if _ext2 != _extracted:
+                try:
+                    return json.loads(_ext2)
+                except json.JSONDecodeError:
+                    pass
         return _repair_truncated_json(raw)
 
     obj = extract()

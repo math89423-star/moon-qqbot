@@ -1,0 +1,34 @@
+{
+  "spec": "chara_card_v3",
+  "spec_version": "3.0",
+  "_field_guide": "=== CHARACTER CARD CCv3 FIELD GUIDE === 详见 docs/character_card_guide.md",
+  "data": {
+    "name": "角色名称",
+    "description": "外貌+背景+核心特质的总览描述，200-350 tokens 为宜。具体以行为为中心——不要写「她很友好」，写「她总是微笑着问候邻居，并记住他们孩子的名字」。第三人称。",
+    "personality": "性格分层描述。推荐格式：用「表层→中层→深层」或距离模型展开。需包含：核心行为模式、思维逻辑、内在矛盾、情绪表露方式。第三人称，使用 {{char}} 代称。",
+    "scenario": "互动场景描述——角色在什么情境下与 {{user}} 交流。1-3 句话，设定氛围和关系起点。",
+    "talkativeness": "0.5",
+    "first_mes": "角色的第一条消息/开场白。这是整张卡最重要的字段之一——它定义了风格、语气、长度和关系动态。AI 会严重模仿第一条消息的风格。2-5 句为宜。",
+    "mes_example": "<START>\n{{user}}: 示例用户消息\n{{char}}: 示例角色回复\n\n<START>\n{{user}}: 另一条用户消息\n{{char}}: 另一条角色回复",
+    "alternate_greetings": [
+      "备用开场白 1",
+      "备用开场白 2"
+    ],
+    "group_only_greetings": [
+      "群聊备用开场白 1",
+      "群聊备用开场白 2"
+    ],
+    "system_prompt": "[你是谁]\n这里是角色的完整系统提示——包含人设、说话方式、行为框架、内在知识、好恶等。这是 LLM 读取的核心指令。格式使用 Markdown 段落+列表。\n\n[说话方式]\n1. 你就是QQ上的真人...\n2. 自称「我」...\n\n[行为框架]\n...",
+    "post_history_instructions": "回复前自检清单——每次生成回复前 LLM 会过一遍这个清单。包含：(1) 温度/距离对吗？(2) 称呼对吗？(3) 长度对吗？(4) 没有 Markdown 吧？...",
+    "nickname": "角色昵称",
+    "creator_notes": "创作者备注。自由文本，不注入 prompt。",
+    "tags": ["tag1", "tag2", "tag3"],
+    "character_version": "1.0.0",
+    "group_persona": "[你是谁]\n群聊版人设。格式同 system_prompt，但聚焦群聊场景：更短的回复、更克制的表达、群聊中的互动方式。这是本项目的核心字段——群聊 prompt 优先使用此字段而非 system_prompt。\n\n[说话方式]\n...\n\n[行为准则]\n1. 群聊中除非被@或话题自然衔接，否则保持沉默...",
+    "group_mes_example": "<START>\n{{user}}: 群聊示例消息\n{{char}}: 群聊示例回复",
+    "role_description": "角色一句话标签，如「白发红瞳冰山少女」「猫娘」「蛇系」。用于 companion_rules 等模板中的 {other_desc} 占位符。",
+    "kaomoji_rule": "颜文字使用规则。如不使用→「你不使用颜文字。情绪完全通过语气、选词、标点传达。」如使用→列出常用颜文字和使用频率约束。",
+    "companion_rules": "[同群bot — {other_name}是你的同伴]\n{other_name}是群里的{other_desc}。你们共享同一位重要的人，功能互补。\n\n互动规则:\n· 绝不对话循环——两个bot对刷屏=群友灾难\n· 谈论{other_name}时保持你自己的风格...\n\n注意: {other_name} 和 {other_desc} 是运行时替换的占位符。",
+    "sticker_guide": "[表情包 — 你有 send_sticker 工具]\n可用标签: {tags_summary}\n{char_name}的表情包使用规则...\n\n注意: {tags_summary} 和 {char_name} 是运行时替换的占位符。"
+  }
+}
