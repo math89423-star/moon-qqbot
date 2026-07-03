@@ -351,7 +351,7 @@ class ShadowSession:
                     model=model,
                     messages=list(self._thread),  # type: ignore[reportArgumentType]
                     temperature=0.1,
-                    max_tokens=256,
+                    max_tokens=512,
                 ),
                 timeout=10.0,
             )
@@ -366,7 +366,7 @@ class ShadowSession:
                 tavern.chat(
                     list(self._thread),
                     temperature=0.1,
-                    max_tokens=256,
+                    max_tokens=512,
                     model=model,
                 ),
                 timeout=10.0,

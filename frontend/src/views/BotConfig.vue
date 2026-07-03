@@ -442,7 +442,10 @@ function slotLabel(slotKey: string, tab: string): string {
     const map: Record<string, string> = {
       llm_primary: '普通聊天',
       llm_secondary: '进阶',
+      llm_lite: '普通聊天',
+      llm_pro: '进阶',
       llm_gate: '意图闸',
+      shadow_agent: '影子',
     }
     return map[slotKey] || slotKey
   }

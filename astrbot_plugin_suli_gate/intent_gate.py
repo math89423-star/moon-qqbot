@@ -1782,46 +1782,61 @@ class IntentGate:
             {"role": "user", "content": user_prompt},
         ]
 
-        # ── LLM 调用 ──
+        # ── Gate thinking: 默认关闭 — Gate 是分类器不需要深度推理 ──
+        # thinking 增加 500-2000 token 不可见 CoT + 5-12s 延迟，
+        # 对 Gate 的结构化分类任务无收益。前端可按 bot 开启。
+        _gate_extra = None
         try:
-            # ── Gate thinking: 默认关闭 — Gate 是分类器不需要深度推理 ──
-            # thinking 增加 500-2000 token 不可见 CoT + 5-12s 延迟，
-            # 对 Gate 的结构化分类任务无收益。前端可按 bot 开启。
-            _gate_extra = None
-            try:
-                from astrbot_plugin_suli_tavern.service.bot_config import get_config_service
-                if get_config_service().is_gate_thinking_enabled(bot_id or ""):
-                    _gate_extra = {"thinking": {"type": "true"}} # 当前默认关闭
-            except Exception:
-                pass  # 默认关
-
-            raw = await asyncio.wait_for(
-                tavern.chat(
-                    gate_messages,
-                    temperature=0.1,
-                    max_tokens=1000,
-                    api_base=api_base,
-                    api_key=api_key,
-                    model=model or "deepseek-v4-flash",
-                    bot_id=bot_id,
-                    extra_params=_gate_extra,
-                ),
-                timeout=timeout,
-            )
-        except TimeoutError:
-            logger.warning("IntentGate Full 超时 (>%.0fs) → fail-closed (静默)", timeout)
-            return FullGateResult(
-                parse_ok=False,
-                parse_error="超时",
-                reasoning="FullGate 超时 (>%.0fs) → fail-closed (静默)" % timeout,
-            )
+            from astrbot_plugin_suli_tavern.service.bot_config import get_config_service
+            if get_config_service().is_gate_thinking_enabled(bot_id or ""):
+                _gate_extra = {"thinking": {"type": "true"}} # 当前默认关闭
         except Exception:
-            logger.warning("IntentGate Full LLM 异常 → fail-closed (静默)", exc_info=True)
-            return FullGateResult(
-                parse_ok=False,
-                parse_error="异常",
-                reasoning="FullGate LLM 异常 → fail-closed (静默)",
-            )
+            pass  # 默认关
+
+        # ── LLM 调用 (超时重试 1 次) ──
+        raw = ""
+        for attempt in (1, 2):
+            try:
+                raw = await asyncio.wait_for(
+                    tavern.chat(
+                        gate_messages,
+                        temperature=0.1,
+                        max_tokens=1000,
+                        api_base=api_base,
+                        api_key=api_key,
+                        model=model or "deepseek-v4-flash",
+                        bot_id=bot_id,
+                        extra_params=_gate_extra,
+                    ),
+                    timeout=timeout,
+                )
+                break  # 成功 → 跳出重试循环
+            except TimeoutError:
+                if attempt == 1:
+                    logger.warning(
+                        "IntentGate Full 超时 (>%.0fs) → 重试第2次",
+                        timeout,
+                    )
+                else:
+                    logger.warning(
+                        "IntentGate Full 超时 2 次 (>%.0fs) → fail-closed",
+                        timeout,
+                    )
+                    return FullGateResult(
+                        parse_ok=False,
+                        parse_error="超时",
+                        reasoning="FullGate 超时 2 次 (>%.0fs) → fail-closed (静默)" % timeout,
+                    )
+            except Exception:
+                logger.warning(
+                    "IntentGate Full LLM 异常 (attempt=%d) → fail-closed",
+                    attempt, exc_info=True,
+                )
+                return FullGateResult(
+                    parse_ok=False,
+                    parse_error="异常",
+                    reasoning="FullGate LLM 异常 → fail-closed (静默)",
+                )
 
         if not raw:
             return FullGateResult(
