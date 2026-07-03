@@ -35,3 +35,7 @@ loadNapCat.js
 astrbot_plugin_suli_tavern/characters/*.json
 astrbot_plugin_suli_tavern/knowledge/_web_cache/
 astrbot_plugin_suli_tavern/knowledge/*.md
+# 私有知识库
+astrbot_plugin_suli_bridge/knowledge_base.py
+astrbot_plugin_suli_services/knowledge_base.py
+tools/embedding_service.py
