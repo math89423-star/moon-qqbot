@@ -1157,7 +1157,7 @@ PLUGIN_NAME = "astrbot_plugin_suli_tavern"
     "1.0.0",
 )
 class LoputTavernPlugin(Star):
-    """暮恩 · 无限之蛇 — AstrBot 版。"暮恩 (Moon)" 开源项目。"""
+    """暮恩 (Moon) — AstrBot 版。开源项目 moon-qqbot。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
@@ -2118,7 +2118,7 @@ class LoputTavernPlugin(Star):
     async def _send_help(self, event: AstrMessageEvent):
         char_name = DEFAULT_CHARACTER["name"]
         help_text = (
-            f"✨ {char_name} · 无限之蛇\n"
+            f"✨ {char_name}\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"  /role <消息>        与 {char_name} 对话\n"
             "  /role reset         重置会话\n"
@@ -2130,7 +2130,7 @@ class LoputTavernPlugin(Star):
             "  /role group status  查看状态\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔬 支持多轮对话，30分钟无操作自动清除会话\n"
-            "当前角色卡: v3.0「无限之蛇」· L-Port专属AI助手"
+            f"当前角色卡: {char_name}"
         )
         await event.send(MessageChain([Plain(help_text)]))
 
