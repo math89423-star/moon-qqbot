@@ -1,10 +1,17 @@
 # 从运行中的 Chrome 提取抖音 cookies (via DevTools Protocol)
-# 用法: powershell.exe -ExecutionPolicy Bypass -File extract_douyin_cookies.ps1
+# 用法: powershell.exe -ExecutionPolicy Bypass -File scripts\extract_douyin_cookies.ps1
 param(
-    [string]$OutputFile = "C:\Users\<你的用户名>\moon-qqbot\runtime\data-luna\douyin_cookies.txt"
+    [string]$OutputFile = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# 缺省输出到 <repo>/AstrBot/data/douyin_cookies.txt (与 video 插件读取路径一致)
+if (-not $OutputFile) {
+    $OutputFile = Join-Path (Split-Path $PSScriptRoot -Parent) "AstrBot\data\douyin_cookies.txt"
+}
+$outDir = Split-Path $OutputFile -Parent
+if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
 # 1. 找 Chrome 的 DevTools 调试端口
 #    如果 Chrome 已经开了远程调试就直接用，否则启动一个新的调试实例

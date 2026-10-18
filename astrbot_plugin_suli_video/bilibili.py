@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -45,10 +46,12 @@ _DEFAULT_FORMAT = (
 _DEFAULT_MAX_MB = 20
 # 下载超时 (秒)
 _DOWNLOAD_TIMEOUT = 120
-# 抖音 cookie 文件路径 (Netscape 格式, 由浏览器扩展导出, 挂在共享卷)
-# 宿主路径: runtime/data/douyin_cookies.txt
-# 容器路径: /AstrBot/data/douyin_cookies.txt
-_DOUYIN_COOKIE_FILE = "/AstrBot/data/douyin_cookies.txt"
+# 抖音 cookie 文件路径 (Netscape 格式, 由浏览器扩展导出)
+# 优先环境变量 DOUYIN_COOKIE_FILE; 缺省 <repo>/AstrBot/data/douyin_cookies.txt
+_DOUYIN_COOKIE_FILE = (
+    os.environ.get("DOUYIN_COOKIE_FILE", "").strip()
+    or str(Path(__file__).resolve().parent.parent / "AstrBot" / "data" / "douyin_cookies.txt")
+)
 
 # 抖音: videofetch 解析器 (按优先级依次尝试)
 _DOUYIN_PARSERS = [
@@ -252,7 +255,8 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         else:
             raise ValueError(
                 "抖音视频需要浏览器 cookie 才能下载。\n"
-                "请用浏览器扩展导出 cookies.txt 放到共享目录。"
+                f"请用浏览器扩展导出 cookies.txt 放到: {_DOUYIN_COOKIE_FILE}\n"
+                "(或设置环境变量 DOUYIN_COOKIE_FILE 指向该文件)"
             )
 
     try:

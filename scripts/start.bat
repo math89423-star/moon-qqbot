@@ -72,6 +72,7 @@ start "moon-panel" cmd /k "cd /d "%ROOT%" && "%ROOT%\.venv\Scripts\python.exe" "
 
 cd AstrBot
 echo Starting AstrBot...
+echo   Dashboard: http://localhost:6185  (default astrbot / astrbot)
 echo QQ: %BOT_QQ_MAIN%
 echo.
 python main.py

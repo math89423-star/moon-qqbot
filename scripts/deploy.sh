@@ -102,6 +102,31 @@ else
     echo -e "${GREEN}  AstrBot 已存在，跳过克隆和依赖安装${NC}"
 fi
 
+# ── AstrBot 平台适配器 (OneBot v11 / aiocqhttp, 反向 WS 6199) ──
+# 没有 platform 条目时 AstrBot 不会启动 WS 服务, 收不到 QQ 消息
+echo ""
+echo -e "${YELLOW}[2.5/5] AstrBot 平台适配器...${NC}"
+mkdir -p "$ASTRBOT_DIR/data"
+if [ ! -f "$ASTRBOT_DIR/data/cmd_config.json" ]; then
+    cat > "$ASTRBOT_DIR/data/cmd_config.json" <<'JSON'
+{
+  "platform": [
+    {
+      "id": "moon_qq",
+      "type": "aiocqhttp",
+      "enable": true,
+      "ws_reverse_host": "0.0.0.0",
+      "ws_reverse_port": 6199,
+      "ws_reverse_token": ""
+    }
+  ]
+}
+JSON
+    echo -e "${GREEN}  已预置平台: OneBot v11 (aiocqhttp) 端口 6199 ✓${NC}"
+else
+    echo -e "${GREEN}  cmd_config.json 已存在，跳过${NC}"
+fi
+
 # ── 部署插件 ──
 echo ""
 echo -e "${YELLOW}[3/5] 部署插件...${NC}"

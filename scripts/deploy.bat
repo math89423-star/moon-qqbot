@@ -40,8 +40,8 @@ if not exist ".env" (
         pause
         exit /b 1
     )
-    echo QQ=!QQ_NUMBER!> .env
-    echo BOT_QQ_MAIN=!QQ_NUMBER!>> .env
+    > .env echo QQ=!QQ_NUMBER!
+    >> .env echo BOT_QQ_MAIN=!QQ_NUMBER!
     echo   QQ number saved
 ) else (
     for /f "tokens=1,2 delims==" %%a in (.env) do (
@@ -95,6 +95,31 @@ if errorlevel 1 (
 )
 echo   AstrBot dependencies OK
 cd ..
+echo.
+
+REM -- Seed AstrBot platform config (OneBot v11 / aiocqhttp, reverse WS 6199) --
+REM Without a platform entry AstrBot starts no WS server and never receives QQ messages.
+echo [2.5/5] AstrBot platform config...
+if not exist "AstrBot\data" mkdir "AstrBot\data"
+if not exist "AstrBot\data\cmd_config.json" (
+    (
+    echo {
+    echo   "platform": [
+    echo     {
+    echo       "id": "moon_qq",
+    echo       "type": "aiocqhttp",
+    echo       "enable": true,
+    echo       "ws_reverse_host": "0.0.0.0",
+    echo       "ws_reverse_port": 6199,
+    echo       "ws_reverse_token": ""
+    echo     }
+    echo   ]
+    echo }
+    ) > "AstrBot\data\cmd_config.json"
+    echo   Platform preset: OneBot v11 ^(aiocqhttp^) on port 6199
+) else (
+    echo   cmd_config.json exists, skipped
+)
 echo.
 
 REM -- Deploy plugins --
@@ -203,5 +228,8 @@ echo   1. Launch: scripts\start.bat
 echo   2. NapCat scan QR to login QQ !QQ_NUMBER! (http://localhost:6099)
 echo   3. Admin panel: http://localhost:5190
 echo   4. Configure LLM API in panel (OpenAI compatible)
+echo.
+echo   Note: AstrBot dashboard (http://localhost:6185, default astrbot/astrbot)
+echo         only needs changes if you want another WS port.
 echo.
 pause

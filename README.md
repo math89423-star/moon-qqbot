@@ -148,6 +148,7 @@ scripts\deploy.bat
 ✨ 创建 Python 虚拟环境
 📦 安装项目依赖
 🤖 安装 AstrBot 框架
+🔗 预置 AstrBot 平台适配器 (OneBot v11 / aiocqhttp, 反向 WS 6199)
 🔌 部署全部 17 个插件
 🎭 复制角色卡
 🐱 引导安装 NapCatQQ
@@ -180,6 +181,15 @@ bash scripts/start.sh
 **② 配置 LLM** — 访问 **`http://localhost:5190`** 进入管理面板，在「机器人配置」中填入 LLM API 信息（详见下方 ⚙️ 配置 LLM）。
 
 > ⚠️ 这两步缺一不可——不登录 QQ 机器人就收不到消息，不配 LLM 机器人就不知道怎么回。
+
+<details>
+<summary>🔗 连接不通？AstrBot 平台适配器说明</summary>
+
+部署脚本已自动写入 `AstrBot/data/cmd_config.json`，预置一个 **OneBot v11 (aiocqhttp)** 平台，反向 WebSocket 端口 **6199**（AstrBot 作为服务端），与 NapCat 自动生成的 `ws://localhost:6199/ws` 一一对应，开箱即用。
+
+只有以下情况需要手动改：想换端口、或 `cmd_config.json` 已存在没被覆盖。此时打开 AstrBot 面板 **`http://localhost:6185`**（默认账号 `astrbot` / 密码 `astrbot`，首次登录要求改密码），在「平台适配器」里添加 **OneBot v11**，把反向 WS 端口与 NapCat 端保持一致即可。
+
+</details>
 
 <details>
 <summary>🐱 NapCatQQ 自动下载失败？点我查看手动方案</summary>
@@ -403,7 +413,7 @@ Model: Qwen/Qwen2.5-7B-Instruct
 <details>
 <summary>🔗 WebSocket 连接错误？</summary>
 
-检查 NapCatQQ 是否已启动并登录。确认 AstrBot 的 `api_config.json` 中 aiocqhttp 平台配置的 WebSocket 地址指向 NapCat（默认 `ws://localhost:6199/ws`）。
+检查 NapCatQQ 是否已启动并登录。确认 AstrBot 的 `AstrBot/data/cmd_config.json` 中 aiocqhttp 平台的反向 WebSocket 端口与 NapCat 客户端地址一致（默认 `ws://localhost:6199/ws`，AstrBot 侧 `ws_reverse_port: 6199`）。部署脚本已自动预置该配置。
 
 NapCat WebUI 地址：`http://localhost:6099`（Token 在 `NapCatQQ\napcat\config\webui.json` 中查看，NapCat 首次启动时自动生成）
 
