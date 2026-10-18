@@ -129,8 +129,8 @@ class ReActEngine:
         max_rounds: int = 5,
         max_total_tokens: int = 8000,
         timeout_seconds: float = 90.0,
-        model: str = "deepseek-v4-pro",
-        provider: str = "deepseek",
+        model: str = "",
+        provider: str = "",
         temperature: float = 0.6,
         max_tokens_per_turn: int = 1024,
         extra_params: dict | None = None,
@@ -142,12 +142,26 @@ class ReActEngine:
         self._max_rounds = max_rounds
         self._max_total_tokens = max_total_tokens
         self._timeout = timeout_seconds
+        # 前端唯一真相源: 空 model 时尝试从面板槽位回退，仍为空则保留空（调用时再校验）
+        if not model and bot_id:
+            try:
+                from ..service.bot_config import get_config_service
+                svc = get_config_service()
+                cfg = svc.resolve_llm_slot(bot_id, "llm_pro") or svc.resolve_llm_slot(bot_id, "llm_lite") \
+                    or svc.resolve_active_llm(bot_id)
+                if cfg and cfg.model_name:
+                    model = cfg.model_name
+                    provider = cfg.provider or provider
+            except Exception:
+                pass
         self._model = model
         self._provider = provider
         self._temperature = temperature
         self._max_tokens_per_turn = max_tokens_per_turn
         self._extra_params = extra_params or {}
         self._bot_id = bot_id
+        if not self._model:
+            logger.warning("ReActEngine 初始化: 前端无可用模型 (bot_id=%r)，后续调用将跳过", bot_id)
 
     # ── 公开 API ─────────────────────────────────────────
 
@@ -339,7 +353,11 @@ class ReActEngine:
                 ),
                 timeout=15.0,
             )
-            final = resp.get("content", "").strip() or "抱歉，研究超时了。请稍后再试。"
+            final = (resp.get("content") or "").strip()
+            if not final:
+                # 空响应≠超时: 思考烧光输出预算 (finish=length) 也落这里,
+                # 报"超时"会把排障引向网络。异常分支仍报超时 (见下)。
+                final = "抱歉，研究返回了空响应（输出预算可能被思考耗尽），请稍后再试。"
         except Exception:
             final = "抱歉，研究超时了。请稍后再试。"
 
@@ -398,7 +416,9 @@ class ReActEngine:
         至少把已经查到的信息原样吐给用户，不会"装死"。
         """
         if not tool_calls_record:
-            return "抱歉，研究超时且未能收集到任何信息。请稍后再试。"
+            # 中性措辞: 无观察时可能是超时, 也可能是收尾调用空响应 (预算死),
+            # 不要在没证据时指控网络。
+            return "抱歉，研究未能完成，且未能收集到任何信息。请稍后再试。"
 
         parts = ["抱歉，研究过程中遇到了技术问题。以下是我已经查到的部分信息：\n"]
         for i, tc in enumerate(tool_calls_record, 1):

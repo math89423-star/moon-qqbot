@@ -478,132 +478,19 @@ class BotDatabase:
     # ── L-Port → Bot LLM 配置迁移 ───────────────────────────
 
     def _migrate_llm_configs(self) -> None:
-        """将 L-Port llm_config 表一次性迁移到 bot 自己的 llm_config 表。
-
-        仅在 bot 的 llm_config 表为空且 L-Port DB 存在时执行。
-        迁移后标记 _MIGRATED_LLM_KEY = "done"。
-        """
+        """已禁用: 前端 6190 是唯一真相源，禁止从 L-Port DB 读取。"""
         row = self.conn.execute(
             "SELECT value FROM bot_config WHERE key = ?",
             (_MIGRATED_LLM_KEY,),
         ).fetchone()
         if row and row["value"] == "done":
             return
-
-        # 检查是否已有配置 (可能是手动添加的)
-        existing = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM llm_config",
-        ).fetchone()
-        if existing and existing["cnt"] > 0:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        # 尝试从 L-Port 迁移
-        lport_db = os.getenv(
-            "LPORT_DB_PATH",
-            "/mnt/d/L-Port-Comfy/app/backend/instance/lport_desktop.db",
-        )
-        if not os.path.exists(lport_db):
-            logger.info("L-Port DB 不存在 (%s)，跳过 LLM 配置迁移", lport_db)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        try:
-            from ...astrbot_plugin_suli_bridge.config_reader import LPortConfigReader
-            reader = LPortConfigReader(lport_db)
-            lport_configs = reader.list_all()
-        except Exception:
-            logger.warning("无法从 L-Port 读取配置，跳过迁移", exc_info=True)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        if not lport_configs:
-            logger.info("L-Port 无 LLM 配置，跳过迁移")
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        # 建立 old_id → new_id 映射
-        old_to_new: dict[int, int] = {}
-        now = time.time()
-        migrated = 0
-
-        for cfg in lport_configs:
-            cur = self.conn.execute(
-                "INSERT INTO llm_config "
-                "(name, provider, provider_name, api_key, base_url, model_name, "
-                " is_active, vlm_resize_max_dim, token_budget_cap, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    cfg.name, cfg.provider, cfg.provider_name,
-                    cfg.api_key, cfg.base_url, cfg.model_name,
-                    int(cfg.is_active),
-                    cfg.vlm_resize_max_dim, cfg.token_budget_cap,
-                    now, now,
-                ),
-            )
-            old_to_new[cfg.id] = cur.lastrowid
-            migrated += 1
-
-        # 同步 active_llm_id / active_vlm_id
-        active_llm_id = self.get_config("active_llm_id", "")
-        if active_llm_id:
-            old_id = int(active_llm_id)
-            if old_id in old_to_new:
-                self.set_config("active_llm_id", str(old_to_new[old_id]))
-                active_llm_id = str(old_to_new[old_id])
-            else:
-                active_llm_id = ""
-
-        active_vlm_id = self.get_config("active_vlm_id", "")
-        if active_vlm_id:
-            old_id = int(active_vlm_id)
-            if old_id in old_to_new:
-                self.set_config("active_vlm_id", str(old_to_new[old_id]))
-                active_vlm_id = str(old_to_new[old_id])
-            else:
-                active_vlm_id = ""
-
-        # 回退: 若 active_llm_id 仍为空, 自动选首个 LLM
-        if not active_llm_id:
-            all_configs = self.list_llm_configs()
-            for c in all_configs:
-                if c.is_llm and c.is_active:
-                    self.set_config("active_llm_id", str(c.id))
-                    logger.info("自动选择活跃 LLM (is_active): id=%d name=%s", c.id, c.name)
-                    break
-            else:
-                for c in all_configs:
-                    if c.is_llm:
-                        self.set_config("active_llm_id", str(c.id))
-                        logger.info("自动选择活跃 LLM (首个): id=%d name=%s", c.id, c.name)
-                        break
-
-        # 标记迁移完成
         self.conn.execute(
             "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
             (_MIGRATED_LLM_KEY, time.time()),
         )
         self.conn.commit()
-        logger.info(
-            "LLM 配置迁移完成: %d 条配置 ← L-Port (%s)",
-            migrated, lport_db,
-        )
+        logger.info("LLM 迁移已禁用: 前端 6190 为唯一真相源")
 
     # ── 配置 CRUD ─────────────────────────────────────────
 

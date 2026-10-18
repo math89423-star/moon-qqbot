@@ -28,12 +28,8 @@ logger = logging.getLogger(__name__)
 # 知识库目录 (修复: 从 service/ 往上一级到 suli_tavern/)
 _KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
-# BGE-M3 本地模型路径
-_BGE_M3_PATH = (
-    "/mnt/d/BaiduNetdiskDownload/model/hub/"
-    "models--BAAI--bge-m3/snapshots/"
-    "5617a9f61b028005a4858fdac845db406aefb181"
-)
+# BGE-M3 本地模型路径: 项目内 models/bge-m3 为准 (git 忽略, 暂不挂载时备用)。
+_BGE_M3_PATH = str(Path(__file__).resolve().parents[1] / "models" / "bge-m3")
 
 # BGE 查询前缀 — 必须加在 query 侧，不加以检索质量显著下降
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "

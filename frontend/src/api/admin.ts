@@ -28,10 +28,12 @@ import type {
   CharacterCardMeta,
   CharacterCard,
   LLMListResponse,
+  NsfwTemperatureView,
   PluginInfo,
   MemeCategory,
   MemeItem,
   MemeSyncStatus,
+  DrawApiConfig,
 } from '@/types'
 
 const api: AxiosInstance = axios.create({
@@ -76,6 +78,32 @@ api.interceptors.response.use(
 )
 
 // ── 认证 ────────────────────────────────────────
+
+export async function fetchRemoteModels(
+  baseUrl: string, apiKey: string, configId?: number,
+): Promise<string[]> {
+  const { data } = await api.post('/llm/remote-models', {
+    base_url: baseUrl, api_key: apiKey, config_id: configId,
+  })
+  return data.models ?? []
+}
+
+export interface ModelMeta {
+  context_window: number | null
+  source_provider: string
+  reasoning: boolean | null
+  tool_call: boolean | null
+  max_effort: string
+  max_effort_source: 'static' | 'default' | string
+  supported_efforts: string[]
+}
+
+export async function fetchModelMeta(
+  model: string, provider: string,
+): Promise<ModelMeta> {
+  const { data } = await api.get('/llm/model-meta', { params: { model, provider } })
+  return data
+}
 
 export async function login(token: string): Promise<boolean> {
   try {
@@ -152,6 +180,29 @@ export async function updateBotSettings(
   await api.post('/bot-settings', { bot_id: botId, ...settings })
 }
 
+export interface LlmTestResult {
+  ok: boolean
+  slot?: string
+  model?: string
+  effort_sent?: string
+  latency_ms?: number
+  output_preview?: string
+  usage?: { prompt_tokens: number; completion_tokens: number; reasoning_tokens?: number }
+  tier_warning?: string
+  error: string
+}
+
+export async function testLlmConnection(
+  botId: string, slot: string, effort: string, prompt: string,
+  scope?: 'sfw' | 'nsfw',
+): Promise<LlmTestResult> {
+  const { data } = await api.post('/llm/test', {
+    bot_id: botId, slot, effort, prompt,
+    scope: scope === 'nsfw' ? 'nsfw' : undefined,
+  })
+  return data
+}
+
 // ── Bot 身份 CRUD ──────────────────────────────────
 
 export async function createBot(data: BotIdentityCreate): Promise<void> {
@@ -211,14 +262,22 @@ export async function deleteCharacter(name: string): Promise<void> {
 
 // ── LLM 槽位分配 (per-bot) ────────────────────────
 
-export async function getLLMListWithSlots(botId?: string): Promise<LLMListResponse> {
-  const params = botId ? { bot_id: botId } : {}
+export async function getLLMListWithSlots(
+  botId?: string, scope?: 'sfw' | 'nsfw',
+): Promise<LLMListResponse> {
+  const params: Record<string, string> = {}
+  if (botId) params.bot_id = botId
+  if (scope === 'nsfw') params.scope = 'nsfw'
   const { data } = await api.get('/llm/list', { params })
   return data
 }
 
-export async function getVLMListWithSlots(botId?: string): Promise<LLMListResponse> {
-  const params = botId ? { bot_id: botId } : {}
+export async function getVLMListWithSlots(
+  botId?: string, scope?: 'sfw' | 'nsfw',
+): Promise<LLMListResponse> {
+  const params: Record<string, string> = {}
+  if (botId) params.bot_id = botId
+  if (scope === 'nsfw') params.scope = 'nsfw'
   const { data } = await api.get('/vlm/list', { params })
   return data
 }
@@ -228,11 +287,13 @@ export async function assignSlot(
   slot: string,
   configId: number,
   botId?: string,
+  scope?: 'sfw' | 'nsfw',
 ): Promise<void> {
   await api.post(`/${type}/activate`, {
     config_id: configId,
     slot,
     bot_id: botId || undefined,
+    scope: scope === 'nsfw' ? 'nsfw' : undefined,
   })
 }
 
@@ -251,6 +312,26 @@ export async function updateTemperatures(
   const params = botId ? { bot_id: botId } : {}
   const { data } = await api.put('/temperature', { temperatures: temps }, { params })
   return data.temperatures
+}
+
+// ── NSFW 温度 (scope=nsfw; 2026-10-18) ───────────
+
+export async function getNsfwTemperatures(botId?: string): Promise<NsfwTemperatureView> {
+  const params: Record<string, string> = { scope: 'nsfw' }
+  if (botId) params.bot_id = botId
+  const { data } = await api.get('/temperature', { params })
+  return data
+}
+
+/** rules: 数字 = 写覆盖; null = 清除覆盖 (恢复跟随 SFW)。 */
+export async function updateNsfwTemperatures(
+  temps: Record<string, number | null>,
+  botId?: string,
+): Promise<NsfwTemperatureView> {
+  const params: Record<string, string> = { scope: 'nsfw' }
+  if (botId) params.bot_id = botId
+  const { data } = await api.put('/temperature', { temperatures: temps }, { params })
+  return data
 }
 
 // ── 用户记忆 ────────────────────────────────────
@@ -539,4 +620,25 @@ export async function uploadMeme(category: string, file: File): Promise<{ ok: bo
 
 export async function deleteMeme(category: string, filename: string): Promise<void> {
   await api.post('/memes/delete', { category, filename })
+}
+
+// ── 绘图 API (NovelAI + PixAI) ──────────────────────────
+
+export async function getDrawConfig(): Promise<DrawApiConfig> {
+  const { data } = await api.get('/draw/config')
+  return data as DrawApiConfig
+}
+
+export async function saveDrawConfig(
+  payload: Record<string, unknown>,
+): Promise<DrawApiConfig> {
+  const { data } = await api.put('/draw/config', payload)
+  return data as DrawApiConfig
+}
+
+export async function probeDraw(
+  provider: 'novelai' | 'pixai',
+): Promise<{ ok: boolean; reason: string }> {
+  const { data } = await api.post('/draw/probe', { provider })
+  return data
 }

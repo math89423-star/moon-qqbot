@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 import {
   Puzzle, BookOpen,
   MessageSquare, ScanEye, ScrollText, Settings,
-  Smile, Bot, Diamond,
+  Smile, Bot, Diamond, Palette, Image as ImageIcon, Flame,
 } from '@lucide/vue'
 import type { Component } from 'vue'
 import type { PluginInfo } from '@/types'
@@ -23,11 +23,14 @@ interface NavItem {
 const coreItems: NavItem[] = [
   { path: '/bot-manage', label: 'Bot 管理',  icon: Bot },
   { path: '/bots',        label: '机器人配置', icon: Settings },
+  { path: '/nsfw-config', label: 'NSFW 配置', icon: Flame },
   { path: '/memories',    label: '用户记忆',  icon: Puzzle },
   { path: '/knowledge',   label: '知识库',    icon: BookOpen },
   { path: '/groups',      label: '群聊设置',  icon: MessageSquare },
   { path: '/bot-detect', label: 'Bot 检测',  icon: ScanEye },
   { path: '/summary',    label: '群聊总结',  icon: ScrollText },
+  { path: '/draw-novelai', label: '绘图 · NovelAI', icon: Palette },
+  { path: '/draw-pixai', label: '绘图 · PixAI', icon: ImageIcon },
 ]
 
 /** 增强插件导航 — 按插件发现结果动态填充 */
@@ -56,7 +59,7 @@ onMounted(async () => {
 
 <template>
   <nav class="sidebar">
-    <div class="sidebar-brand"><Diamond :size="14" class="brand-icon" />粟藜bot控制面板</div>
+    <div class="sidebar-brand"><Diamond :size="14" class="brand-icon" />暮恩控制面板</div>
     <ul>
       <li v-for="item in coreItems" :key="item.path">
         <router-link

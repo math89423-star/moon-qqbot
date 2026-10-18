@@ -176,13 +176,37 @@ class ProactiveScheduler:
                 if not result.allowed:
                     continue
 
+                # ── 荷尔蒙曲线: 静默巡检 + 主动意愿加权 ──
+                #   1) sweep: 戏打到一半人不见了 → 记一次"中断", 给下次开口当燃料
+                #   2) weight: >1 提权 (快要忍不住) / ==1 中性 (接线前行为) / <1 抑制 (余韵/冷淡)
+                _score = 0.5
+                try:
+                    from astrbot_plugin_suli_tavern.service import hormone_bridge as _hb
+
+                    _bid = _hb.current_bot_id()
+                    if _bid:
+                        _hb.sweep(
+                            _bid, user_id,
+                            silence_s=max(0.0, float(self._rel.idle_minutes(user_id)) * 60.0),
+                            private=True,
+                        )
+                        _w = float(_hb.proactive_weight(_bid, user_id))
+                        if _w < 1.0 and random.random() > max(0.0, _w):
+                            logger.info(
+                                "主动行为被荷尔蒙抑制: user=%s w=%.2f", user_id[:8], _w,
+                            )
+                            continue
+                        _score = 0.5 * max(1.0, _w)
+                except Exception:
+                    logger.debug("荷尔蒙加权失败 (不影响主动行为)", exc_info=True)
+
                 # 加入候选池
                 candidate = ProactiveCandidate(
                     reason=result.reason,
                     action=result.action,
                     motive=result.motive,
                     source="scheduler",
-                    score=0.5,
+                    score=_score,
                 )
                 if self._pool.offer(candidate):
                     # 安排下一次检查

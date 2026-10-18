@@ -16,11 +16,13 @@
 from __future__ import annotations
 
 import contextvars
+import contextlib
 import copy
 import inspect
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -30,7 +32,6 @@ from urllib.parse import urlparse
 from astrbot.api import logger
 from astrbot_plugin_suli_services import format_web_results, get_knowledge_base, web_search
 
-from ..service.lport_api import LPortClient
 from ..sticker_sender import get_available_tags, send_sticker_by_tag
 
 # ═══════════════════════════════════════════════════════════════
@@ -135,6 +136,55 @@ _current_bot_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_bot_id", default="",
 )
 
+# ── 模块级共享 bot_id (执行器路径读不到 contextvars) ──
+_shared_bot_id: str = ""
+
+
+def set_shared_bot_id(bot_id: str) -> None:
+    """在后台任务派发前设置共享 bot_id (执行器读不到 contextvars 时用)。"""
+    global _shared_bot_id
+    _shared_bot_id = bot_id
+
+
+def get_shared_bot_id() -> str:
+    """获取共享 bot_id (无 context 路径 fallback)。"""
+    return _shared_bot_id
+
+
+# ── 模块级共享「本次场景」(跨任务执行读不到 contextvars) ──
+# 只用于绘图访问策略判定 NSFW 通路 (计费后端准入), 不参与任何内容生成。
+# 群=群号 / 私聊=""; 与 set_shared_bot_id 同源同生命周期 (dispatcher 派发前压)。
+_shared_group_id: str = ""
+
+
+def set_shared_scene(group_id: str) -> None:
+    """在后台任务派发前设置共享群号 (私聊传空串)。"""
+    global _shared_group_id
+    _shared_group_id = str(group_id or "")
+
+
+def get_shared_scene() -> str:
+    """获取共享群号 (无 context 路径 fallback)。空串 = 私聊/未知 → NSFW 群通路判定失败 (fail-closed)。"""
+    return _shared_group_id
+
+
+# ── 跨进程共享「触发原文」(pixiv 单图压回看触发原文用) ──
+# 后台任务路的执行器拿不到 scheduler 上下文，只能靠模块级共享。
+# dispatcher 派发前压入本次触发用户原文 (前 200 字)，pixiv 单图判定同时看
+# agent 传的 user_message 与该原文；任务结束由 dispatcher 覆盖，无需弹出。
+_shared_trigger_text: str = ""
+
+
+def set_shared_trigger_text(text: str) -> None:
+    """在后台任务派发前设置触发原文。"""
+    global _shared_trigger_text
+    _shared_trigger_text = str(text or "")[:200]
+
+
+def get_shared_trigger_text() -> str:
+    """获取触发原文 (空串 = 未知，调用方回退只看 user_message)。"""
+    return _shared_trigger_text
+
 
 # ── Per-bot 拒绝文案风格映射 ────────────────────────────
 # 每个 bot 通过角色卡的角色特征 (role_description) 匹配对应的拒绝文案风格。
@@ -233,6 +283,17 @@ def _get_tool_rejection(bot_id: str, gate_type: str, **kwargs) -> str:
             f"⛔ 绘图冷却中 (还需等待约 {remain_str})。\n"
             f"你是{bot_name}——用{style_label}让对方稍等。\n"
             f"· 语气{tone_hint}，让人感觉你在认真处理。"
+        )
+
+    if gate_type == "image_gen_master_only":
+        return (
+            f"⛔ 按着 Pixiv 参考图直挂绘制 (Vibe) 是主人的专属功能。\n"
+            f"你是{bot_name}——用{style_label}自然地告诉对方：找参考角色可以，"
+            f"但直挂参考图目前只给主人开放。\n"
+            f"· 正确链路：先调 describe_pixiv_refs 读已暂存图的特征，"
+            f"再用纯文字调 generate_image (不要传 use_pixiv_refs)。\n"
+            f"· 知名角色 NovelAI 可直出，不必逐字照抄特征。\n"
+            f"· 语气{tone_hint}不伤人。不要提「主人」「权限」这类词，用「我这边」带过。"
         )
 
     if gate_type == "tool_affinity":
@@ -358,6 +419,289 @@ def _get_draw_cooldown_seconds() -> int:
             pass
     return _DRAW_COOLDOWN_SECONDS_DEFAULT
 
+
+def _get_draw_min_level(bot_id: str, tool_name: str, fallback: int = 2) -> int:
+    """执行层绘图门槛跟随面板 (2026-10-16 Lv0 下发案)。
+
+    真相源与 Gate 层一致: bot_config.get_tool_min_affinity per-bot 值。
+    面板下发 Lv0 时执行层同步放行 Lv0, 不再写死 Lv.2。
+    """
+    try:
+        from ..service.bot_config import get_config_service
+        return int(get_config_service().get_tool_min_affinity(bot_id or "", tool_name))
+    except Exception:
+        return fallback
+
+# ── 绘图预检缓存: 先验 API 通不通，再花 180s 生图 ──# key: (base_url, model) → (ok, timestamp, reason)。通则 5 分钟内不再探，
+# 不通则 1 分钟内直接失败，避免每次用户请求都撞一次墙。
+_DRAW_PROBE_CACHE: dict[tuple[str, str], tuple[bool, float, str]] = {}
+_DRAW_PROBE_OK_TTL = 300.0
+_DRAW_PROBE_FAIL_TTL = 60.0
+
+_DRAW_PROBE_FAIL_TEXT: dict[str, str] = {
+    "auth": "❌ 绘图 API 认证失败（预检），请联系管理员检查 API Key。",
+    "rate": "⏳ 绘图 API 繁忙（预检），请稍等片刻后再试。",
+    "network": "❌ 绘图服务连接失败（预检不通），请稍后重试。",
+}
+
+
+def _draw_switch(bot_id: str, tool_name: str) -> bool:
+    """绘图总开关 — 默认关闭 (面板可按 bot 重开)。查不到归属时放行，异常时关闭。"""
+    if not bot_id:
+        return True
+    try:
+        from ..service.bot_config import get_config_service
+        return get_config_service().is_tool_enabled(bot_id, tool_name)
+    except Exception:
+        logger.warning("🎨 [Tool] 绘图开关检查异常, fail-closed", exc_info=True)
+        return False
+
+
+# ── 新绘图后端分发: 面板绘图分配 (NovelAI / PixAI) + 访问策略 ──
+
+def _resolve_draw_backend(
+    bot_id: str, user_id: str = "", group_id: str = "", *, private: bool = False,
+) -> tuple[str, dict, dict]:
+    """读面板绘图分配 + 应用访问策略。返回 (provider, novelai_cfg, pixai_cfg)。
+
+    provider ∈ novelai / pixai / none，且已是**生效**后端 (2026-10-12 用户裁定):
+      - 计费后端 (pixai) 仅主人可用，或主人 NSFW 通路；非主人自动降级到 novelai，
+        用户侧无感 (不报错、不改口吻)，降级只进日志。
+      - novelai_cfg["model"] 已按身份分档 (2026-10-14 起双档统一 V5 full：
+        主人 high / 普通用户 medium，默认 full，用户点名才 curated)；
+        novelai_cfg["model_alt"] 是另一档，供「带参考图但本档不支持 Vibe」时改用。
+    异常时 fail-closed 返回 none。
+    """
+    try:
+        from ..service.draw_access import resolve_route
+
+        route = resolve_route(
+            bot_id or "", user_id=user_id, group_id=group_id, private=private,
+        )
+        if route.downgraded or route.is_metered:
+            logger.info("🎨 绘图路线: %s", route.log_line(bot_id=bot_id, user_id=user_id))
+        return route.provider, dict(route.novelai), dict(route.pixai)
+    except Exception:
+        logger.warning("🎨 [Tool] 绘图分配读取异常, fail-closed", exc_info=True)
+        return "none", {}, {}
+
+
+def _scene_group_id(ctx: dict | None) -> str:
+    """本次工具调用所在的群号 (无 context 路径回退到模块级共享场景)。空串 = 私聊/未知。"""
+    _gid = str((ctx or {}).get("group_id", "") or "").strip()
+    if _gid and _gid != "0":
+        return _gid
+    return get_shared_scene()
+
+
+def _is_private_ctx(ctx: dict | None) -> bool:
+    """本次工具调用是否私聊上下文。
+
+    显式 ctx["private"] 优先 (宿主可注入)；缺省按「有 group_id 就是群聊」推断，
+    group_id 缺失/为 0 → 私聊 (与 nsfw_zone 的 `not group_id` 口径一致)。
+    """
+    _explicit = (ctx or {}).get("private")
+    if isinstance(_explicit, bool):
+        return _explicit
+    return not _scene_group_id(ctx)
+
+
+def _pick_novelai_model(ncfg: dict, *, has_refs: bool) -> tuple[str, str]:
+    """按「本次是否带参考图」定 NovelAI 模型 → (model, note)。
+
+    语义与 draw_access.DrawRoute.pick_model 同源: 档位模型 (主人 V5 / 普通 V4.5)
+    不支持 Vibe 时，带参考图的这一次改用另一档里支持 Vibe 的模型 —— 否则参考图
+    会被静默丢弃 (V5 实测 500, 见 AGENT.md §9.2)。note 只进日志。
+    候选只取面板的另一档 (ncfg["model_alt"]), 不引入代码内置模型 ——
+    面板是模型真相源 (原则 24): 两档都是 V5 就该丢图告警，不绕开配置。
+    """
+    try:
+        from ..service.draw_access import supports_vibes
+    except Exception:  # pragma: no cover - 兜底
+        def supports_vibes(m: str) -> bool:  # type: ignore[misc]
+            return "diffusion-4" in str(m or "").lower()
+
+    _m = str(ncfg.get("model") or "nai-diffusion-5-full")
+    if not has_refs:
+        return _m, ""
+    if supports_vibes(_m):
+        return _m, ""
+    _alt = str(ncfg.get("model_alt") or "")
+    if _alt and _alt != _m and supports_vibes(_alt):
+        return _alt, "vibe_carve_out"
+    # 双档统一 V5 后无档支持 Vibe：参考图只支持 V4.5，回落硬编码 V4.5
+    return "nai-diffusion-4-5-full", "vibe_fallback_v45"
+
+
+def _draw_backend_missing_text(provider: str, missing_key: bool) -> str:
+    """后端未就绪时的角色化回复 (不断言自己没功能)。"""
+    if missing_key:
+        which = "NovelAI Token" if provider == "novelai" else "PixAI Key"
+        return (
+            f"⛔ 绘图后端还没配好 ({which}为空)。不要说自己「没有生图功能」。按你的角色风格自然表达：\n"
+            "「画画的钥匙还没插上呢，等管理员配好就能帮你画啦～」\n"
+            "说完就停，不追加追问。"
+        )
+    return (
+        "⛔ 绘图功能当前未配置。你的画图能力是正常的——只是后端配置暂未就绪。\n"
+        "不要说自己「没有生图功能」。按你的角色风格自然表达：\n"
+        "「画图功能还在准备中呢，等管理员配好就能帮你画啦～」\n"
+        "说完就停，不追加追问。"
+    )
+
+
+def _max_vibes() -> int:
+    """单次参考图张数上限 (成本护栏)。
+
+    2026-10-14 用户裁定：限定只能加 1 张。默认锁 1 张，确实需要更多时置
+    env SULI_NAI_MAX_VIBES=2..16 放宽 (官方上限 16，>4 张每次生成 (N-4)×2 Anlas)。
+    """
+    try:
+        n = int((os.getenv("SULI_NAI_MAX_VIBES", "") or "1").strip())
+    except Exception:
+        n = 1
+    return max(1, min(16, n))
+
+
+def _apply_v5_effort_and_variant(
+    model: str, steps: int, tier: str, params: dict | None, prompt: str = "",
+) -> tuple[str, int, str, str]:
+    """V5 双档统一：effort high/medium + curated 可切 → (model, steps, sampler, effort)。
+
+    - tier=master → high：保持面板 steps（默认 23），全功能。
+    - tier=public → medium：强制 steps=14 + sampler=k_euler_ancestral（官方 medium 口径：
+      只跑 14 步、只认 Euler Ancestral，约省 42% 用量；自定义 UC/ guidance rescale 不可用）。
+    - 默认 full；用户明确要 curated（params.model 含 curated，或 prompt 含 curated/精修版）
+      才切同家族 curated 版（v5-full→v5-curated）。
+    非 V5 模型原样返回（V4.5 参考图链不受 effort 影响）。
+    """
+    m = str(model or "nai-diffusion-5-full")
+    t = str(tier or "public").lower()
+    _p = params or {}
+    _pm = str(_p.get("model") or "").lower()
+    _pt = f"{prompt} {str(_p.get('variant') or '')}".lower()
+    want_curated = ("curated" in _pm) or ("curated" in _pt) or ("精修" in _pt)
+    if want_curated and "diffusion-5-full" in m.lower():
+        m = "nai-diffusion-5-curated"
+    elif want_curated and "diffusion-4-5-full" in m.lower():
+        m = "nai-diffusion-4-5-curated"
+    if "diffusion-5" not in m.lower():
+        return m, int(steps or 23), "", "high" if t == "master" else "std"
+    if t == "master":
+        return m, int(steps or 23), "", "high"
+    return m, 14, "k_euler_ancestral", "medium"
+
+
+def _collect_draw_urls(params: dict, tool_context: dict | None) -> list[str]:
+    """汇总本次请求的参考图 URL (去重保序)。
+
+    来源: params.image_urls (LLM 显式数组) → params.image_url (单值) →
+    tool_context._pending_source_image_urls / _pending_source_image_url (宿主注入)。
+    """
+    out: list[str] = []
+    _many = (params or {}).get("image_urls")
+    if isinstance(_many, (list, tuple)):
+        out.extend(str(x).strip() for x in _many if str(x or "").strip())
+    _one = str((params or {}).get("image_url") or "").strip()
+    if _one:
+        out.append(_one)
+    _ctx = tool_context or {}
+    _ctx_many = _ctx.get("_pending_source_image_urls")
+    if isinstance(_ctx_many, (list, tuple)):
+        out.extend(str(x).strip() for x in _ctx_many if str(x or "").strip())
+    _ctx_one = str(_ctx.get("_pending_source_image_url") or "").strip()
+    if _ctx_one:
+        out.append(_ctx_one)
+    _seen: set[str] = set()
+    return [u for u in out if not (u in _seen or _seen.add(u))]
+
+
+async def _collect_ref_images(urls: list[str], limit: int = 16) -> list[bytes]:
+    """把多张参考图 URL 收集成 bytes 列表 (Vibe Transfer 用)。
+
+    预下载缓存 (OneBot get_image 拿到的) 优先，其次直接下载；
+    单张失败跳过，不整体失败。limit 对应 NovelAI 单次上限 16 张。
+    """
+    out: list[bytes] = []
+    for u in (urls or [])[:limit]:
+        _u = str(u or "").strip()
+        if not _u:
+            continue
+        try:
+            _b = get_cached_qq_image(_u) or await _download_ref_bytes(_u)
+            if _b:
+                out.append(_b)
+        except Exception:
+            logger.warning("🎨 参考图获取失败 (跳过): %.70s", _u)
+    return out
+
+
+async def _download_ref_bytes(url: str, timeout_sec: int = 30, max_bytes: int = 10 * 1024 * 1024) -> bytes:
+    """下载参考图 (QQ 图片 CDN)。仅 http(s)，超限/失败抛错。"""
+    import aiohttp
+
+    u = (url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        raise ValueError("参考图 URL 非法")
+    timeout_obj = aiohttp.ClientTimeout(total=timeout_sec)
+    async with (
+        aiohttp.ClientSession(timeout=timeout_obj, trust_env=False) as sess,
+        sess.get(u) as resp,
+    ):
+        if not 200 <= resp.status < 300:
+            raise ValueError(f"参考图下载失败 {resp.status}")
+        data = await resp.read()
+    if not data or len(data) > max_bytes:
+        raise ValueError("参考图为空或过大")
+    return data
+
+
+_DRAW_SWITCH_OFF_TEXT = (
+    "⛔ 绘图功能暂时关闭了。不要说自己「没有生图功能」。按你的角色风格自然表达：\n"
+    "「画画功能暂时休息中，以后开放了再帮你画～」\n"
+    "说完就停，不追加追问。"
+)
+
+
+async def _probe_draw_api(bot_id: str, vlm_cfg) -> tuple[bool, str]:
+    """绘图 API 预检 (带缓存)。返回 (ok, 用户侧文案; ok 时为空串)。
+
+    失败不扣日限额、不进冷却——纯粹是“路不通”，不是“用完了”。
+    """
+    import time as _time
+
+    key = (vlm_cfg.base_url or "", vlm_cfg.model_name or "")
+    now = _time.time()
+    hit = _DRAW_PROBE_CACHE.get(key)
+    if hit is not None:
+        _ok, _ts, _reason = hit
+        _ttl = _DRAW_PROBE_OK_TTL if _ok else _DRAW_PROBE_FAIL_TTL
+        if now - _ts < _ttl:
+            if _ok:
+                return True, ""
+            return False, _DRAW_PROBE_FAIL_TEXT.get(
+                _reason, f"❌ 绘图服务异常（预检 {_reason}），请稍后重试。",
+            )
+    try:
+        _draw = _deps.draw_client
+        _client = _draw.ImageGenClient(
+            api_key=vlm_cfg.api_key or "",
+            base_url=vlm_cfg.base_url or "",
+            model=vlm_cfg.model_name or "",
+        )
+        ok, reason = await _client.probe()
+    except Exception:
+        logger.warning("🎨 [Tool] 绘图预检异常 bot=%s", bot_id, exc_info=True)
+        ok, reason = False, "network"
+    _DRAW_PROBE_CACHE[key] = (ok, now, reason)
+    if ok:
+        logger.info("🎨 [Tool] 绘图预检通过 bot=%s model=%s", bot_id, vlm_cfg.model_name)
+        return True, ""
+    logger.warning("🎨 [Tool] 绘图预检失败 bot=%s model=%s reason=%s", bot_id, vlm_cfg.model_name, reason)
+    return False, _DRAW_PROBE_FAIL_TEXT.get(
+        reason, f"❌ 绘图服务异常（预检 {reason}），请稍后重试。",
+    )
+
 # ── 生图侧通道: 工具生成的图片字节暂存于此 (per-bot) ──
 # run_tool_loop 的调用方在拿到文本回复后应检查并发送这些图片，
 # 然后调用 clear_pending_images(bot_id) 清空。
@@ -443,6 +787,190 @@ def clear_pending_images(bot_id: str) -> None:
     _pending_images.pop(bot_id, None)
 
 
+# ── 最近一次生成图 (per bot:user) ──────────────────────────────────
+# 「把衣服换成…重绘」「改成…再来一张」这类诉求指的就是刚生成的那张图，
+# 但图是 bytes 直发 QQ、没有可回填的 URL，LLM 只能交白卷
+# (线上事故: edit_image 收到 image_url=空 → 以图生图失败)。
+# 此处按 (bot, user) 留一份最近成图 bytes，作 edit_image 的兜底源图。
+_last_draw_images: dict[str, tuple[bytes, float]] = {}
+_LAST_DRAW_TTL = 3600.0   # 1 小时: 超过视为换了话题，不复用旧图
+_LAST_DRAW_MAX = 64       # 最多 64 个 (bot,user) 条目
+
+
+def set_last_draw_image(bot_id: str, user_id: str, data: bytes) -> None:
+    """记住该 (bot, user) 最近一次生成的图 bytes。"""
+    if not data:
+        return
+    key = f"{bot_id}:{user_id}" if (bot_id or user_id) else ""
+    if not key:
+        return
+    now = time.time()
+    if key not in _last_draw_images and len(_last_draw_images) >= _LAST_DRAW_MAX:
+        for _k in [k for k, (_, ts) in _last_draw_images.items() if now - ts > _LAST_DRAW_TTL]:
+            _last_draw_images.pop(_k, None)
+        while len(_last_draw_images) >= _LAST_DRAW_MAX:
+            _oldest = min(_last_draw_images, key=lambda k: _last_draw_images[k][1])
+            _last_draw_images.pop(_oldest, None)
+    _last_draw_images[key] = (data, now)
+
+
+def get_last_draw_image(bot_id: str, user_id: str) -> bytes:
+    """取该 (bot, user) 最近一次生成图 bytes；无 / 已过期返回 b""。"""
+    key = f"{bot_id}:{user_id}" if (bot_id or user_id) else ""
+    hit = _last_draw_images.get(key)
+    if not hit:
+        return b""
+    data, ts = hit
+    if time.time() - ts > _LAST_DRAW_TTL:
+        _last_draw_images.pop(key, None)
+        return b""
+    return data
+
+
+# ── Pixiv 参考图暂存 (对着画流程用) ──────────────────────────
+# pixiv_search 发完美图后把图 bytes 留一份在这里 (内存, 10 分钟有效, 取一次即删),
+# generate_image 置 use_pixiv_refs=true 时挂载为 Vibe 参考。
+# 只存安全图 (搜图侧已过滤 R-18); 存 bytes 不存 URL —— Pixiv CDN 防盗链,
+# 通用下载器拿不到, 而搜图时已经下好在手里了。
+# 上限 3 张/键: Vibe 编码 2 Anlas/张, 且搜图单次最多发 2 张。
+_PENDING_PIXIV_REFS: dict[str, tuple[list, float]] = {}
+_PENDING_PIXIV_TTL = 600.0
+_PENDING_PIXIV_MAX_KEYS = 64
+_PENDING_PIXIV_MAX_IMGS = 3
+
+
+def _pixiv_ref_key(bot_id: str, user_id: str) -> str:
+    return f"{bot_id}:{user_id}" if (bot_id or user_id) else ""
+
+
+def set_pending_pixiv_refs(bot_id: str, user_id: str, items: list) -> int:
+    """暂存 Pixiv 参考图 [(illust_id, bytes), ...]。返回实际存下张数。"""
+    key = _pixiv_ref_key(bot_id, user_id)
+    clean: list = []
+    for _iid, _b in (items or [])[:_PENDING_PIXIV_MAX_IMGS]:
+        if _b and len(_b) > 0:
+            clean.append((int(_iid or 0), _b))
+    if not key or not clean:
+        return 0
+    now = time.time()
+    if key not in _PENDING_PIXIV_REFS and len(_PENDING_PIXIV_REFS) >= _PENDING_PIXIV_MAX_KEYS:
+        for _k in [k for k, (_, ts) in _PENDING_PIXIV_REFS.items() if now - ts > _PENDING_PIXIV_TTL]:
+            _PENDING_PIXIV_REFS.pop(_k, None)
+        while len(_PENDING_PIXIV_REFS) >= _PENDING_PIXIV_MAX_KEYS:
+            _oldest = min(_PENDING_PIXIV_REFS, key=lambda k: _PENDING_PIXIV_REFS[k][1])
+            _PENDING_PIXIV_REFS.pop(_oldest, None)
+    _PENDING_PIXIV_REFS[key] = (clean, now)
+    return len(clean)
+
+
+def pending_pixiv_count(bot_id: str, user_id: str) -> int:
+    """有效暂存参考图张数 (过期自动清理)。"""
+    key = _pixiv_ref_key(bot_id, user_id)
+    hit = _PENDING_PIXIV_REFS.get(key)
+    if not hit:
+        return 0
+    items, ts = hit
+    if time.time() - ts > _PENDING_PIXIV_TTL:
+        _PENDING_PIXIV_REFS.pop(key, None)
+        return 0
+    return len(items)
+
+
+def pop_pending_pixiv_refs(bot_id: str, user_id: str, limit: int = 3) -> list:
+    """取出并删除暂存参考图 [(illust_id, bytes), ...]。取一次即删, 防串单。"""
+    key = _pixiv_ref_key(bot_id, user_id)
+    hit = _PENDING_PIXIV_REFS.pop(key, None)
+    if not hit:
+        return []
+    items, ts = hit
+    if time.time() - ts > _PENDING_PIXIV_TTL:
+        return []
+    return list(items[:max(0, limit)])
+
+
+def peek_pending_pixiv_refs(bot_id: str, user_id: str, limit: int = 2) -> list:
+    """只读暂存参考图 (不消费, VLM 特征提取用; Vibe 挂载仍走 pop)。"""
+    key = _pixiv_ref_key(bot_id, user_id)
+    hit = _PENDING_PIXIV_REFS.get(key)
+    if not hit:
+        return []
+    items, ts = hit
+    if time.time() - ts > _PENDING_PIXIV_TTL:
+        _PENDING_PIXIV_REFS.pop(key, None)
+        return []
+    return list(items[:max(0, limit)])
+
+
+def _is_draw_master(bot_id: str, user_id: str) -> bool:
+    """是否为绘图口径的主人 (draw_access.is_master, fail-closed)。"""
+    if not str(user_id or "").strip():
+        return False
+    try:
+        from ..service.draw_access import is_master as _is_m
+        return bool(_is_m(bot_id, user_id))
+    except Exception:
+        return False
+
+
+def _in_nsfw_scene(bot_id: str, group_id: str, user_id: str, private: bool) -> bool:
+    """当前上下文是否命中 NSFW 白名单场景 (fail-closed)。"""
+    try:
+        from ..service.nsfw_zone import is_nsfw_zone_any as _zone
+        return bool(_zone(bot_id, group_id, user_id, private=private))
+    except Exception:
+        return False
+
+
+def _tool_ctx_nsfw(ctx: dict | None) -> bool:
+    """工具上下文是否处于 NSFW 场景 (VLM 槽位选择用; fail-closed → False)。
+
+    uid 取法与 pixiv/确认门同源: ctx.trigger_user_id → 记忆上下文 → 任务级共享触发人。
+    群号取法: ctx.group_id → 模块级共享场景 (dispatcher 派发前压入, 后台任务路可读)。
+    """
+    c = ctx or {}
+    bot_id = str(c.get("bot_id", "") or "") or _current_bot_id.get()
+    if not bot_id:
+        return False
+    _uid = str(c.get("trigger_user_id", "") or "")
+    if not _uid:
+        try:
+            _uid = str(_get_memory_ctx().get("trigger_user_id", "") or "")
+        except Exception:
+            _uid = ""
+    if not _uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv_znsfw
+            _uid = str(_trigger_cv_znsfw() or "")
+        except Exception:
+            _uid = ""
+    return _in_nsfw_scene(bot_id, _scene_group_id(c), _uid, _is_private_ctx(c))
+
+
+# ── 非主人 NSFW 请求拦截（2026-10-14 用户裁定：NSFW 只对 Master 豁免）──
+# 身份一律 QQ 号（trigger_user_id）比对，名称可改号不变，名称不参与判定。
+# 命中即礼貌拒绝，不调 API、不计次数、不落盘。
+_NSFWR_PATTERNS = (
+    "r18", "r-18", "18禁", "里番", "本子", "黄图", "黄片", "色图", "涩图",
+    "涩涩", "开车", "无码", "有码", "裸体", "全裸", "裸聊", "情趣", "调教",
+    "触手", "足交", "胸交", "乳交", "自慰", "手冲", "做爱", "性交", "口交",
+    "hentai", "porn", "nude", "naked", "nsfw", "sex", "pornhub",
+    "脱衣", "脱光", "一丝不挂", "酥胸", "巨乳", "爆乳", "内衣秀", "情趣内衣",
+)
+
+
+def _is_nsfw_request(text: str) -> bool:
+    """请求文本是否含明确 NSFW 诉求（ fail-open：无文本/空 → False）。"""
+    _s = str(text or "").strip().lower()
+    if not _s:
+        return False
+    return any(_k in _s for _k in _NSFWR_PATTERNS)
+
+
+def _nsfw_master_only_text(bot_id: str = "") -> str:
+    """非主人 NSFW 礼貌拒绝（短，不说教不泄名单）。"""
+    return "抱歉，这个请求是主人专属哦～需要的话可以找主人确认。说完就停，不追加追问。"
+
+
 # ── 生图即时通知回调: 在生图 API 调用前发送「收到，正在生成...」 ──
 # run_tool_loop 的调用方设置此回调，execute_generate_image / execute_edit_image
 # 在开始 API 调用前通过此回调发送即时确认消息。
@@ -461,8 +989,104 @@ def clear_notice_sender() -> None:
     _notice_sender = None
 
 
-# 全局 L-Port 客户端 (延迟初始化)
-_lport: LPortClient | None = None
+# ── 开画固定短语 (用户裁定 2026-10-11)：API 真正开调前回一条，证明任务确实进行了 ──
+# 双通道统一：tavern 路经 _notice_sender 发，后台任务路经下面的 hook 发（notice 被 suppress）。
+# 2026-10-12 起按 bot 个性化 (draw_start_brace); 常量保留作缺省兜底。
+DRAW_START_BRACE = "{图片生成中}"
+
+
+def _brace_name(bot_id: str = "") -> str:
+    """开画短语用角色名 (拿不到走中性版, 永不抛异常)。"""
+    try:
+        from ..service.tavern_client import get_character_for_self_id as _get_card
+        return str((_get_card(str(bot_id or "")) or {}).get("name", "") or "")
+    except Exception:
+        return ""
+
+
+def draw_start_brace(bot_id: str = "") -> str:
+    """按 bot 个性化的开画短语。括号短句, 进群不扎眼。
+
+    bot 为空/未知时回缺省常量 (拿不到 bot 身份时别乱套人设)。
+    """
+    if not str(bot_id or "").strip():
+        return DRAW_START_BRACE
+    _n = _brace_name(bot_id)
+    if "暮恩" in _n:
+        return "（落笔了，等着收图）"
+    return DRAW_START_BRACE
+
+# ── 开画钩子 (后台任务路用)：key = f"{bot_id}:{trigger_uid}"，一次性，fire 即删 ──
+# dispatcher 在后台任务派发前注册发送闭包；执行器在 probe 通过、POST 前 fire。
+# hook 没被 fire（agent 全程没调工具）→ dispatcher 事后 pop 丢弃，不会误发。
+_draw_start_hooks: dict[str, object] = {}
+
+
+def set_draw_start_hook(key: str, fn: object) -> None:
+    """注册开画钩子（覆盖同 key 旧钩）。"""
+    if key and fn is not None:
+        _draw_start_hooks[key] = fn
+
+
+def pop_draw_start_hook(key: str) -> None:
+    """丢弃开画钩子（幂等）。"""
+    _draw_start_hooks.pop(key, None)
+
+
+async def fire_draw_start_hook(bot_id: str, trigger_uid: str) -> bool:
+    """触发开画钩子（一次性）。返回是否真实发出。永不抛异常。"""
+    key = f"{bot_id}:{trigger_uid}" if bot_id or trigger_uid else ""
+    fn = _draw_start_hooks.pop(key, None) if key else None
+    if fn is None:
+        return False
+    try:
+        res = fn()  # type: ignore[operator]
+        if hasattr(res, "__await__"):
+            await res
+    except Exception:
+        logger.debug("开画钩子发送失败", exc_info=True)
+        return False
+    else:
+        logger.info("🎨 开画短语已发 bot=%s user=%s", bot_id, str(trigger_uid)[:8])
+        return True
+
+
+# ── spec tavern 专线 (bot_id → async provider)。dispatcher route=tavern 时用 ──
+# provider 签名: async (content, effort, max_tokens, temperature) -> str。
+# 由 group_chat 在回复管线内注册（持有 tavern 客户端）；未注册则回落 VLM 线。
+_spec_llm_providers: dict[str, object] = {}
+
+
+def set_spec_llm_provider(bot_id: str, fn: object) -> None:
+    """注册 spec tavern 专线 (同 bot 覆盖)。"""
+    if bot_id and fn is not None:
+        _spec_llm_providers[bot_id] = fn
+
+
+async def run_spec_via_tavern(
+    bot_id: str, content: str, effort: str, max_tokens: int, temperature: float,
+    *, nsfw: bool = False,
+) -> str:
+    """经 tavern 专线产 spec 文本。未注册/失败回空串（调用方回落 VLM 线）。
+
+    nsfw=True 透传给 provider（holder 决定用哪套 system）；provider 仍是旧 4 参签名时
+    自动降级调用，不因为多一个 kwarg 全线报错。
+    """
+    fn = _spec_llm_providers.get(bot_id)
+    if fn is None:
+        return ""
+    try:
+        try:
+            res = fn(content, effort, max_tokens, temperature, nsfw)  # type: ignore[operator]
+        except TypeError:
+            res = fn(content, effort, max_tokens, temperature)  # type: ignore[operator]
+        if hasattr(res, "__await__"):
+            res = await asyncio.wait_for(res, timeout=150.0)
+        return str(res or "")
+    except Exception:
+        logger.debug("spec tavern 专线失败 bot=%s", bot_id, exc_info=True)
+        return ""
+
 
 # ── 记忆工具上下文 (在 LLM 调用前由调用方设置) ──
 # per-bot: bot_id → ctx dict。结构:
@@ -484,30 +1108,60 @@ def clear_memory_context(bot_id: str) -> None:
     _memory_ctxs.pop(bot_id, None)
 
 
-# ── thread_summary 提取缓存 (per-bot) ──
+# ── thread_summary 提取缓存 (per-(bot,群,人)) ──
 # tools.py 在工具循环返回前从 LLM 回复中提取 <thread_summary> 标签内容，
-# 存入此缓存。group_chat.py 读取后写入 conversation_session 关注槽。
-# 这避免了标签泄漏到用户可见回复中，同时保留脉络数据不丢失。
+# 提取后直写 conversation_session 关注槽（追问时注入【当前对话脉络】）。
+# 缓存仅作兼容保留（历史调用方按 per-bot 读写）。
 _thread_summary_cache: dict[str, str] = {}
 
 
-def set_thread_summary_cache(bot_id: str, text: str) -> None:
-    """存入从 LLM 回复中提取的 thread_summary (per-bot)。"""
+def _ts_key(bot_id: str, group_id: str = "", user_id: str = "") -> str:
+    return f"{bot_id}:{group_id}:{user_id}"
+
+
+def set_thread_summary_cache(bot_id: str, text: str, group_id: str = "", user_id: str = "") -> None:
+    """存入从 LLM 回复中提取的 thread_summary。"""
     if text:
-        _thread_summary_cache[bot_id] = text
+        _thread_summary_cache[_ts_key(bot_id, group_id, user_id)] = text
 
 
-def get_thread_summary_cache(bot_id: str) -> str:
-    """读取并消费缓存的 thread_summary (per-bot)。
+def get_thread_summary_cache(bot_id: str, group_id: str = "", user_id: str = "") -> str:
+    """读取并消费缓存的 thread_summary。
 
     读取后立即清除，保证一次消费。
     """
-    return _thread_summary_cache.pop(bot_id, "")
+    return _thread_summary_cache.pop(_ts_key(bot_id, group_id, user_id), "")
 
 
-def clear_thread_summary_cache(bot_id: str) -> None:
-    """清除 thread_summary 缓存 (per-bot)。"""
-    _thread_summary_cache.pop(bot_id, None)
+def clear_thread_summary_cache(bot_id: str, group_id: str = "", user_id: str = "") -> None:
+    """清除 thread_summary 缓存。"""
+    _thread_summary_cache.pop(_ts_key(bot_id, group_id, user_id), None)
+
+
+def store_thread_summary(bot_id: str, group_id: str, user_id: str, text: str) -> bool:
+    """直写关注槽（追问时注入【当前对话脉络】用）。fail-safe：写不上只记 debug。
+
+    text 含 <thread_summary> 标签时只存标签内文本；不含标签时存正文裁剪
+    （供后台任务/任务台账这类不产标签的路径复用）。
+    """
+    _raw = str(text or "")
+    if not _raw.strip() or not str(bot_id or "").strip() or not str(user_id or "").strip():
+        return False
+    _m = re.search(r"<thread_summary>(.*?)</thread_summary>", _raw, re.DOTALL)
+    _body = (_m.group(1) if _m else _raw).strip()
+    if not _body:
+        return False
+    try:
+        _gid = int(str(group_id))
+    except (ValueError, TypeError):
+        logger.debug("thread_summary 直写跳过：group_id 非数字 (%r)", group_id)
+        return False
+    try:
+        from ..context.conversation_session import get_slot_manager
+        return bool(get_slot_manager().set_thread_summary(str(bot_id), _gid, str(user_id), _body))
+    except Exception:
+        logger.debug("thread_summary 直写失败", exc_info=True)
+        return False
 
 
 def _strip_xml_tool_calls(content: str) -> str:
@@ -535,11 +1189,12 @@ def _strip_xml_tool_calls(content: str) -> str:
     return _cleaned
 
 
-def _extract_thread_summary(content: str) -> str:
-    """从 LLM 回复中提取 <thread_summary> 标签，缓存，返回剥离后内容。
+def _extract_thread_summary(content: str, *, bot_id: str = "", group_id: str = "", user_id: str = "") -> str:
+    """从 LLM 回复中提取 <thread_summary> 标签，直写关注槽，返回剥离后内容。
 
-    1. 提取标签内容 → 缓存 (供 group_chat.py 写入 conversation_session)
+    1. 提取标签内容 → 直写关注槽 + 兼容缓存 (供追问时注入【当前对话脉络】)
     2. 剥离标签 → 防止泄漏到用户可见的回复中
+    ids 缺失时仅做剥离+缓存，不写槽（fail-safe）。
     """
     if '<thread_summary>' not in content:
         return content
@@ -549,12 +1204,31 @@ def _extract_thread_summary(content: str) -> str:
     )
     if _ts_match:
         _ts_text = _ts_match.group(1).strip()
-        _bid = _current_bot_id.get()
+        _bid = bot_id or _current_bot_id.get() or ""
+        _uid = user_id
+        if not _uid:
+            try:
+                _uid = _get_memory_ctx().get("trigger_user_id", "") or ""
+            except Exception:
+                _uid = ""
+        _gid = group_id
+        if not _gid:
+            try:
+                _gid = get_shared_scene() or ""
+            except Exception:
+                _gid = ""
         if _ts_text and _bid:
-            set_thread_summary_cache(_bid, _ts_text)
-            logger.debug(
-                "<thread_summary> 已提取缓存: %.60s", _ts_text,
-            )
+            set_thread_summary_cache(_bid, _ts_text, _gid, _uid)
+            if _uid and _gid:
+                _ok = store_thread_summary(_bid, _gid, _uid, _ts_text)
+                logger.debug(
+                    "<thread_summary> 已提取%s: %.60s",
+                    "直写槽" if _ok else "缓存（槽不可达）", _ts_text,
+                )
+            else:
+                logger.debug(
+                    "<thread_summary> 已提取缓存: %.60s", _ts_text,
+                )
     _ts_cleaned = re.sub(
         r'<thread_summary>.*?</thread_summary>',
         '', content, flags=re.DOTALL,
@@ -638,70 +1312,11 @@ def _resolve_memory_user(target_name: str = "") -> tuple[str, str]:
     return (trigger_uid, trigger_name)
 
 
-def get_lport_client() -> LPortClient:
-    """获取或创建 L-Port 客户端单例。"""
-    global _lport
-    if _lport is None:
-        _lport = LPortClient()
-    return _lport
-
-
 # ── 工具定义 (OpenAI Function Calling 格式) ─────────────
+# 注: L-Port 三件套已下线（2026-10-13，后端无容器，HTTP 127.0.0.1:5000 永不通）。
+# 用户问生图能力改由口头告知 + generate_image/edit_image 实际能力判定。
 
 TOOLS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_lport_status",
-            "description": (
-                "检查 L-Port 生图平台是否在线，获取系统状态摘要。"
-                "仅在用户明确询问「L-Port 状态」「生图系统是否正常」「你能生图吗」时调用。"
-                "【注意】此工具只检查 L-Port 自身，不涉及其他 bot/AstrBot/QQ/其他服务。"
-                "如果用户问的是其他 bot 或服务的问题，不要调用此工具——它们与 L-Port 无关。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_available_models",
-            "description": (
-                "获取 ComfyUI 当前可用的 AI 模型列表。"
-                "当群友问「有哪些模型」「支持什么 checkpoint/LoRA/VAE」「有没有 xxx 模型」时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filter_type": {
-                        "type": "string",
-                        "enum": ["checkpoint", "lora", "vae", "controlnet", "upscale", "all"],
-                        "description": "按模型类型筛选。默认 all 返回全部。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_custom_nodes",
-            "description": (
-                "获取 ComfyUI 已安装的自定义节点列表。"
-                "当群友问「支持哪些节点」「有没有 xxx 节点」「装了什么插件」时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -769,6 +1384,8 @@ TOOLS: list[dict] = [
                 "如果群内在热烈讨论, 可以简短有力; 如果群冷, 可以多展开一点\n"
                 "- 给出可操作的建议 — 不要只列信息, 告诉用户「这意味着你可以…」"
                 "或「建议你先试X再看Y」\n\n"
+                "检索自问表单（对标生图确认单，单相）：query 太泛（<4字无定向）或有时效词却无时间落点时，\n"
+                "本工具不盲搜，直接返回缺件反问（缺什么+给例子），你转述用户；用户补一句后你带新 query 再调。\n"
                 "搜索结果最多 6 条，会标注来源 URL 和发布日期。\n"
                 "⚠️ 回复原则: 把搜到的信息讲清楚——覆盖用户问的关键点，给出可操作的判断。\n"
                 "  不要逐条罗列搜索结果，也不要只丢一句结论。自然地综合几条来源的信息，\n"
@@ -800,11 +1417,72 @@ TOOLS: list[dict] = [
                             "可用 site:域名 限定来源 (如 site:github.com、site:zh.wikipedia.org)。\n"
                             "时效性查询加时间关键词 (如「2026年6月」「最新版本」)。\n"
                             "例如：「CS2 2026 总决赛 结果」「iPhone 17 发布时间」"
-                            "「Python 3.14 新特性 site:docs.python.org」「原神 最新版本 卡池」"
+                            "「Python 3.14 新特性 site:docs.python.org」「原神 最新版本 卡池」\n\n"
+                            "⚠️ 时间意识 (重要): 上下文中会告诉你当前日期。用户说「最近/近期/这周」时，"
+                            "你必须根据当前日期计算出具体时间范围，把「最近」翻译成精确的时间关键词。"
+                            "例如当前是 2026年8月，用户说「最近的新闻」→ 搜索「2026年8月」而非「2024年」。"
+                            "绝对不要用你的训练截止日期——用上下文给你的当前日期。"
                         ),
+                    },
+                    "time_range": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "时间过滤: day=近1天 week=近1周 month=近1月 year=近1年。用户说「近1周」等时填写此字段，SearXNG 会自动过滤过期结果。",
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": (
+                "🔧 在专属 Python Docker 小黑屋中执行代码片段 (Python/JavaScript/Bash)。\n"
+                "用途: 数据处理、计算、格式转换、生成图表、运行脚本、**生成字符画/ASCII art** 等。\n"
+                "★ 真隔离无外网: 跑在 per-bot 专属容器 (sandbox-loput/sandbox-luna)，不在 Bot 本机跑，\n"
+                "  运行时无外网 — pip install / curl 外网 / 网络请求一律不通，不要写这类代码。\n"
+                "  基础环境构建期已装好: Python numpy/pandas/scipy + matplotlib/seaborn + pillow + openpyxl，Node 可用。\n"
+                "  - 超时限制: 默认 30 秒，最大 90 秒\n"
+                "  - 输出截断: 单流 20000 字，超长自动截断\n"
+                "  - 容器资源: 1核/1G/256进程，/tmp 256M\n"
+                "★ 适用场景:\n"
+                "  - 数学计算: 计算表达式、统计分析\n"
+                "  - 数据处理: JSON/CSV 解析、格式转换 (pandas/openpyxl 已预装)\n"
+                "  - 文本处理: 正则匹配、字符串操作\n"
+                "  - 生成图表: matplotlib 可视化 — 必须 plt.savefig('output.png') 存相对路径，图会自动发给用户 (最多4张)\n"
+                "  - 运行脚本: Python/Node.js 代码，只用预装库\n"
+                "  - ★ 字符画/ASCII art: 用户说「画字符猫」「ASCII art」「字符画」时，用 print() 输出文本艺术\n"
+                "★ 不适用场景:\n"
+                "  - 需要持久化存储的任务 → 用 remember_memory (小黑屋重启/重建会丢 /tmp)\n"
+                "  - 需要生成真实图片/照片/绘画 → 用 generate_image (本工具只发代码画的图表)\n"
+                "  - 需要联网/装包的任务 → 直接告知做不了 (无外网)"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "bash"],
+                        "description": "编程语言 (默认 python)",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "要执行的代码片段。\n"
+                            "Python 示例: \"import json; data = {'a': 1, 'b': 2}; print(json.dumps(data, indent=2))\"\n"
+                            "JavaScript 示例: \"console.log(JSON.stringify({a: 1, b: 2}, null, 2))\"\n"
+                            "Bash 示例: \"echo 'Hello World'\""
+                        ),
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "超时时间 (秒), 默认 30, 最大 90",
+                        "default": 30,
+                    },
+                },
+                "required": ["code"],
             },
         },
     },
@@ -851,6 +1529,75 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["image_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_pixiv_refs",
+            "description": (
+                "🎨 读已暂存的 Pixiv 参考图, VLM 提取可重绘视觉特征。\n"
+                "仅当用户说「对着画/按这个画/照着画」, 且本轮 pixiv_search 已返回"
+                "「已暂存 N 张参考图」时调用。返回发色发型/眼睛/服装配饰/画风清单——"
+                "拿到后用这些特征组纯文字 prompt 调 generate_image"
+                "(不要传 use_pixiv_refs, 那是主人的 Vibe 直挂通道, 你没有)。"
+                "⚠️ 暂存没有/过期会当场告诉你, 先调 pixiv_search 再来。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "要读几张暂存参考图 (1-2, 默认 2)。",
+                        "minimum": 1,
+                        "maximum": 2,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_video",
+            "description": (
+                "🎬 调用视觉模型 (VLM) 解析 QQ 原生视频内容 (抽头/中/尾 3 帧一次看完)。\n"
+                "⚠️ 仅在用户明确要求看视频/讲讲视频内容时调用——"
+                "用户说「看看这个视频」「视频里讲了什么」等才触发。"
+                "不要主动解析任何视频，除非用户明确要求。上下文 [视频 URL: ...] 即为参数。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "video_url": {
+                        "type": "string",
+                        "description": "视频的 URL 地址（QQ 视频 URL，见 [视频 URL: ...] 标记）",
+                    },
+                },
+                "required": ["video_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_voice",
+            "description": (
+                "🎙️ 解析 QQ 语音内容 (下载→转写)。VLM 不支持音频输入时降级返回时长等元数据。\n"
+                "⚠️ 仅在用户明确要求听语音/转写时调用——"
+                "用户说「听听这条语音」「语音说了什么」「转写一下」等才触发。"
+                "上下文 [语音 URL: ...] 即为参数。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "voice_url": {
+                        "type": "string",
+                        "description": "语音的 URL 地址（见 [语音 URL: ...] 标记）",
+                    },
+                },
+                "required": ["voice_url"],
             },
         },
     },
@@ -915,6 +1662,35 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "resolve_character_identity",
+            "description": (
+                "🎭 生图表单补全 — 角色身份核验（本地圣经秒查 + 联网检索 + 自学习）。"
+                "生图任务缺 character_danbooru / identity 未核验时必须先调本工具，"
+                "不许凭记忆编 Danbooru tag、不许写 `X from Y` 自然语言、不许留中文名硬画。\n"
+                "输入中文角色 query（如「明日方舟 普瑞赛斯」「鸣潮 达妮娅」），"
+                "返回 5 行：danbooru / pixiv / name / series / features。"
+                "拿到 danbooru tag 后，把它顶到 generate_image prompt 最前面再开画；"
+                "返回空/失败时按通用画法并在复述里明示不确定，不硬编发色瞳色。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "角色检索串，含 IP/作品名+角色名（如「明日方舟 普瑞赛斯」）。",
+                    },
+                    "series_hint": {
+                        "type": "string",
+                        "description": "作品名兜底（可选，如 arknights）。",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_image",
             "description": (
                 "🎨 调用云端 AI 绘图模型生成二次元插画。\n"
@@ -922,24 +1698,40 @@ TOOLS: list[dict] = [
                 "1. 用户明确表达了「帮我画」「生成一张图」「画个xxx」「来张图」等强烈绘图意图\n"
                 "2. 用户提供了足够具体的画面描述 (不能只是「画个妹子」这种空泛描述)\n"
                 "3. 用户没有说「不要生图」「别画」「不用了」等拒绝语句\n"
-                "4. 这不是普通的聊天/讨论/询问——是明确的生成请求\n\n"
+                "4. 这不是普通的聊天/讨论/询问——是明确的生成请求\n"
+                "5. ★ 用户要的是真实图片/插画，**不是**字符画/ASCII art/文本艺术\n\n"
                 "🚫 不要调用的情况:\n"
                 "- 用户只是问「你能画图吗」「支持生图吗」→ 口头回答即可\n"
                 "- 用户在讨论绘画技巧/模型/参数 → 用 search_knowledge 回答\n"
                 "- 用户说「我想要xxx风格的图」但没有明确要你画 → 先确认再调用\n"
-                "- 用户在闲聊/玩梗/开玩笑 → 不要调用\n\n"
+                "- 用户在闲聊/玩梗/开玩笑 → 不要调用\n"
+                "- ★ 用户说「字符画」「ASCII art」「字符猫」「文本艺术」→ 用 execute_code，不是本工具\n\n"
                 "🔍 意图不清时——必须反问用户，禁止猜测后强行调用:\n"
                 "- 描述过于空泛 (「画个人物」「来张好看的」「画个帅哥/美女」) → 反问: "
                 "「你想要什么感觉的？有没有参考角色或作品？」\n"
                 "- 描述存在歧义 (同一句话可理解为多种完全不同的画面) → 反问确认\n"
                 "- 用户说的场景/角色你不熟悉 → 反问「你说的是xxx吗？能再描述一下吗？」\n"
-                "- 原则上: 仅当你能清晰勾勒出最终画面时才调用。模糊就反问，不猜。\n\n"
+                "- ★ 用户只说画一张图/帮我画画类而没有任何主体（人/物/场景/角色全没提）→ 不要调用，直接回复问画什么"
+                "（主体/风格/横竖任问一两个）。这和看着办是两回事："
+                "看着办=已有主体细节你定；没主体=不能定，编造发色瞳色服装场景"
+                "属于幻觉零容忍。user_raw 传用户原话，确认门会复核，无主体打回反问。\n"
+                "- 原则上: 仅当你能清晰勾勒出最终画面时才调用。模糊就反问，不猜。\n"
+                "- ★ 反问时默认自己有生图能力: 禁止说「没笔/不会画/没有生图功能/下次补上」——\n"
+                "  你是有画笔的，只是缺细节才问 (2026-10-11「手里没笔」教训)。\n"
+                "- ★ 双相确认铁律 (2026-10-11): 无论描述多清楚，首次调用 confirmed 留空/false——\n"
+                "  工具返回复述单 (译文+分辨率+模型) 由你转告用户；用户明确说执行后，\n"
+                "  下一轮带 confirmed=true 再次调用才真正生成。跳过复述直接生成=违规。\n"
+                "- ★ 用户说「看着办/你定/都行/都喜欢」= 明确授权你补全并执行，不是闲聊——\n"
+                "  必须调用本工具 (confirmed 空，走复述流程)，禁止只回 persona 话术不调工具\n"
+                "  (2026-10-11「看着办吧」零调用教训)。\n\n"
                 "📝 调用前必须完成创作需求整理 (见 prompt 参数说明):\n"
                 "扫描上文→补全细节→输出 prompt，绝不能直接复制用户原话。\n\n"
-                "⚠️ 系统限制 (非常昂贵，严格门控):\n"
-                "- 仅好感等级 ≥ Lv.3 (喜欢) 的用户可以使用\n"
-                "- 每人每天最多 3 张\n"
-                "- 生成默认竖图 (1024x1536)，约需 30-120 秒 (大图可达 180 秒)\n"
+                "⚠️ 系统限制 (执行侧按身份自动分级，你只管调用，不替用户判断够不够格):\n"
+                "- ★ 新朋友不要拒绝：好感低的用户照常调用本次工具——执行侧会自动转体验档"
+                "（V4.5，每日3次），用户侧只会收到图或体验说明。冒出“等级不够”类想法时掐掉，直接调用。\n"
+                "- NovelAI 通道：每人每天最多 5 张 (文生图/以图生图共享)\n"
+                "- PixAI 通道：需要更高信任（多聊一阵开放），每人每天最多 3 张 (文生图/以图生图共享)\n"
+                "- 尺寸走管理面板配置 (默认竖图 832x1216)，约需 30-120 秒 (大图可达 180 秒)\n"
                 "- 生成成功后会自动在聊天中发送图片\n"
                 "- ⛔ 超时后**禁止重试**！告知用户「生成超时，可能是服务器繁忙，稍后再试吧~」即可，不要再调用此工具"
             ),
@@ -969,6 +1761,13 @@ TOOLS: list[dict] = [
                             "补全原则: 略微发散让画面更生动——用户说「猫娘」可以补猫耳/尾巴/铃铛，"
                             "用户说「战斗」可以补战损披风/光影对比。但核心主体和场景必须与用户描述"
                             "一致，不要替换成别的东西。\n"
+                            "★ 角色同人：用户提到具体作品角色（如明日方舟普瑞赛斯/原神胡桃）时，"
+                            "prompt 开头先写你认为的官方英文名（Danbooru 格式，如 priestess (arknights)），"
+                            "再跟发色/瞳色/服装等关键外貌特征兜底——翻译层会再归一化。"
+                            "不知道官方名时写作品英文名+特征（如 arknights, 1girl, "
+                            "light flaxen short hair...），绝不能只丢中文名。"
+                            "冷门角色/拿不准时，复述单里主动问一句要不要去 Pixiv 找张参考图对着画。\n"
+                            "禁编造：不确定角色官方外貌时只写作品名+通用气质，不许编发色/瞳色/服装细节。"
                             "\n"
                             "第3步 输出: 将整理好的完整需求写为绘图 prompt。"
                             "**使用用户的主要语言** (中文用户→中文 prompt，英文用户→英文 prompt)，"
@@ -989,16 +1788,70 @@ TOOLS: list[dict] = [
                             "⚠️ 不要直接复制用户原话——必须扫描上文→补全→输出。"
                         ),
                     },
+                    "user_raw": {
+                        "type": "string",
+                        "description": (
+                            "【必填】触发这次绘图的用户原话（一字不差复制，不改写不扩写）。"
+                            "确认门用它核验主体是否真实来自用户：原话无主体却给了丰富"
+                            "prompt 会被打回反问；缺失本字段直接打回重调。"
+                            "拿 prompt 充数、编造原话等同幻觉零容忍。"
+                        ),
+                    },
+                    "image_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "🔗 参考图 URL 数组 (可选，最多 16 张) — 文生图时让画风/角色"
+                            "向这些图靠拢 (Vibe Transfer)。"
+                            "用户给了图但诉求是「画一张新的、参考这几张的风格/人物」时填这里"
+                            "(不是改图；要改图用 edit_image)。"
+                            "URL 取 system prompt 的 [绘图/编辑工具图片 URL] 区块，"
+                            "或用户消息中 [图片 URL: ...] 标签内的地址。"
+                            "⚠️ 无参考图时不要传本字段。"
+                        ),
+                    },
+                    "use_pixiv_refs": {
+                        "type": "boolean",
+                        "description": (
+                            "是否挂载已暂存的 Pixiv 参考图 (Vibe Transfer, 对着画)。"
+                            "仅当用户明确要「对着 Pixiv 的图画/按刚搜到的图画」，"
+                            "且本轮 pixiv_search 已返回「已暂存 N 张参考图」时传 true。"
+                            "用户只要美图、或没搜过图时不要传。"
+                            "⚠️ 仅主人可用，非主人传 true 会被确认门直接拒绝"
+                            "(非主人走 describe_pixiv_refs 读特征 + 纯文字绘制)；"
+                            "R-18 参考仅主人 NSFW 场景可见；"
+                            "NovelAI V5 档不支持 Vibe，挂载时会自动切到支持的档。"
+                        ),
+                    },
                     "orientation": {
                         "type": "string",
                         "enum": ["portrait", "landscape"],
                         "description": (
-                            "图片方向。竖图=portrait (1024x1536)，横图=landscape (1536x1024)。"
+                            "图片方向。竖图=portrait，横图=landscape。"
                             "默认 portrait (竖图)，用户明确要横图/宽图/全景时选 landscape。"
+                            "方向只定构图朝向，不决定分辨率。"
+                        ),
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": (
+                            "分辨率覆盖（可选，不传走管理面板全局）。"
+                            "仅限定档位内有效，超纲会被取整并如实告知用户："
+                            "NovelAI 通道填 WxH（832x1216/1216x832/1024x1024/512x768/768x512），"
+                            "PixAI 通道填 aspect[空格size]（如 16:9 / 16:9 1k）。"
+                            "用户说「大点/高清」但没给具体值时不要猜——直接沿用面板值，"
+                            "在复述单里由用户拍板。"
+                        ),
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "双相确认第二相：用户已对复述单明确说执行才传 true。"
+                            "首次组织好画面只传 prompt（工具返回复述文本，不生成）。"
                         ),
                     },
                 },
-                "required": ["prompt"],
+                "required": ["prompt", "user_raw"],
             },
         },
     },
@@ -1036,8 +1889,10 @@ TOOLS: list[dict] = [
                 "- 不确定用户是要 i2i 风格迁移还是局部编辑 → 反问确认模式\n"
                 "- 原则上: 仅当你能清晰描述修改目标时才调用。模糊就反问，不猜。\n"
                 "\n"
-                "⚠️ 系统限制: 好感≥Lv.3, 每日3张, 冷却3分钟 (与 generate_image 共享额度)\n"
-                "生成默认竖图 (1024x1536)，约需 10-30 秒。"
+                "⚠️ 系统限制 (执行侧按身份自动分级，你只管调用，不替用户判断够不够格)："
+                "新朋友照常调用，执行侧自动转体验档；PixAI 通道需要更高信任（多聊一阵开放）。"
+                "NovelAI 每日5张，PixAI 每日3张，冷却3分钟 (与 generate_image 共享额度)\n"
+                "尺寸走管理面板配置，约需 10-30 秒。"
             ),
             "parameters": {
                 "type": "object",
@@ -1049,6 +1904,18 @@ TOOLS: list[dict] = [
                             "如需指定: 从 system prompt 底部的 "
                             "[绘图/编辑工具图片 URL] 区块获取，"
                             "或提取用户消息中 [图片 URL: ...] 标签内的地址。"
+                            "要改的那张图填这里；额外的参考图 (风格/角色参考) 填 image_urls。"
+                        ),
+                    },
+                    "image_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "🔗 多张参考图的 URL 数组 (最多 16 张)。"
+                            "用户一次给了多张图 (「参考这几张」「照这几张的风格」"
+                            "「第一张的脸 + 第二张的衣服」) 时，把每一张的 URL 都填进来。"
+                            "系统把 image_url (或数组首张) 当作要改的底图，其余作风格/角色参考图。"
+                            "⚠️ 只发了一张图时不要用本字段，填 image_url 即可。"
                         ),
                     },
                     "prompt": {
@@ -1078,6 +1945,21 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "enum": ["portrait", "landscape"],
                         "description": "输出方向。默认 portrait。",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": (
+                            "分辨率覆盖（可选，不传走管理面板全局）。"
+                            "仅限定档位内有效：WxH（832x1216/1216x832/1024x1024/512x768/768x512）。"
+                            "超纲会被取整并如实告知用户；用户只说「大点」没给具体值时不要猜。"
+                        ),
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "双相确认第二相：用户已对复述单明确说执行才传 true。"
+                            "首次只传 prompt/image_url（工具返回复述文本，不生成）。"
+                        ),
                     },
                     "mask_url": {
                         "type": "string",
@@ -1127,13 +2009,17 @@ TOOLS: list[dict] = [
                 "🎨 Pixiv 插画搜索 — 搜索、下载并发图到群聊。\n"
                 "⚠️ 用户要求找图/搜图/找xxx的图时调用。\n"
                 "直接把用户的原始消息填入 user_message 即可——工具内部会用轻量 LLM 自动提取检索关键词。\n"
-                "你不需要自己翻译标签或提取关键词。传原话就行。\n\n"
+                "你不需要自己翻译标签或提取关键词。传原话就行，严禁添加用户没说的风格词\n"
+                "（如女友感/色气/涩气等）：加词会污染检索并导致回复复读同一形容词。\n\n"
                 "📌 功能:\n"
                 "- 内部自动提取 Pixiv 检索标签 + 网页搜索验证标签 + 搜索 + 下载 + 发图\n"
                 "- 当角色名只有拼音时，自动通过网页搜索发现 Pixiv 标准标签并替换\n"
                 "- 支持按最新/热门排序\n"
                 "- 图片超过 QQ 限制自动压缩\n"
-                "- 内容安全过滤\n\n"
+                "- 内容安全过滤：R-18 仅「主人 + NSFW 白名单场景」可见并暂存，"
+                "其余一律过滤不发送\n"
+                "- 发出去的图会自动暂存为作画参考 (10 分钟有效)：用户接着说"
+                "「对着画/按这个画」时，调 generate_image 并传 use_pixiv_refs=true 挂载\n\n"
                 "⚠️ 每次调用只发 1-2 张图。"
             ),
             "parameters": {
@@ -1142,7 +2028,7 @@ TOOLS: list[dict] = [
                     "user_message": {
                         "type": "string",
                         "description": (
-                            "用户找图的原始消息全文。不用加工，直接复制。\n"
+                            "用户找图的原始消息全文。不用加工，直接复制，禁止改写/扩写。\n"
                             "例如用户说「帮我找一张星铁藿藿的图」→ 传这一整句。"
                         ),
                     },
@@ -1205,108 +2091,349 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ── L4D2 服务器工具 ──
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_server_status",
+            "description": (
+                "🎮 查询 L4D2 游戏服务器状态。\n"
+                "返回: 当前地图、在线人数、玩家列表、游戏模式。\n"
+                "当用户问「服务器什么情况」「有人在玩吗」「现在什么图」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_list_maps",
+            "description": (
+                "📦 列出 L4D2 服务器可用地图 (官图+三方图)。\n"
+                "当用户问「有哪些地图」「能玩什么图」「地图列表」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_switch_map",
+            "description": (
+                "🔄 切换 L4D2 服务器地图。\n"
+                "支持: 地图名 (c1m1_hotel) / 别名 (hls, tumtara) / 战役中文名 (死亡中心→战役第1图) / "
+                "中文标签 (死亡中心1-酒店)。\n"
+                "⚠️ 如果不确定精确地图名, 先调用 l4d2_list_maps 查看可用地图。\n"
+                "确认流程: 换图 (sm_map) 不会踢出玩家, 玩家连接保留, 仅当前战局进度重置。"
+                "如果有玩家在线, 工具会返回确认提示。此时若用户已明确确认 "
+                "(如「直接换」「确认」「换就换」), 必须带 force=true 再次调用才会真正执行; "
+                "若用户犹豫或询问, 则不传 force 转达确认提示或建议投票换图。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "map_name": {
+                        "type": "string",
+                        "description": "地图名/别名/战役中文名/中文标签 (如 c1m1_hotel, hls, 死亡中心, 死亡中心1-酒店)",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "用户已确认时设为 true, 跳过玩家在线检查直接换图。默认 false。",
+                    },
+                },
+                "required": ["map_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_vote_map",
+            "description": (
+                "🗳️ 发起 L4D2 投票换图 (有玩家在线时自动走投票)。\n"
+                "支持地图名/别名/战役中文名/中文标签 (自动解析, 如 死亡中心→c1m1_hotel)。\n"
+                "当用户说「投票换xxx」「让大家投票选xxx图」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "map_name": {
+                        "type": "string",
+                        "description": "地图名/别名/战役中文名/中文标签 (如 c2m1_highway, hls, 死亡中心)",
+                    },
+                },
+                "required": ["map_name"],
+            },
+        },
+    },
+    # ── L4D2 服务器控制 ──
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_start",
+            "description": (
+                "▶️ 启动 L4D2 游戏服务器。\n"
+                "当用户说「开服务器」「启动l4d2」「把服务器开起来」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_stop",
+            "description": (
+                "⏹️ 停止 L4D2 游戏服务器。\n"
+                "当用户说「关服务器」「停掉l4d2」「把服务器关了」时调用。\n"
+                "⚠️ 有玩家在线时需要确认。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "是否强制停止 (跳过玩家在线检查)。默认 false。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_restart",
+            "description": (
+                "🔄 重启 L4D2 游戏服务器。\n"
+                "当用户说「重启服务器」「重启l4d2」时调用。\n"
+                "⚠️ 有玩家在线时需要确认。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "是否强制重启 (跳过玩家在线检查)。默认 false。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    # ── L4D2 数据监控 (积分/表现/榜单/绑定) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_player_score",
+            "description": (
+                "💰 查询 L4D2 玩家当前积分 (wallet)。\n"
+                "当用户问「xx积分多少」「查下xx的分」「我多少分」时调用。\n"
+                "player 参数接受: 游戏内名字 / SteamID (STEAM_1:1:xxx) / 已绑定的QQ号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "player": {
+                        "type": "string",
+                        "description": "玩家标识: 在线游戏名 / SteamID / 已绑定QQ号",
+                    },
+                },
+                "required": ["player"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_player_stats",
+            "description": (
+                "🧾 查询 L4D2 玩家表现报告 (击杀特感/死亡/黑枪友伤/被黑次数/被控次数/救援次数) + 评价。\n"
+                "当用户问「xx打得怎么样」「这局表现如何」「谁在演」「黑枪之王」时调用。\n"
+                "player 参数接受: 游戏内名字 / SteamID / 已绑定的QQ号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "player": {
+                        "type": "string",
+                        "description": "玩家标识: 在线游戏名 / SteamID / 已绑定QQ号",
+                    },
+                },
+                "required": ["player"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_leaderboard",
+            "description": (
+                "📊 查看 L4D2 积分榜 (按积分降序)。\n"
+                "当用户问「排行榜」「谁积分最高」「排名」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "显示前几名 (默认 10, 最大 50)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_bind_qq",
+            "description": (
+                "🔗 绑定 QQ 与 L4D2 SteamID (双向, 绑定后可用QQ号查积分/表现，Web 前端显示四元组)。\n"
+                "当用户说「绑定」「关联我的账号」「绑定我的steam」时调用。\n"
+                "⚠️ 必须向用户索要**数字 SteamID**, 不是游戏内名字(名字改了就查不到数据)。\n"
+                "三种格式任选: STEAM_1:1:xxx / [U:1:xxx] / 7656119...(profiles链接后17位数字)。\n"
+                "如果用户给了游戏名, 要礼貌说明需要数字 ID 并解释去哪看(个人资料链接 profiles/ 后)。\n"
+                "可选 qq_name/steam_name：若能从上下文获取到 QQ 昵称或游戏内名称，一并传入以便 Web 前端显示“Steam 名称 + SteamID + QQ 名称 + QQ 号”。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "qq": {
+                        "type": "string",
+                        "description": "用户的 QQ 号",
+                    },
+                    "steam_id": {
+                        "type": "string",
+                        "description": "数字 SteamID (非游戏名!): STEAM_1:1:xxx / [U:1:xxx] / 7656119... 任选其一",
+                    },
+                    "qq_name": {
+                        "type": "string",
+                        "description": "QQ 名称/昵称（可选，用于 Web 前端展示）",
+                    },
+                    "steam_name": {
+                        "type": "string",
+                        "description": "Steam 游戏内名称（可选，用于 Web 前端展示，如 luna）",
+                    },
+                },
+                "required": ["qq", "steam_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_unbind_qq",
+            "description": (
+                "🔓 解绑 QQ 与 L4D2 SteamID。\n"
+                "当用户说「解绑」「取消绑定」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "qq": {
+                        "type": "string",
+                        "description": "要解绑的 QQ 号",
+                    },
+                },
+                "required": ["qq"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "l4d2_bind_link",
+            "description": (
+                "🔗 生成仅该 QQ 有效的 L4D2 自助绑定链接（10 分钟有效，一次性）。\n"
+                "当用户在群里说「绑定」「绑定 l4d2」「怎么绑定」「给我个绑定链接」但未提供 SteamID 时调用。\n"
+                "无需 SteamID，Bot 会基于触发者的 QQ 自动生成专属链接，用户点开在网页上自助填 SteamID 完成绑定。\n"
+                "返回的链接仅该 QQ 可用，切勿转发。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "qq": {
+                        "type": "string",
+                        "description": "要生成链接的 QQ 号（可空，默认取触发者 QQ）",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dispatch_subagents",
+            "description": (
+                "🚀 Hybrid Main→SubAgent 派发 — Main 保持深度角色扮演，任务执行由无 persona 子代理完成。\n"
+                "当需要检索/代码/识图/搜图/绘图/研究等执行时，统一通过此工具派发子代理并发执行。\n"
+                "子代理只知道自己是 subagent，为 Main 服务，无角色扮演，纯执行器，效率最高。\n"
+                "⚠️ 必须一次性在单次调用中列完所有 subtasks 以实现并发 — 不要分多次调用 dispatch_subagents。\n"
+                "支持一次派发多个子任务 (retrieval/code/vision/research 等) 并发完成，结果汇总后由 Main 合成最终角色扮演回复。\n"
+                "不要直接调用 web_search/execute_code 等底层工具 — 统一走此入口，Main 保持 persona 完整。\n"
+                "★ 绘图硬规则 (2026-10-11)：用户明确要画图（帮我画/来张图/看着办/你定/都喜欢）→ "
+                "必须派发 image_gen 子任务（task 写清画面描述），禁止只回 persona 话术不派发；\n"
+                "  用户只是在问能不能画/聊画画技巧 → 不派发，口头回。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subtasks": {
+                        "type": "array",
+                        "description": "子任务列表，并发派发",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "family": {
+                                    "type": "string",
+                                    "enum": ["retrieval", "code", "pixiv", "vision", "image_gen", "video", "research"],
+                                    "description": "子代理家族: retrieval=检索/web_search/search_knowledge, code=沙箱执行, pixiv=搜图, vision=识图, image_gen=生图, research=本地迭代研究",
+                                },
+                                "task": {
+                                    "type": "string",
+                                    "description": "任务描述，子代理执行的具体内容。例如检索写 query，代码写需求，research 写研究问题",
+                                },
+                                "tool": {
+                                    "type": "string",
+                                    "description": "可选覆盖具体工具名 (如 web_search/execute_code/describe_image)，留空自动映射",
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "description": "可选传递给工具的参数 (如 {\"query\":\"...\"} / {\"code\":\"...\"})",
+                                    "additionalProperties": True,
+                                },
+                            },
+                            "required": ["family", "task"],
+                        },
+                    },
+                },
+                "required": ["subtasks"],
+            },
+        },
+    },
+]
+
+# ── Hybrid Main Tools: 仅暴露 dispatch_subagents + 零成本本地工具 ──
+# Main 保持 persona 完整，工具调用通过 dispatch_subagents 间接派发，
+# 子代理无 persona 并发执行。TOOLS 仍为子代理可用全量工具。
+MAIN_TOOLS: list[dict] = [
+    t for t in TOOLS if t.get("function", {}).get("name") in ("dispatch_subagents", "send_sticker", "parse_forwarded_message")
 ]
 
 # ── 工具执行器 ───────────────────────────────────────────
-
-
-async def execute_health_check(params: dict) -> str:
-    """执行 check_lport_status 工具。"""
-    client = get_lport_client()
-    result = await client.health_check()
-
-    if "error" in result:
-        return (
-            f"❌ L-Port 状态查询失败: {result.get('error', '未知错误')}\n"
-            f"详情: {result.get('detail', '无')}"
-        )
-
-    data = result.get("data", result)
-    status = data.get("status", "unknown")
-    db_status = data.get("database", "unknown")
-    model_count = data.get("model_count", "?")
-    node_count = data.get("node_count", "?")
-
-    lines = [
-        f"L-Port 系统状态: {'✅ 在线' if status == 'ok' else '⚠️ ' + status}",
-        f"数据库: {'✅ 正常' if db_status == 'connected' else '⚠️ ' + str(db_status)}",
-        f"GPU 数: {data.get('gpu_count', '?')}",
-        f"模型数: {model_count}",
-        f"自定义节点数: {node_count}",
-    ]
-    return "\n".join(lines)
-
-
-async def execute_list_models(params: dict) -> str:
-    """执行 list_available_models 工具。"""
-    filter_type = params.get("filter_type", "all")
-    client = get_lport_client()
-    result = await client.list_models(filter_type=filter_type)
-
-    if "error" in result:
-        return (
-            f"❌ 模型列表查询失败: {result.get('error', '未知错误')}\n"
-            f"详情: {result.get('detail', '无')}"
-        )
-
-    data = result.get("data", result)
-    total = data.get("total", 0)
-    filtered = data.get("filtered", 0)
-    models = data.get("models", [])
-
-    if not models:
-        type_label = "所有" if filter_type == "all" else filter_type
-        return f"📦 没有找到 {type_label} 类型的模型。"
-
-    # 按类型分组
-    by_type: dict[str, list] = {}
-    for m in models:
-        mtype = m.get("type", "other")
-        by_type.setdefault(mtype, []).append(m["name"])
-
-    lines = [f"📦 模型列表 (共 {total} 个, 筛选到 {filtered} 个, 类型: {filter_type})"]
-    for mtype, names in by_type.items():
-        lines.append(f"\n【{mtype}】({len(names)} 个)")
-        # 每个类型最多展示 8 个
-        for name in names[:8]:
-            lines.append(f"  - {name}")
-        if len(names) > 8:
-            lines.append(f"  ... 还有 {len(names) - 8} 个")
-
-    return "\n".join(lines)
-
-
-async def execute_list_nodes(params: dict) -> str:
-    """执行 list_custom_nodes 工具。"""
-    client = get_lport_client()
-    result = await client.list_custom_nodes()
-
-    if "error" in result:
-        return (
-            f"❌ 节点查询失败: {result.get('error', '未知错误')}\n"
-            f"详情: {result.get('detail', '无')}"
-        )
-
-    data = result.get("data", result)
-    total = data.get("total", 0)
-    nodes = data.get("nodes", [])
-
-    if not nodes:
-        return "📦 没有安装自定义节点。"
-
-    lines = [f"🔌 自定义节点 (共 {total} 个)"]
-    for n in nodes[:15]:
-        name = n.get("name", "?")
-        author = n.get("author", "")
-        version = n.get("version", "")
-        extra = f" — by {author}" if author else ""
-        extra += f" v{version}" if version else ""
-        lines.append(f"  - {name}{extra}")
-
-    if len(nodes) > 15:
-        lines.append(f"  ... 还有 {len(nodes) - 15} 个")
-
-    return "\n".join(lines)
 
 
 async def execute_search_knowledge(params: dict, tool_context: dict | None = None) -> str:
@@ -1354,24 +2481,308 @@ async def execute_search_knowledge(params: dict, tool_context: dict | None = Non
     return "\n".join(lines)
 
 
+# ── 检索自问表单（对标 draw_confirm 双相确认，单相版）──
+# 生图贵，走“建单→复述→等确认”两相；检索便宜，走“自问→缺件反问/齐件直搜”单相，
+# 无跨轮存单：缺件时把问题抛回给 LLM 转述用户，用户补一句后下一轮新 query 再进。
+# 只收相对时间词（最近/今天/昨天…）：绝对诉求（版本/发布/比分…）直搜最新即可，不打扰。
+_SEARCH_TIME_HINTS = (
+    "最近", "最新", "今天", "今日", "昨天", "昨日", "本周", "上周",
+)
+_SEARCH_TIME_KW = ("202", "年", "月", "日", "今天", "昨天", "本周", "近一周", "近一月")
+
+
+def _search_missing_slots(query: str, time_range: str = "") -> list[str]:
+    """检索缺件扫描 → 缺件名列表（空=可搜）。只收可执行槽，不猜。"""
+    miss: list[str] = []
+    _q = str(query or "").strip()
+    if not _q:
+        miss.append("query")
+        return miss
+    # 过短且无定向：如“新闻”“搜一下”——必问
+    _core = _q.replace("site:", " ").strip()
+    if len(_core) < 4 and "site:" not in _q:
+        miss.append("query")
+        return miss
+    # 时效词在场但无时间落点：既无时间关键词又无 time_range → 问时间范围
+    if any(_h in _q for _h in _SEARCH_TIME_HINTS):
+        if not time_range and not any(_k in _q for _k in _SEARCH_TIME_KW):
+            miss.append("time_range")
+    return miss
+
+
+def _search_ask_text(query: str, missing: list[str]) -> str:
+    """缺件反问文本（短，照确认单口吻：先讲缺什么，再给例子）。"""
+    _lines = ["没太确定要查什么，再对一下：", f"主题：{str(query or '').strip()[:60] or '（空）'}"]
+    if "query" in missing:
+        _lines.append("缺：具体查什么（太泛了搜不准）。回一句补充就行，比如“ CS2 2026 总决赛结果 ”。说完我就搜。")
+    if "time_range" in missing:
+        _lines.append("缺：时间范围（要哪段的？今天 / 近一周 / 近一月 / 具体年月）。回一句就行，比如“查近一周的”。说完我就搜。")
+    return "\n".join(_lines)
+
+
 async def execute_web_search(params: dict, tool_context: dict | None = None) -> str:
-    """执行 web_search 工具。"""
+    """执行 web_search 工具（含自问表单：缺件反问，不盲搜）。"""
     query = params.get("query", "").strip()
     if not query:
         return "❌ 网页搜索需要提供 query 参数。"
+    time_range = params.get("time_range", "").strip() if isinstance(params.get("time_range"), str) else ""
+    # ── 自问表单：缺件直接反问，不烧检索 ──
+    _miss = _search_missing_slots(query, time_range)
+    if _miss:
+        return _search_ask_text(query, _miss)
 
-    # ── 即时通知: 首轮搜索告知用户 (后续轮不重复, 防刷屏) ──
+    # ── 即时通知: 首轮搜索告知用户 (后续轮不重复, 防刷屏; 并行安全) ──
     ctx = tool_context if tool_context is not None else {}
     if _notice_sender and not ctx.get("_search_notice_sent"):
+        ctx["_search_notice_sent"] = True  # 先置位，避免并行 2×web_search 同轮双发
         try:
             _short = query[:50] + "…" if len(query) > 50 else query
             await _notice_sender(f"收到，帮你搜一下「{_short}」~")
-            ctx["_search_notice_sent"] = True
         except Exception:
             pass
+    # ── 去重: 同 query 在同一 tool_loop 内重复搜索直接复用 ──
+    _prev_qs: set[str] = ctx.setdefault("_prev_web_queries", set())
+    _norm_q = " ".join(query.lower().split())
+    if _norm_q in _prev_qs:
+        logger.info("web_search 去重: 跳过重复 query %r", query[:60])
+        return f"🌐 已搜索过「{query}」，结果见上轮。"
+    _prev_qs.add(_norm_q)
 
-    results = await web_search(query, max_results=6)
+    # ── L4D2 近战查询清洗：移除与近战矛盾的火器词，补 workshop 定向，修复截断 ──
+    _q_low = query.lower()
+    if "l4d2" in _q_low and any(k in query for k in ("近战", "melee", "刀", "剑", "武器")):
+        _orig_q = query
+        for _bad in ("霰弹枪", "shotgun", "电锯", "chainsaw", "步枪", "rifle", "冲锋枪", "smg"):
+            if _bad.lower() in _q_low:
+                query = query.replace(_bad, "").replace(_bad.title(), "").replace(_bad.upper(), "")
+                _q_low = query.lower()
+        # 去重空格
+        query = " ".join(query.split())
+        if query != _orig_q:
+            logger.info("L4D2 近战清洗: %r → %r", _orig_q[:80], query[:80])
+        # 修复截断的年份 "2025 20" → "2025 2026"（tool 参数被 1024 截断）
+        if query.rstrip().endswith(" 20") and "2025" in query:
+            query = query.rstrip()[:-2] + "2026"
+            logger.info("L4D2 截断修复: 20→2026")
+        # 确保 workshop 定向（二次元近战 mod 主源）
+        if "site:" not in query and "steamcommunity" not in _q_low and "workshop" not in _q_low:
+            query = query + " site:steamcommunity.com/workshop"
+            logger.info("L4D2 补定向: site:steamcommunity.com/workshop")
+
+    # 多列举类查询放宽条数（6→10）
+    _max_res = 6
+    if "l4d2" in _q_low and any(k in query for k in ("多列举", "多", "全部", "列表", "推荐")):
+        _max_res = 10
+    # time_range 透传给 SearXNG（近1周等查询自动过滤过期结果）
+    results = await web_search(query, max_results=_max_res, time_range=time_range or None)
     return format_web_results(results, query)
+
+
+async def execute_code(params: dict, tool_context: dict | None = None) -> str:
+    """执行 execute_code 工具 — 转发到 per-bot 专属 Docker 小黑屋。
+
+    真隔离：跑在 sandbox-loput / sandbox-luna 容器里，不在 Bot 本机跑。
+    容器内完全放权 (pip/文件/网络都行)，边界就是容器本身。
+    CODE_SANDBOX_URL 未配置 (宿主机调试) 时回退本地执行 (保留黑名单)。
+    """
+    import os as _os
+
+    code = params.get("code", "").strip()
+    language = params.get("language", "python").strip().lower()
+    timeout = max(3, min(int(params.get("timeout", 30) or 30), 90))
+
+    if not code:
+        return "❌ 代码不能为空。"
+    if language not in ("python", "javascript", "bash"):
+        return f"❌ 不支持的语言: {language}。支持: python, javascript, bash"
+
+    sandbox_url = (_os.getenv("CODE_SANDBOX_URL", "") or "").strip().rstrip("/")
+    if sandbox_url:
+        # ── 主路径: HTTP 转发到小黑屋 (内网直连，不走代理) ──
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=timeout + 15, trust_env=False) as _cli:
+                _resp = await _cli.post(
+                    f"{sandbox_url}/execute",
+                    json={"language": language, "code": code, "timeout": timeout},
+                )
+                _resp.raise_for_status()
+                _data = _resp.json()
+        except Exception as _e:
+            logger.warning("code sandbox 不可用，回退本地执行: %s", _e)
+            return await _execute_code_local(params, tool_context)
+
+        _stdout = (_data.get("stdout") or "").strip()
+        _stderr = (_data.get("stderr") or "").strip()
+        _rc = _data.get("returncode", 0)
+        _err = (_data.get("error") or "").strip()
+
+        # ── 出图回传: 小黑屋 job 目录图片 → _pending_images 侧通道 (与 generate_image 同通道) ──
+        _n_img = 0
+        try:
+            _imgs = _data.get("images") or []
+            if _imgs:
+                import base64 as _b64
+
+                _bid = ((tool_context or {}).get("bot_id", "") or "").strip() or _current_bot_id.get()
+                _bufs: list[bytes] = []
+                for _im in _imgs[:4]:
+                    try:
+                        _b64s = str((_im or {}).get("data_b64", "") or "")
+                        if not _b64s:
+                            continue
+                        _raw = _b64.b64decode(_b64s)
+                        if 0 < len(_raw) <= 8 * 1024 * 1024:
+                            _bufs.append(_raw)
+                    except Exception:
+                        continue
+                if _bufs and _bid:
+                    _pending_images.setdefault(_bid, []).extend(_bufs)
+                    _n_img = len(_bufs)
+                    logger.info("📊 [Tool] execute_code 出图 %d 张 bot=%s", _n_img, _bid)
+        except Exception as _ie:
+            logger.warning("execute_code 图片侧通道失败: %s", _ie)
+
+        # 超时 / 执行失败透传 (有图也先报图，再报错)
+        if _err and _rc == 124:
+            _t = (
+                f"⏰ 代码执行超时 ({timeout}秒)。\n"
+                "可能原因: 死循环、计算量过大、等待用户输入。\n"
+                "建议: 添加超时检查、减少计算量、避免阻塞操作。"
+            )
+            if _n_img:
+                _t += f"\n📊 已生成 {_n_img} 张图，图片即将发送。"
+            return _t
+        if _err and not _stdout and not _stderr and not _n_img:
+            return f"❌ 代码执行失败: {_err}"
+
+        _parts: list[str] = []
+        if _stdout:
+            _parts.append(f"📤 输出:\n{_stdout}")
+        if _stderr:
+            _parts.append(f"⚠️ 错误/警告:\n{_stderr}")
+        if _rc != 0:
+            _parts.append(f"🔴 退出码: {_rc}")
+        if _n_img:
+            _parts.append(f"📊 已生成 {_n_img} 张图表，图片即将发送给用户。")
+        if not _parts:
+            return "✅ 代码执行成功 (无输出)"
+        return "\n\n".join(_parts)
+
+    # ── 回退: 宿主机本地执行 (开发调试用，保留黑名单) ──
+    return await _execute_code_local(params, tool_context)
+
+
+async def _execute_code_local(params: dict, tool_context: dict | None = None) -> str:
+    """本地回退执行 — 仅宿主机调试用，保留黑名单限制。"""
+    import asyncio
+    import tempfile
+    import os
+
+    code = params.get("code", "").strip()
+    language = params.get("language", "python").strip().lower()
+    timeout = min(params.get("timeout", 30), 60)  # 最大 60 秒
+
+    if not code:
+        return "❌ 代码不能为空。"
+
+    # 安全检查: 禁止危险操作 (仅本地回退用，小黑屋内不拦)
+    dangerous_patterns = [
+        "import os", "import sys", "import subprocess", "import shutil",
+        "from os", "from sys", "from subprocess", "from shutil",
+        "import socket", "from socket", "import http", "from http",
+        "import requests", "from requests", "import urllib", "from urllib",
+        "import aiohttp", "from aiohttp",
+        "__import__", "eval(", "exec(",
+        "open(", "with open",
+        "import ctypes", "from ctypes",
+        "import signal", "from signal",
+        "import multiprocessing", "from multiprocessing",
+        "import threading", "from threading",
+        "import asyncio", "from asyncio",
+    ]
+
+    code_lower = code.lower()
+    for pattern in dangerous_patterns:
+        if pattern.lower() in code_lower:
+            return (
+                f"❌ 安全限制: 代码包含禁止的操作「{pattern}」。\n"
+                "本地回退环境禁止: 文件系统操作、网络请求、系统命令、进程/线程控制。\n"
+                "生产小黑屋 (Docker) 内无此限制。"
+            )
+
+    # 创建临时文件
+    suffix_map = {
+        "python": ".py",
+        "javascript": ".js",
+        "bash": ".sh",
+    }
+    suffix = suffix_map.get(language, ".py")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=suffix, delete=False, dir="/tmp"
+    ) as f:
+        f.write(code)
+        temp_path = f.name
+
+    try:
+        # 构建执行命令
+        cmd_map = {
+            "python": ["python3", temp_path],
+            "javascript": ["node", temp_path],
+            "bash": ["bash", temp_path],
+        }
+        cmd = cmd_map.get(language)
+        if not cmd:
+            return f"❌ 不支持的语言: {language}。支持: python, javascript, bash"
+
+        # 执行代码
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd="/tmp",
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            return (
+                f"⏰ 代码执行超时 ({timeout}秒)。\n"
+                "可能原因: 死循环、计算量过大、等待用户输入。\n"
+                "建议: 添加超时检查、减少计算量、避免阻塞操作。"
+            )
+
+        # 解码输出
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        # 格式化输出
+        result_parts = []
+        if stdout_text:
+            result_parts.append(f"📤 输出:\n{stdout_text}")
+        if stderr_text:
+            result_parts.append(f"⚠️ 错误/警告:\n{stderr_text}")
+        if proc.returncode != 0:
+            result_parts.append(f"🔴 退出码: {proc.returncode}")
+
+        if not result_parts:
+            return "✅ 代码执行成功 (无输出)"
+
+        return "\n\n".join(result_parts)
+
+    except Exception as e:
+        return f"❌ 代码执行失败: {e}"
+    finally:
+        # 清理临时文件
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
 
 
 async def execute_send_sticker(params: dict, tool_context: dict | None = None) -> str:
@@ -1429,9 +2840,12 @@ async def execute_describe_image(params: dict, tool_context: dict | None = None)
     image_url = params.get("image_url", "").strip()
     if not image_url:
         return "❌ 图片 URL 不能为空。"
-    if not image_url.startswith("http"):
+    # 支持 HTTP URL 和本地文件路径
+    is_local_path = image_url.startswith("/") or image_url.startswith("./") or image_url.startswith("file://")
+    if not image_url.startswith("http") and not is_local_path:
         return "❌ 这不是一个有效的图片 URL。当前上下文中可能有 [图片] 占位标记，但图片的实际 URL 不可用——请根据对话上下文描述你对图片的理解，而不是调用此工具。"
-    if err := _validate_image_url(image_url):
+    # 仅对 HTTP URL 进行验证
+    if not is_local_path and (err := _validate_image_url(image_url)):
         return f"❌ 图片 URL 验证失败: {err}"
 
     # ── Per-bot VLM 配置 ──
@@ -1444,19 +2858,34 @@ async def execute_describe_image(params: dict, tool_context: dict | None = None)
         try:
             from ..service.bot_config import get_config_service
             svc = get_config_service()
-            vlm_cfg = svc.resolve_vlm_slot(bot_id, "vlm_primary")
+            # NSFW 场景: 优先 NSFW 专属 VLM 槽 (未配 = 跟随 SFW, 零行为变化)
+            _vlm_nsfw = _tool_ctx_nsfw(tool_context)
+            vlm_cfg = svc.resolve_vlm_slot(bot_id, "vlm_primary", nsfw=_vlm_nsfw)
             if vlm_cfg is not None:
                 vlm_api_base = vlm_cfg.base_url or ""
                 vlm_api_key = vlm_cfg.api_key or ""
                 vlm_model = vlm_cfg.model_name or ""
                 logger.info(
-                    "describe_image per-bot VLM: bot=%s provider=%s model=%s",
+                    "describe_image per-bot VLM%s: bot=%s provider=%s model=%s",
+                    " (NSFW)" if _vlm_nsfw else "",
                     bot_id, getattr(vlm_cfg, 'provider', '?'), vlm_model[:30],
                 )
             else:
                 logger.warning("describe_image: bot=%s 无 VLM 槽位配置", bot_id)
         except Exception:
             logger.warning("per-bot VLM 解析失败, 回退全局配置", exc_info=True)
+
+    # ── VLM 长耗时预回复：明确看图任务才发，不描述图内容只认收到 ──
+    # 能到这里说明已过意图门（gate_suggested_tools 含本工具或 image_share），
+    # 纯图无授权早已在上游返回，所以这里发是精准的，不会给刷图逐一回。
+    try:
+        _vlm_ctx = tool_context if tool_context is not None else {}
+        if _notice_sender and not _vlm_ctx.get("_vlm_notice_sent"):
+            _vlm_ctx["_vlm_notice_sent"] = True
+            _vlm_ack = "（图收到了，正在看）"
+            await _notice_sender(_vlm_ack)
+    except Exception:
+        pass
 
     from astrbot_plugin_suli_services.vision import describe_image_from_url
     try:
@@ -1472,6 +2901,168 @@ async def execute_describe_image(params: dict, tool_context: dict | None = None)
     except Exception as e:
         logger.error("describe_image 执行失败: %s", e)
         return "❌ 图片解析失败，请稍后重试。"
+
+
+_PIXIV_REF_FEATURE_QUERY = (
+    "你是角色设定提取器。只输出可用于重绘的视觉特征清单："
+    "发色/发型/发饰、眼睛、服装款式与配色、配饰、整体画风。"
+    "每项一行短语，不要寒暄不要解释，不要评价画得好不好。"
+)
+
+
+async def execute_describe_pixiv_refs(params: dict | None = None, tool_context: dict | None = None) -> str:
+    """读已暂存的 Pixiv 参考图, VLM 提取可重绘特征 (非主人「特征→纯文字」链路用)。
+
+    不消费暂存 (只读; Vibe 挂载留给主人, 过期 10 分钟)。
+    不走 Gate 意图门 —— 暂存本身只在「本轮本用户刚搜过图」时存在,
+    这就是最具体的授权, 再套 Gate 只是加故障点。
+    """
+    ctx = tool_context if tool_context is not None else {}
+    bot_id = str(ctx.get("bot_id", "") or "")
+    trigger_uid = str(ctx.get("trigger_user_id", "") or "")
+    if not trigger_uid:
+        try:
+            trigger_uid = _get_memory_ctx().get("trigger_user_id", "") or ""
+        except Exception:
+            trigger_uid = ""
+    if not trigger_uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv_pr
+            trigger_uid = str(_trigger_cv_pr() or "")
+        except Exception:
+            pass
+    try:
+        _count = int((params or {}).get("count", 2))
+    except (TypeError, ValueError):
+        _count = 2
+    _count = max(1, min(2, _count))
+
+    items = peek_pending_pixiv_refs(bot_id, trigger_uid, limit=_count)
+    if not items:
+        return (
+            "没有已暂存的 Pixiv 参考图（已过期或还没搜过）。"
+            "先调 pixiv_search 搜图发图，再来读特征。说完就停，不追加追问。"
+        )
+
+    vlm_api_base, vlm_api_key, vlm_model = _resolve_media_vlm(tool_context)
+    from astrbot_plugin_suli_services.vision import describe_image_from_url
+
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="pixiv_ref_")
+    try:
+        out: list[str] = []
+        for _iid, _b in items:
+            _p = str(Path(tmp_dir) / f"ref_{int(_iid or 0)}.jpg")
+            try:
+                with open(_p, "wb") as _f:
+                    _f.write(_b)
+                _desc = await describe_image_from_url(
+                    "file://" + _p,
+                    api_base=vlm_api_base, api_key=vlm_api_key, model=vlm_model,
+                    user_query=_PIXIV_REF_FEATURE_QUERY,
+                )
+            except Exception as e:
+                logger.warning("[pixiv_refs] VLM 特征提取失败 illust=%d: %s", _iid, e)
+                _desc = ""
+            if _desc:
+                out.append(f"图{_iid}特征：{_desc.strip()}")
+        if not out:
+            return "❌ 参考图特征提取失败（VLM 繁忙或未配置），请稍后重试。不要说自己「看不到图」。"
+        _ret = "🎨 暂存参考图特征（10 分钟内有效）：\n" + "\n".join(out)
+        _ret += (
+            "\n直接用这些特征组纯文字 prompt 调 generate_image"
+            "（不要传 use_pixiv_refs，那是主人的 Vibe 直挂通道）。"
+            "知名角色可直出，无需逐字照抄特征。"
+        )
+        return _ret
+    finally:
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _media_gate_ok(tool_name: str, tool_context: dict | None) -> str:
+    """视频/语音工具门控: 与 describe_image 同源 (suggested 或媒体分享意图)。
+
+    Gate 暂无 video_share/voice_share 类型，image_share 代为放行
+    (视频/语音同属媒体分享；新类型落地后本函数已提前兼容)。
+    返回 ""=放行，否则为拒绝文案。
+    """
+    suggested = (tool_context if tool_context is not None else {}).get("gate_suggested_tools", [])
+    intent_type = str((tool_context if tool_context is not None else {}).get("gate_intent_type", "") or "")
+    if tool_name in suggested or intent_type in ("image_share", "video_share", "voice_share"):
+        return ""
+    _bid = _current_bot_id.get()
+    _style_label, _, _tone = _resolve_style(_bid)
+    return (
+        f"⛔ {tool_name} 本轮未被授权。你的媒体解析能力是正常的——只是本轮门控未放行。\n"
+        f"用{_style_label}自然带过——说完就停，不要追加追问。"
+    )
+
+
+def _resolve_media_vlm(tool_context: dict | None) -> tuple[str, str, str]:
+    """解析 per-bot VLM 槽位 (base, key, model)，失败回 ("", "", "") 走全局配置。
+
+    NSFW 场景 (工具上下文判定) 优先 NSFW 专属 VLM 槽; 未配 = 跟随 SFW。
+    """
+    bot_id = (tool_context if tool_context is not None else {}).get("bot_id", "")
+    if not bot_id:
+        return "", "", ""
+    try:
+        from ..service.bot_config import get_config_service
+        svc = get_config_service()
+        _vlm_nsfw = _tool_ctx_nsfw(tool_context)
+        vlm_cfg = svc.resolve_vlm_slot(bot_id, "vlm_primary", nsfw=_vlm_nsfw)
+        if vlm_cfg is not None:
+            return vlm_cfg.base_url or "", vlm_cfg.api_key or "", vlm_cfg.model_name or ""
+        logger.warning("media工具: bot=%s 无 VLM 槽位配置", bot_id)
+    except Exception:
+        logger.warning("media工具 per-bot VLM 解析失败, 回退全局配置", exc_info=True)
+    return "", "", ""
+
+
+async def execute_describe_video(params: dict, tool_context: dict | None = None) -> str:
+    """执行 describe_video 工具 — 下载抽帧 + VLM 时序描述。"""
+    if denied := _media_gate_ok("describe_video", tool_context):
+        return denied
+    video_url = (params.get("video_url", "") or "").strip()
+    if not video_url.startswith("http"):
+        return "❌ 这不是有效的视频 URL。上下文 [视频 URL: ...] 即为参数，不要编造。"
+    vlm_api_base, vlm_api_key, vlm_model = _resolve_media_vlm(tool_context)
+    from astrbot_plugin_suli_services.vision import describe_video_from_url
+    try:
+        desc = await describe_video_from_url(
+            video_url, api_base=vlm_api_base, api_key=vlm_api_key, model=vlm_model,
+        )
+        if desc:
+            return f"🎬 视频内容: {desc}"
+        return "❌ 视频解析暂未成功（太大/损坏/网络波动），请稍后重试。"
+    except Exception as e:
+        logger.error("describe_video 执行失败: %s", e)
+        return "❌ 视频解析失败，请稍后重试。"
+
+
+async def execute_describe_voice(params: dict, tool_context: dict | None = None) -> str:
+    """执行 describe_voice 工具 — 下载 + VLM 转写 (不支持则元数据降级)。"""
+    if denied := _media_gate_ok("describe_voice", tool_context):
+        return denied
+    voice_url = (params.get("voice_url", "") or "").strip()
+    if not voice_url.startswith("http"):
+        return "❌ 这不是有效的语音 URL。上下文 [语音 URL: ...] 即为参数，不要编造。"
+    vlm_api_base, vlm_api_key, vlm_model = _resolve_media_vlm(tool_context)
+    from astrbot_plugin_suli_services.vision import transcribe_voice_from_url
+    try:
+        text = await transcribe_voice_from_url(
+            voice_url, api_base=vlm_api_base, api_key=vlm_api_key, model=vlm_model,
+        )
+        if text:
+            return f"🎙️ {text}"
+        return "❌ 语音解析暂未成功（下载失败或网络波动），请稍后重试。"
+    except Exception as e:
+        logger.error("describe_voice 执行失败: %s", e)
+        return "❌ 语音解析失败，请稍后重试。"
 
 
 async def execute_remember_memory(params: dict) -> str:
@@ -1539,14 +3130,905 @@ async def execute_get_memory(params: dict) -> str:
     return f"📝 目前还没有关于 {name} 的记忆。如果你想让我记住什么，直接告诉我就好～"
 
 
+_DRAW_IP_HINTS: tuple[tuple[str, str], ...] = (
+    ("明日方舟", "明日方舟 (Arknights)"),
+    ("终末地", "终末地 (Arknights Endfield)"),
+    ("原神", "原神 (Genshin Impact)"),
+    ("崩坏3", "崩坏3 (Honkai Impact 3rd)"),
+    ("星铁", "星铁 (Honkai Star Rail)"),
+    ("星穹铁道", "星穹铁道 (Honkai Star Rail)"),
+    ("崩铁", "崩铁 (Honkai Star Rail)"),
+    ("鸣潮", "鸣潮 (Wuthering Waves)"),
+    ("碧蓝航线", "碧蓝航线 (Azur Lane)"),
+    ("蔚蓝档案", "蔚蓝档案 (Blue Archive)"),
+    ("绝区零", "绝区零 (Zenless Zone Zero)"),
+)
+
+
+def _hint_draw_ip_names(src: str) -> str:
+    """给翻译模型加 IP 英文提示：中文IP名 → 中文 (英文)，零额外调用。"""
+    out = src
+    for cn, hint in _DRAW_IP_HINTS:
+        if cn in out and hint not in out:
+            out = out.replace(cn, hint)
+    return out
+
+
+async def _translate_draw_prompt(prompt: str, bot_id: str, *, nsfw: bool = False) -> str:
+    """生图 prompt 中→英翻译 (VLM 槽位，chat-completions 兼容)，失败回原文。
+
+    注意：背景 LLM 槽多为 /responses 协议 (spark)，raw chat.completions 必 404
+    (2026-10-11 教训)——翻译走 VLM 槽 (mimo，实测可用)，零失败抛出。
+    nsfw=True: 优先 NSFW 专属 VLM 槽 (未配 = 跟随 SFW, 零行为变化)。
+    """
+    src = (prompt or "").strip()
+    if not src:
+        return ""
+    src = _hint_draw_ip_names(src)
+    try:
+        from ..service.bot_config import get_config_service
+        vlm_cfg = get_config_service().resolve_vlm_slot(bot_id or "", "vlm_primary", nsfw=nsfw)
+        if vlm_cfg is None or not vlm_cfg.api_key:
+            return src
+        _base = (vlm_cfg.normalized_base_url or "").rstrip("/")
+        if "/responses" in _base or "muse-spark" in str(vlm_cfg.model_name or "").lower():
+            return src
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(
+            api_key=vlm_cfg.api_key, base_url=_base, timeout=20.0,
+        )
+        resp = await client.chat.completions.create(
+            model=vlm_cfg.model_name,
+            messages=[
+                {"role": "system", "content": (
+                    "Translate the following anime illustration request into English, "
+                    "comma-separated tags/phrases (subject, style, composition, lighting, "
+                    "background, quality tags like masterpiece, best quality). "
+                    "Output ONLY the translation, no explanations.\n"
+                    "CHARACTER TAG RULES (critical for NovelAI character knowledge):\n"
+                    "- Anime/game characters MUST use Danbooru tags: "
+                    "`name (series)` lowercase with underscores, e.g. "
+                    "`priestess (arknights)`, `hutao (genshin impact)`. "
+                    "Put the character tag FIRST, then 1girl/1boy, then features.\n"
+                    "- Chinese character/IP names MUST be converted, NEVER left in "
+                    "Chinese: 明日方舟→arknights, 终末地→arknights endfield, "
+                    "原神→genshin impact, 崩坏3→honkai impact 3rd, "
+                    "星铁/崩铁→honkai star rail, "
+                    "鸣潮→wuthering waves, 碧蓝航线→azur lane, "
+                    "蔚蓝档案→blue archive, 绝区零→zenless zone zero, "
+                    "FGO→fate grand order, hololive→hololive.\n"
+                    "- If you know the official EN/JP name use it as the tag; "
+                    "if unsure, romanize the name AND keep hair/eyes/outfit "
+                    "features so the image still resembles the character.\n"
+                    "- Example: 明日方舟普瑞赛斯浅亚麻色短发 → "
+                    "`priestess (arknights), 1girl, light flaxen short hair "
+                    "with flipped ends, ...`"
+                )},
+                {"role": "user", "content": src},
+            ],
+            max_tokens=300,
+            temperature=0.0,
+            # opencode.ai 网关必需头 (与 vision.py 同源，缺之 400 MissingSessionID)
+            extra_headers={
+                "User-Agent": "suli-qqbot/1.0",
+                "x-opencode-session": "suli-qqbot-vlm",
+            },
+        )
+        out = (resp.choices[0].message.content or "").strip().split("\n")[0].strip("\"' ")
+        if out and len(out) >= 4:
+            logger.info("🎨 绘图 prompt 翻译: %s → %s", src[:60], out[:80])
+            return out
+    except Exception:
+        logger.debug("🎨 绘图 prompt 翻译失败，回原文", exc_info=True)
+    return src
+
+
+# ── 生图尺寸限定档（与面板/纯库客户端同源，超纲一律回面板值）──
+_NOVELAI_DRAW_SIZES = frozenset({
+    "832x1216", "1216x832", "1024x1024", "512x768", "768x512",
+})
+_PIXAI_DRAW_ASPECTS = frozenset({
+    "1:1", "2:3", "3:2", "3:4", "4:3", "3:5",
+    "5:3", "9:16", "16:9", "1:3", "3:1",
+})
+_PIXAI_DRAW_SIZES = frozenset({"1k", "1.5k"})
+_PIXAI_PORTRAIT_ASPECTS = frozenset({"9:16", "2:3", "3:4", "3:5", "1:3", "1:1"})
+_PIXAI_LANDSCAPE_ASPECTS = frozenset({"16:9", "3:2", "5:3", "3:1", "1:1"})
+
+
+def _resolve_draw_size(
+    provider: str, orientation: str, panel_size: str, requested: str = "",
+) -> tuple[str, bool]:
+    """限定档位内解析生图尺寸。返回 (resolved_label, clamped)。
+
+    - 空请求 → 面板值（仍按 orientation 翻转），clamped=False。
+    - NovelAI：请求须为档位内 "WxH"，否则回面板值 clamped=True；
+      按 orientation 定方向（portrait 窄边在前，landscape 宽边在前）。
+    - PixAI：请求 "A[ S]"（如 "16:9" / "16:9 1k"），aspect 非法回面板 clamped=True；
+      S 非法回面板 S（同样记 clamped）；按 orientation 翻转 aspect 分组。
+    """
+    req = (requested or "").strip()
+    is_portrait = (orientation or "portrait") != "landscape"
+    if provider == "novelai":
+        base = (panel_size or "832x1216").strip()
+        if base not in _NOVELAI_DRAW_SIZES:
+            base = "832x1216"
+        if not req:
+            w, h = _split_wh(base)
+            return (_order_wh(w, h, is_portrait=is_portrait), False)
+        # 显式合法值原样执行（方向由所给宽高本身表达，不再翻转）
+        w, h = _split_wh(req.lower().replace(" ", ""))
+        if (w, h) == (0, 0) or f"{w}x{h}" not in _NOVELAI_DRAW_SIZES:
+            w, h = _split_wh(base)
+            return (_order_wh(w, h, is_portrait=is_portrait), True)
+        return (f"{w}x{h}", False)
+    if provider == "pixai":
+        parts = req.split()
+        asp = (parts[0] if parts else "").strip()
+        sz_req = (parts[1] if len(parts) > 1 else "").strip().lower()
+        _pp = (panel_size or "").split()
+        base_asp = (_pp[0] if _pp else "9:16").strip()
+        base_sz = (_pp[1] if len(_pp) > 1 else "1k").strip().lower()
+        if base_asp not in _PIXAI_DRAW_ASPECTS:
+            base_asp = "9:16"
+        if base_sz not in _PIXAI_DRAW_SIZES:
+            base_sz = "1k"
+        if not asp:
+            asp, sz, clamped = base_asp, base_sz, False
+            if (is_portrait and asp in _PIXAI_LANDSCAPE_ASPECTS - {"1:1"}) or (
+                not is_portrait and asp in _PIXAI_PORTRAIT_ASPECTS - {"1:1"}
+            ):
+                asp, clamped = _flip_pixai_aspect(asp), True
+            return (f"{asp} {sz}", clamped)
+        # 显式合法 aspect 原样执行；S 非法回面板 S
+        if asp not in _PIXAI_DRAW_ASPECTS:
+            return (f"{base_asp} {base_sz}", True)
+        sz = sz_req if sz_req in _PIXAI_DRAW_SIZES else base_sz
+        return (f"{asp} {sz}", bool(sz_req) and sz_req not in _PIXAI_DRAW_SIZES)
+    return ((panel_size or "").strip(), False)
+
+
+def _split_wh(s: str) -> tuple[int, int]:
+    try:
+        w, _, h = s.partition("x")
+        return int(w), int(h)
+    except (ValueError, TypeError):
+        return (0, 0)
+
+
+def _order_wh(w: int, h: int, *, is_portrait: bool) -> str:
+    if w <= 0 or h <= 0:
+        return "512x768" if is_portrait else "768x512"
+    if is_portrait:
+        return f"{min(w, h)}x{max(w, h)}"
+    return f"{max(w, h)}x{min(w, h)}"
+
+
+def _flip_pixai_aspect(asp: str) -> str:
+    _pairs = {
+        "9:16": "16:9", "16:9": "9:16", "2:3": "3:2", "3:2": "2:3",
+        "3:4": "4:3", "4:3": "3:4", "3:5": "5:3", "5:3": "3:5",
+        "1:3": "3:1", "3:1": "1:3",
+    }
+    return _pairs.get(asp, asp)
+
+
+def _size_options_text(provider: str) -> str:
+    """未点尺寸时的复述选项块（限定档全列，用户点名即得）。"""
+    if provider == "novelai":
+        return (
+            "\n没定尺寸的话就走默认（只限五档）：\n"
+            "1）832x1216 竖图（默认）\n2）1216x832 横图\n3）1024x1024 方图\n"
+            "4）512x768 小竖图\n5）768x512 小横图\n"
+            "直接回「执行」就按当前尺寸开画。"
+        )
+    if provider == "pixai":
+        return (
+            "\n没定尺寸的话就走默认：比例 9:16/16:9/1:1/2:3/3:2/3:4/4:3/"
+            "3:5/5:3/1:3/3:1 x 档位 1k/1.5k（如“16:9 1k”）。"
+            "直接回「执行」就按当前尺寸开画。"
+        )
+    return ""
+
+
+def _model_options_text(provider: str, model: str = "") -> str:
+    """复述里的模型选项提示（默认full，用户点名即切curated）。"""
+    if str(provider or "").lower() != "novelai":
+        return ""
+    if "curated" in str(model or "").lower():
+        return "（当前curated版，要换回full直接说「要full」。）"
+    return "（模型默认full版，要curated版直接说「要curated」。）"
+
+
+def _orient_of_size(provider: str, label: str, fallback: str) -> str:
+    """由已定尺寸反推方向标记（复述诚实）。方形/未知沿用传入值。"""
+    fb = fallback if fallback in ("portrait", "landscape") else "portrait"
+    try:
+        if provider == "novelai":
+            w, h = _split_wh((label or "").lower().replace(" ", ""))
+            if w > h:
+                return "landscape"
+            if h > w:
+                return "portrait"
+            return fb
+        if provider == "pixai":
+            asp = ((label or "").split() or [""])[0].strip()
+            if asp in _PIXAI_LANDSCAPE_ASPECTS - {"1:1"}:
+                return "landscape"
+            if asp in _PIXAI_PORTRAIT_ASPECTS - {"1:1"}:
+                return "portrait"
+            return fb
+    except Exception:
+        pass
+    return fb
+
+
+# ── 生图角色判定 + 联网身份解析（治根：中文角色名必须先查再画）──
+_DRAW_CHARACTER_IPS: tuple[str, ...] = (
+    "明日方舟", "终末地", "原神", "崩坏3", "崩坏三", "星铁", "星穹铁道", "崩铁", "鸣潮",
+    "碧蓝航线", "蔚蓝档案", "绝区零", "FGO", "hololive",
+)
+_DRAW_CHARACTER_GENERIC: frozenset[str] = frozenset({
+    "同人", "官设", "角色", "人物", "画一张", "画一个", "画一幅",
+    "帮我画", "给我画", "来一张", "来一幅", "横图", "竖图",
+    "少女", "少年", "赛博", "都市", "插画", "壁纸",
+})
+
+
+def _extract_draw_character_query(prompt: str) -> str | None:
+    """判断生图 prompt 是否在画某个特定角色，返回联网检索 query，否返回 None。
+
+    触发条件（二选一）：
+    1. 含已知 IP 名（明日方舟/原神/…）→ 极大概率是角色同人；
+    2. 含「同人/官设/角色」+ 中文名片段 → 无 IP 名的角色单。
+    纯场景描述（赛博都市少女等）不触发，零额外开销。
+    原创强信号（原创角色/自设/OC/自创/我家孩子）→ 直接回 None（原创不走核验；
+    “原神胡桃原创服装”这类同人变体不含强信号，照常触发）。
+    """
+    import re
+
+    src = (prompt or "").strip()
+    if not src:
+        return None
+    try:
+        from ..service.draw_confirm import looks_like_original as _is_oc
+        if _is_oc(src):
+            return None
+    except Exception:
+        pass
+    hit_ip = next((ip for ip in _DRAW_CHARACTER_IPS if ip in src), "")
+    marker_at = min(
+        (src.find(m) for m in ("同人", "官设") if m in src),
+        default=-1,
+    )
+    if not hit_ip and marker_at < 0:
+        return None
+    # 1) 有 IP 名：取 IP 之后到第一个标点前的中文作角色名（「明日方舟普瑞赛斯，…」→普瑞赛斯）
+    if hit_ip:
+        tail = src.split(hit_ip, 1)[1]
+        tail = re.split(r"[，。、,.\s:：|/》〉」』】)）]+", tail)[0]
+        name = re.sub(r"[^\u4e00-\u9fff]", "", tail)[:8]
+        # 前置助词先剥（「的梅比乌斯」→「梅比乌斯」，不占截断窗口；
+        # 旧顺序先截断再split会把“的梅比乌斯”(5字)截成“的梅比乌”丢“斯”）。
+        name = name.lstrip("的之")
+        # 通用人名前缀剥掉（「鸣潮少女达妮娅」→达妮娅，「鸣潮角色达妮娅」→达妮娅，不是少女达妮）
+        for _gen in ("少女", "少年", "美女", "帅哥", "妹子", "猫娘", "男孩", "女孩",
+                     "角色", "人物", "同人", "官设"):
+            if name.startswith(_gen):
+                name = name[len(_gen):]
+                break
+        # 「花火的同人图」→「花火」/「崩坏3的梅比乌斯」→「梅比乌斯」：
+        # 按的/之切分后取首个有效专名段。首段为空即前置助词（的梅比乌斯），
+        # 取后段；尾段是同人/官设等泛词时取首段。旧代码直接取[0]，
+        # “的梅比乌斯”.split(“的”)[0]="" 会吞掉名字，回退成裸IP
+        # （崩坏3→联网泛检索→琪亚娜案）。
+        _parts = [p for p in re.split(r"[的之]", name) if p]
+        _parts = [p.rstrip("的之和与或") for p in _parts]
+        _parts = [p for p in _parts if p and p not in ("同人", "官设", "角色", "人物", "图")]
+        if _parts:
+            name = _parts[0]
+        else:
+            name = ""
+        # 名字过长多半吞了描述，只留前 2-4 字（切分后截，不误伤前置助词位）
+        if len(name) > 4:
+            name = name[:4]
+        # 尾巴助词剥掉（「达妮娅的」→达妮娅；上面已处理，这里兜底单段尾巴）
+        name = name.rstrip("的之和与或")
+        if name in ("同人", "官设", "角色", "人物"):
+            return hit_ip
+        if len(name) >= 2:
+            return f"{hit_ip} {name}"
+        return hit_ip
+    # 2) 无 IP 但有 同人/官设：取标记前最后 2-4 个汉字作名
+    head = src[:marker_at]
+    cjk = re.sub(r"[^\u4e00-\u9fff]", "", head)
+    for verb in ("帮我画", "给我画", "画一张", "画一个", "画一幅", "画一下", "来一张", "来一幅",
+                 "绘制一张", "绘制一个", "绘制一幅", "绘制一下", "生成一张", "生成一个"):
+        cjk = cjk.replace(verb, "")
+    name = cjk[-4:]
+    # 常见动词残留再剥一层
+    name = re.sub(r"^(画|给|帮|请|要|想)", "", name)
+    if len(name) >= 2:
+        return name
+    return None
+
+
+async def _extract_draw_character_query_llm(text: str, bot_id: str = "", *, nsfw: bool = False) -> str | None:
+    """LLM 取名（正则只看门，取名交给 LLM）。
+
+    策略：
+    - 快门（零成本）：无 IP 且无 同人/官设 标记 → 纯场景，直接 None，不调 LLM。
+    - 原创强信号 → 直接 None（原创不走核验）。
+    - 其余疑似角色单 → 调 VLM 槽（与翻译同源，~60 token）抽「作品 角色名」；
+      失败/无配置/空回 → 回退同步正则结果。
+    输出合同：单行「作品 角色名」或「角色名」，纯场景/原创回「无」。
+    """
+    import re as _re_llm
+
+    src = (text or "").strip()
+    if not src:
+        return None
+    try:
+        from ..service.draw_confirm import looks_like_original as _is_oc_llm
+        if _is_oc_llm(src):
+            return None
+    except Exception:
+        pass
+    hit_ip = next((ip for ip in _DRAW_CHARACTER_IPS if ip in src), "")
+    marker_at = min(
+        (src.find(m) for m in ("同人", "官设") if m in src),
+        default=-1,
+    )
+    if not hit_ip and marker_at < 0:
+        return None
+    # 同步正则先算好当兜底（LLM 失败时用，不多花钱）
+    try:
+        _fallback = _extract_draw_character_query(src)
+    except Exception:
+        _fallback = None
+    # VLM 槽复用翻译线（mimo 实测可用；responses/spark 槽直接回退）
+    try:
+        from ..service.bot_config import get_config_service
+        vlm_cfg = get_config_service().resolve_vlm_slot(bot_id or "", "vlm_primary", nsfw=nsfw)
+        if vlm_cfg is None or not vlm_cfg.api_key:
+            return _fallback
+        _base = (vlm_cfg.normalized_base_url or "").rstrip("/")
+        if "/responses" in _base or "muse-spark" in str(vlm_cfg.model_name or "").lower():
+            return _fallback
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=vlm_cfg.api_key, base_url=_base, timeout=15.0)
+        resp = await client.chat.completions.create(
+            model=vlm_cfg.model_name,
+            messages=[
+                {"role": "system", "content": (
+                    "你是生图角色取名器。从用户绘画需求中提取要画的特定角色。\n"
+                    "只回一行：`作品 角色名`（如 `崩坏3 梅比乌斯`）；无作品名只回角色名；\n"
+                    "纯场景/原创角色/无明确角色时只回 `无`。\n"
+                    "规则：不要编全名（不知道姓只给名）；不要加标点解释；\n"
+                    "“XX的同人图”取XX；“IP的角色”取IP+角色；通用词（少女/同人/角色）不算名。"
+                )},
+                {"role": "user", "content": src[:300]},
+            ],
+            max_tokens=60,
+            temperature=0.0,
+            extra_headers={
+                "User-Agent": "suli-qqbot/1.0",
+                "x-opencode-session": "suli-qqbot-vlm",
+            },
+        )
+        out = ((resp.choices[0].message.content or "").strip().split("\n") or [""])[0]
+        out = out.strip().strip("\"' 。，、").strip()
+        if not out or out in ("无", "没有", "NONE", "none", "None", "-", "无角色"):
+            return None
+        # 清洗：只留中文/字母数字/空格，限 20 字防幻觉长尾
+        out = _re_llm.sub(r"[^\u4e00-\u9fffA-Za-z0-9 ·・・]+", "", out).strip()[:20].strip()
+        if len(out) < 2:
+            return _fallback
+        # 纯通用词回 None（防 “横图少女” 这类被当成名）
+        if out in ("同人", "官设", "角色", "人物", "少女", "少年"):
+            return None
+        logger.info("[draw_character] LLM取名: %.30s → %s (fallback=%s)", src[:30], out, _fallback)
+        return out
+    except Exception:
+        logger.debug("[draw_character] LLM取名失败，回退正则", exc_info=True)
+        return _fallback
+
+
+async def _resolve_draw_character_via_web(query: str, bot_id: str, *, nsfw: bool = False) -> dict | None:
+    """联网解析角色身份：官方名/系列/Danbooru tag/Pixiv tag/官设特征。
+
+    Returns:
+        {"danbooru", "pixiv", "name", "series", "features"} 缺失键为空串；
+        失败返回 None（调用方按原译文执行，特征兜底）。
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    # 系列裸查否决（2026-10-15 普瑞赛斯案）：query 去掉系列名后无残留
+    # （如“明日方舟”）→ 直接回 None，不许联网/VLM。VLM 被问“明日方舟是哪个角色”
+    # 必编一个出来（shining 案），还会经 learn() 污染圣经。圣经 lookup 自带同款
+    # guard，此处是第二道门；同时 learn() 侧也永久拒收无名 query（见下）。
+    try:
+        from ..service.character_bible import _SERIES_CN as _SERIES_CN_R
+        from ..service.character_bible import _norm as _bnorm_r
+        _qr = _bnorm_r(q)
+        for _cn_r, _en_r in _SERIES_CN_R:
+            _qr = _qr.replace(_bnorm_r(_cn_r), "")
+            _qr = _qr.replace(_bnorm_r(_en_r), "")
+        if not _qr.strip():
+            logger.info("[draw_character] 系列裸查拒解 query=%r", q[:40])
+            return None
+    except Exception:
+        pass
+    # 本地圣经秒查 (零耗时零费用)：热门二游直接命中，不吃网关脸色
+    try:
+        from ..service.character_bible import lookup as _bible_lookup
+        _hit = _bible_lookup(q)
+        if _hit and _hit.get("danbooru"):
+            logger.info("[draw_character] 圣经命中: 「%s」→ %s", q[:40], _hit["danbooru"])
+            return _hit
+    except Exception:
+        logger.debug("[draw_character] 圣经查询跳过", exc_info=True)
+    try:
+        results = await web_search(f"{q} pixiv", max_results=5)
+        if not results:
+            return None
+        formatted = format_web_results(results, q)
+        # 背景槽多为 /responses 协议 (spark)，raw chat.completions 必 404
+        # (2026-10-11 教训，同 _translate_draw_prompt)——走 VLM 槽 (mimo)。
+        from ..service.bot_config import get_config_service
+
+        vlm_cfg = get_config_service().resolve_vlm_slot(bot_id or "", "vlm_primary", nsfw=nsfw)
+        if vlm_cfg is None or not vlm_cfg.api_key:
+            return None
+        _base = (vlm_cfg.normalized_base_url or "").rstrip("/")
+        if "/responses" in _base or "muse-spark" in str(vlm_cfg.model_name or "").lower():
+            return None
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            api_key=vlm_cfg.api_key, base_url=_base, timeout=30.0,
+        )
+        resp = await client.chat.completions.create(
+            model=vlm_cfg.model_name,
+            messages=[
+                {"role": "system", "content": (
+                    "You identify an anime/game character for image generation.\n"
+                    "Given a Chinese query + web search results, output EXACTLY 5 lines:\n"
+                    "danbooru: <danbooru tag `name (series)` lowercase, e.g. "
+                    "priestess (arknights)>\n"
+                    "pixiv: <official Pixiv tag, JP or EN>\n"
+                    "name: <official character name>\n"
+                    "series: <official series name>\n"
+                    "features: <canonical visual features, comma-separated English, "
+                    "hair/eyes/outfit, under 30 words>\n"
+                    "Rules: no Chinese in the danbooru line; "
+                    "if unsure of the official name, romanize + keep features; "
+                    "NEVER output anything besides these 5 lines."
+                )},
+                {"role": "user", "content": (
+                    f"Character query: {q}\n\nWeb search results:\n{formatted[:3000]}"
+                )},
+            ],
+            max_tokens=400,
+            temperature=0.0,
+            # opencode.ai 网关必需头 (与 _translate_draw_prompt 同源，缺之 400 MissingSessionID)
+            extra_headers={
+                "User-Agent": "suli-qqbot/1.0",
+                "x-opencode-session": "suli-qqbot-vlm",
+            },
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        out = {"danbooru": "", "pixiv": "", "name": "", "series": "", "features": ""}
+        for line in text.split("\n"):
+            low = line.strip().lower()
+            for key in out:
+                if low.startswith(key + ":"):
+                    out[key] = line.split(":", 1)[1].strip().strip("\"' ")[:200]
+        # 兜底：LLM 没按 5 行格式回时，正文里捞 `名字 (系列)` 样 tag
+        if not out["danbooru"]:
+            import re as _re2
+            _m = _re2.search(r"([a-z0-9][a-z0-9 _\-']{1,40}\([a-z0-9 :\-]+\))", text.lower())
+            if _m:
+                out["danbooru"] = _m.group(1).strip()[:200]
+        import re as _re
+        if out["danbooru"] and _re.search(r"[一-鿿]", out["danbooru"]):
+            out["danbooru"] = ""
+        if not out["danbooru"]:
+            logger.warning(
+                "[draw_character] 解析无有效 danbooru tag query=%r raw=%.200s",
+                q[:40], text,
+            )
+            return None
+        logger.info(
+            "[draw_character] 「%s」→ %s / pixiv=%s",
+            q[:40], out["danbooru"], out["pixiv"][:30],
+        )
+        # 自学习进圣经：下次同角色秒出
+        try:
+            from ..service.character_bible import learn as _bible_learn
+            _bible_learn({**out, "series": out.get("series", "")}, query_name=q)
+        except Exception:
+            pass
+        return out
+    except Exception as _e:
+        # 单行告警不清栈（AstrBot 会把 exc_info 渲染成 rich 长 traceback 刷屏）
+        logger.warning("[draw_character] 联网解析失败: %.150s", str(_e))
+        return None
+
+
+async def execute_resolve_character_identity(params: dict, tool_context: dict | None = None) -> str:
+    """执行 resolve_character_identity — 生图表单元核验工具入口。
+
+    包一层 _resolve_draw_character_via_web（圣经→联网→自学习），返回 5 行结构化文本，
+    供任务执行器 / tavern loop 直接取 danbooru tag 填表。失败回空并明示，不编数。
+    """
+    _q = str((params or {}).get("query", "") or "").strip()
+    _hint = str((params or {}).get("series_hint", "") or "").strip()
+    if _hint and _hint not in _q:
+        _q = f"{_hint} {_q}".strip()
+    if not _q:
+        return "❌ 缺 query：请给「作品+角色名」（如「明日方舟 普瑞赛斯」）。"
+    try:
+        from ..service.draw_confirm import looks_like_original as _is_oc_tool
+        if _is_oc_tool(_q):
+            return (
+                f"「{_q[:40]}」是原创角色，无需外部核验：不要查圣经/联网，"
+                "直接用用户给的外貌描述画；外貌不足两样时先向用户要细节，不硬编。"
+            )
+    except Exception:
+        pass
+    _bot = ""
+    try:
+        _bot = str(((tool_context or {}).get("bot_id", "")) or "") or (_current_bot_id.get() or "")
+    except Exception:
+        _bot = ""
+    _out = await _resolve_draw_character_via_web(_q, _bot or "", nsfw=_tool_ctx_nsfw(tool_context))
+    if not _out or not (_out.get("danbooru") or "").strip():
+        return (
+            f"未核实「{_q[:40]}」的官方身份（圣经+联网均无有效 Danbooru tag）。"
+            "按通用画法，不要编发色瞳色；复述里必须明示不确定。"
+        )
+    return "\n".join([
+        f"danbooru: {_out.get('danbooru', '')}",
+        f"pixiv: {_out.get('pixiv', '')}",
+        f"name: {_out.get('name', '')}",
+        f"series: {_out.get('series', '')}",
+        f"features: {_out.get('features', '')}",
+    ])
+
+
+# ── 空主体拦截：用户没说画什么时不许建单编主体 ──
+# 背景：agent 按“第2步补全”自由发挥时，会把“画一张图好不好”补成完整少女下单
+# （棕色双马尾事故）。user_raw 为触发原话（schema 要求原文复制）；用它做决定性
+# 检查：剥掉称呼/画图动词/客套后，0 有效字（纯空话）→ 直接反问，不建单不翻译。
+# 2026-10-14 收紧：阈值只拦剥完 0 字。短主体（猫/少女/鲸鱼娘）是合法需求，
+# 此前 <4 会误伤（“给我画只猫”剩“只猫”=2 字被拦），不再用长度卡内容。
+_DRAW_SUBJECT_STRIP = (
+    "暮恩", "moon",
+    "帮我画一张图", "帮我画", "给我画", "画一张图", "画个图", "画一张", "画一个",
+    "画一幅", "画一下", "画图", "画画", "生图", "来一张", "来一幅",
+    "帮我", "给我", "请", "好不好", "可以吗", "行不行", "好吗", "行吗",
+    "麻烦", "谢谢", "感谢",
+    "一下", "一张", "一个", "一幅", "一只", "一条", "一头", "一匹",
+    "只", "条", "头", "匹", "双", "两", "位", "图片", "插画",
+    "吧", "嘛", "哦", "呀", "呢", "吗", "的", "张", "图", "画",
+    "了", "啊", "哈", "呐", "哒", "啦",
+    "？", "?", "！", "!", "。", "～", "~", " ", "，", ",",
+)
+
+
+def _draw_subject_length(user_raw: str) -> int:
+    """原话去噪后剩余有效字符数（CJK/字母数字都算）。
+
+    顺序是定的，不许调换：先剥 @/CQ/空白，再剥噪音词。
+    反例（2026-10-14 自画像事故）：“@某 bot 画一张你的自画像哦”——
+    若先剥噪音词，空格被吃掉后“@”和残字连体（@你自像），@正则一口吞掉
+    整串，误判 0 字。先剥 @，剩下的才是真正的用户正文。
+    """
+    import re as _re_subj
+    _s = _re_subj.sub(r"\[.*?\]|@\S*|\s+", "", str(user_raw or "").strip())
+    for _tok in sorted(_DRAW_SUBJECT_STRIP, key=len, reverse=True):
+        _s = _s.replace(_tok, "")
+    return len([_c for _c in _s if _c.strip()])
+
+
+async def _draw_confirm_gate(
+    params: dict, tool_context: dict | None,
+    *, tool: str, orientation: str, image_url: str = "",
+) -> tuple[bool, str, dict]:
+    """生图双相确认门 (generate/edit 共用)。
+
+    Returns:
+        (proceed, reply, spec_dict)。
+        proceed=False → reply 为复述文本 (直接返回给 LLM，本轮零扣费)；
+        proceed=True → spec_dict 为确认过的执行参数 (用单中译文执行)。
+    """
+    from ..service.draw_confirm import CAPPED_TEXT as _CAPPED
+    from ..service.draw_confirm import MAX_RESTAGES as _MAX_RS
+    from ..service.draw_confirm import (
+        DrawSpec,
+        build_repeat_text,
+        consume_order,
+        peek_order,
+        stage_order,
+    )
+
+    ctx = tool_context if tool_context is not None else {}
+    bot_id = str(ctx.get("bot_id", "") or "") or (_current_bot_id.get() or "")
+    # F1: 无工具上下文路径读不到记忆上下文，依次回退：显式 ctx → 记忆 ctx → 任务级共享 trigger
+    trigger_uid = str(ctx.get("trigger_user_id", "") or "") or _get_memory_ctx().get("trigger_user_id", "")
+    if not trigger_uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv
+            trigger_uid = str(_trigger_cv() or "")
+        except Exception:
+            pass
+    prompt = str(params.get("prompt", "") or "").strip()
+    confirmed = params.get("confirmed") is True
+    req_size = str(params.get("size", "") or "").strip()
+
+    # ── NSFW 自主配图直执旁路 (2026-10-17 裁定: agent 自绘不必审批) ──
+    # dispatcher 三验 zone 后透传 nsfw_zone_verified → 本调用无用户订单、
+    # 无 user_raw 属正常形态: 免确认门、免空主体打回, 直接用传入参数执行。
+    # 事故背景: 15:33 自主配图无单滑到 user_raw 打回 → 打回文案被直执
+    # 误判为成功 → 图根本没画, 最终报"有图无发送上下文"。
+    if bool(ctx.get("nsfw_zone_verified")):
+        return True, "", {
+            "prompt": prompt,
+            "orientation": orientation,
+            "image_url": image_url,
+            "size": req_size,
+            "use_pixiv_refs": bool(params.get("use_pixiv_refs")),
+        }
+
+    if confirmed and trigger_uid:
+        spec = peek_order(bot_id, trigger_uid)
+        if spec is not None and spec.tool == tool:
+            try:
+                from ..service.draw_confirm import require_ready_to_draw as _req_ready_gate
+                _rok, _rreason = _req_ready_gate(spec)
+                if not _rok:
+                    logger.info("🎨 确认被表单门拦截 user=%s reason=%s",
+                                (trigger_uid or "?")[:8], _rreason[:120])
+                    return False, _rreason, {}
+            except Exception:
+                pass
+            consume_order(bot_id, trigger_uid)
+            logger.info("🎨 双相确认通过 user=%s tool=%s", trigger_uid[:8], tool)
+            return True, "", {
+                "prompt": spec.prompt_en or spec.prompt or prompt,
+                "orientation": spec.orientation or orientation,
+                "image_url": spec.image_url or image_url,
+                "size": spec.size_label or "",
+                "use_pixiv_refs": bool(getattr(spec, "use_pixiv_refs", False)),
+            }
+        logger.info("🎨 确认无效 (无单/过期/他人) user=%s → 终止本次", (trigger_uid or "?")[:8])
+
+    # 改单上限：有单且已改满 → 封顶话术，不烧翻译不存新单（旧单保留可直接确认）
+    _old_spec = peek_order(bot_id, trigger_uid) if trigger_uid else None
+    if _old_spec is not None and int(_old_spec.restages or 0) >= _MAX_RS:
+        logger.info(
+            "🎨 改单封顶 user=%s restages=%d", (trigger_uid or "?")[:8], _old_spec.restages,
+        )
+        return False, _CAPPED, {}
+
+    # 纯横竖改单（横图没变过来案）：有旧单 + 短句只说横/竖时原地翻旧单，
+    # 不重建新单（新单会丢主体）。与 dispatcher 同源判定。
+    if _old_spec is not None and tool == "generate_image":
+        try:
+            from ..service.draw_confirm import apply_orientation_modify as _apply_ori_g
+            from ..service.draw_confirm import parse_orientation_modify as _parse_ori_g
+            _raw_g = str(params.get("user_raw") or params.get("prompt") or "").strip()
+            _want_g = _parse_ori_g(_raw_g) or _parse_ori_g(orientation or "")
+            # orientation 参数本身也算：agent 传 landscape 但 prompt 是“改成横图”短句
+            if not _want_g and str(orientation or "").strip().lower() in ("landscape", "portrait"):
+                # 只有旧单存在且新 prompt 很短（无新主体）时才视为改单
+                _pg = str(params.get("prompt") or "").strip()
+                _ug = str(params.get("user_raw") or "").strip()
+                if len(_pg) <= 12 and len(_ug) <= 20:
+                    _want_g = str(orientation or "").strip().lower()
+            if _want_g and str(getattr(_old_spec, "orientation", "") or "") != _want_g:
+                _apply_ori_g(_old_spec, _want_g)
+                stage_order(
+                    bot_id, trigger_uid, _old_spec,
+                    restages=int(_old_spec.restages or 0) + 1,
+                )
+                try:
+                    from ..service.tavern_client import get_character_for_self_id as _get_card_g
+                    _char_g = str((_get_card_g(str(bot_id)) or {}).get("name", "") or "")
+                except Exception:
+                    _char_g = ""
+                logger.info("🎨 横竖改单原地翻 user=%s want=%s", (trigger_uid or "?")[:8], _want_g)
+                return False, build_repeat_text(_old_spec, note="", char_name=_char_g), {}
+        except Exception:
+            pass
+
+    # Pixiv 参考绘制仅主人可用 (R18 参考同理只收主人的份, 见搜图侧)。
+    # 非主人带 flag 直接拒, 不建单不烧翻译; 确认门只认同 (bot,user) 的单, 跨人串用本来就不可能。
+    if bool(params.get("use_pixiv_refs")) and tool == "generate_image":
+        if not _is_draw_master(bot_id, trigger_uid):
+            logger.info("🎨 Pixiv 参考绘制被拒: 非主人 user=%s", (trigger_uid or "?")[:8])
+            return False, _get_tool_rejection(
+                bot_id or _current_bot_id.get(), "image_gen_master_only",
+            ), {}
+
+    # 空主体拦截（无视觉输入时）：原话无主体 → 反问，不建单（防编主体幻觉下单）
+    _has_visual = bool(
+        str(params.get("image_url") or "").strip()
+        or params.get("image_urls")
+        or params.get("use_pixiv_refs")
+    )
+    if tool == "generate_image" and not _has_visual:
+        _raw0 = str(params.get("user_raw") or "").strip()
+        if not _raw0:
+            logger.info("🎨 user_raw 缺失打回 user=%s", (trigger_uid or "?")[:8])
+            return False, (
+                "缺 user_raw：把触发这次绘图的用户原话一字不差填进 user_raw 再调一次。"
+                "若用户确实没说主体（只说画一张图类），不要调用、直接问用户画什么。"
+                "这是给你（agent）的指令，转述给用户时只问画什么，别提 user_raw。"
+            ), {}
+        if _draw_subject_length(_raw0) == 0:
+            logger.info("🎨 空主体打回 user=%s raw=%.30s", (trigger_uid or "?")[:8], _raw0)
+            return False, (
+                "用户还没说画什么（原话无主体），不要建单编主体。"
+                "直接问用户：想画什么呀？人物/场景/风格说一个就行。"
+                "说完就停，不追加追问。"
+            ), {}
+        if not _raw0:
+            logger.debug("🎨 user_raw 缺失 user=%s，走旧复述流程", (trigger_uid or "?")[:8])
+
+    # 第一相: 组织复述单 (需后端配置定模型/尺寸；显式 size 仅限定档位内有效)
+    # 票面按触发者身份+等级定档：主人 → 面板主人档 V5 / Lv.2+ → 面板公共档 V5 / Lv.0-1 → V4.5 体验。
+    # 面板值动态取（_resolve_draw_backend），兜底才是硬编码；体验档与执行层同口径，票面即执行。
+    provider, _ncfg, _pcfg = _resolve_draw_backend(
+        bot_id, trigger_uid, _scene_group_id(ctx),
+        private=_is_private_ctx(ctx),
+    )
+    if provider == "novelai":
+        _model = _ncfg.get("model") or "nai-diffusion-4-5-full"
+        _panel_size = _ncfg.get("size") or "832x1216"
+    elif provider == "pixai":
+        _asp = _pcfg.get("aspect") or "9:16"
+        _panel_size = f"{_asp} {_pcfg.get('size') or '1k'}"
+        _model = _pcfg.get("model") or "1983308862240288769"
+    else:
+        _model, _panel_size = "", ""
+    _is_trial_ticket = False
+    if tool in ("generate_image", "edit_image") and provider == "novelai" and trigger_uid and not _is_draw_master(bot_id, trigger_uid):
+        try:
+            from astrbot_plugin_suli_emotion.affinity import can_generate_image as _cgi
+            _bid_aff = bot_id or _current_bot_id.get() or ""
+            _admin_q = (ctx.get("admin_qq") or "") or None
+            _formal_min = _get_draw_min_level(_bid_aff, tool, fallback=2)
+            if not _cgi(trigger_uid, admin_qq=_admin_q, self_id=_bid_aff, min_level=_formal_min) and _cgi(
+                trigger_uid, admin_qq=_admin_q, self_id=_bid_aff, min_level=0
+            ):
+                _is_trial_ticket = True
+                _model = "nai-diffusion-4-5-full"
+        except Exception:
+            pass
+    _size, _clamped = _resolve_draw_size(provider, orientation, _panel_size, req_size)
+    _orientation = _orient_of_size(provider, _size, orientation or "portrait")
+    # NSFW 区画图: 提示词翻译 / 角色核验的 VLM 调用走 NSFW 专属槽 (未配 = 跟随 SFW)
+    _draw_nsfw = _tool_ctx_nsfw(ctx)
+    prompt_en = await _translate_draw_prompt(prompt, bot_id, nsfw=_draw_nsfw)
+
+    # 角色同人治根：中文角色名单先联网定身份（官方名/Danbooru tag/官设特征），
+    # 命中才查（IP 名/同人标记），纯场景零开销；失败按原译文执行。
+    # 统一表单 (2026-10-13)：核验结果写回表单槽位 + missing，不只改 prompt_en 字符串。
+    _char_tag_note = ""
+    _char_resolved = None
+    _char_query = ""
+    if tool == "generate_image" and provider == "novelai":
+        # LLM 取名优先、正则兜底（梅比乌斯案：正则吞“的”回退裸IP→错tag）
+        try:
+            _char_q = await _extract_draw_character_query_llm(prompt, bot_id or "", nsfw=_draw_nsfw)
+        except Exception:
+            _char_q = None
+        if not _char_q:
+            try:
+                _char_q = _extract_draw_character_query(prompt)
+            except Exception:
+                _char_q = None
+        if _char_q:
+            _char_query = _char_q
+            _resolved = await _resolve_draw_character_via_web(_char_q, bot_id, nsfw=_draw_nsfw)
+            _char_resolved = _resolved
+            if _resolved:
+                _tag = (_resolved.get("danbooru") or "").strip()
+                # 官设优先：tag + 官设特征顶到最前，压住翻译层可能编造的细节
+                # (tag 越靠前权重越高；编造的发色瞳色会把角色带偏)。
+                _head = _tag
+                _feats = (_resolved.get("features") or "").strip()
+                if _feats:
+                    _head += f", {_feats}"
+                if _tag and _tag.lower() not in (prompt_en or "").lower():
+                    prompt_en = f"{_head}, {prompt_en}"
+                _disp = (_resolved.get("name") or _char_q).strip()[:30]
+                _char_tag_note = f"（角色：{_disp} → {_tag}）"
+            else:
+                # 怀疑是角色但没核实：明示不确定，不自信地编
+                _char_tag_note = f"（{_char_q} 的身份没联网核实，外貌是通用画法——错了直接纠我，或丢张参考图对着画）"
+
+    # Pixiv 参考挂载意愿 (仅文生图有效): 有暂存才建单, 否则当场指引 LLM 先搜图。
+    _want_refs = bool(params.get("use_pixiv_refs")) and tool == "generate_image"
+    _refs_n = pending_pixiv_count(bot_id, trigger_uid) if (_want_refs and trigger_uid) else 0
+    if bool(params.get("use_pixiv_refs")) and tool == "generate_image" and trigger_uid and _refs_n == 0:
+        return False, (
+            "没有已暂存的 Pixiv 参考图（已过期或还没搜过）。"
+            "先调 pixiv_search 搜图发图，再调 generate_image 并传 use_pixiv_refs=true。"
+            "说完就停，不追加追问。"
+        ), {}
+    spec_view = DrawSpec(
+        prompt=prompt, prompt_en=prompt_en, orientation=_orientation,
+        size_label=_size, model=_model, provider=provider, tool=tool,
+        image_url=image_url, use_pixiv_refs=bool(_want_refs and _refs_n > 0),
+        theme=prompt, requested_size=req_size, size_clamped=bool(_clamped),
+    )
+    try:
+        from ..service.draw_confirm import apply_character_resolution as _apply_char_gate
+        from ..service.draw_confirm import apply_size_resolution as _apply_size_gate
+        _apply_char_gate(spec_view, _char_resolved, query=_char_query)
+        _apply_size_gate(spec_view, _size, bool(_clamped), requested=req_size)
+        try:
+            from ..service.draw_confirm import ensure_prompt_head as _ensure_head_gate
+            _ensure_head_gate(spec_view)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from ..service.aesthetic_skill import enhance_prompt_en as _aes_enh_gate
+        spec_view.prompt_en = _aes_enh_gate(spec_view.prompt_en or "", _orientation)
+    except Exception:
+        pass
+    # 缺件不落单 (2026-10-15)：信息不齐不出复述单，不 stage。
+    # 调用方 (agent) 收到拦截原因后，应先调 resolve_character_identity 等工具补齐，
+    # 补齐后带齐参数重调一次，齐了才落单。用户侧看到的是缺件说明，不是待确认单。
+    try:
+        from ..service.draw_confirm import require_ready_to_draw as _req_ready_gate
+        _gok, _greason = _req_ready_gate(spec_view)
+    except Exception:
+        _gok, _greason = True, ""
+    if not _gok:
+        return False, (
+            f"{_greason}先补上，补完重说一次需求，我按新单重开。"
+            "说完就停，不追加追问。"
+        ), {}
+    stage_order(bot_id, trigger_uid, spec_view, restages=(int(_old_spec.restages or 0) + 1 if _old_spec else 0))
+    _note = f"（所要尺寸超限定档，已按 {_size} 执行）" if _clamped else ""
+    if _is_trial_ticket:
+        _note += "（本次为低好感体验档·V4.5，每日3次）"
+    if _char_tag_note:
+        _note += _char_tag_note
+    if _want_refs and _refs_n > 0:
+        _note += f"（参考：已暂存 Pixiv 参考图 {_refs_n} 张，执行时挂载）"
+    # 没点中尺寸（没说/超纲）→ 复述里摆选项；点中合法值 → 不打扰
+    if not (req_size and not _clamped):
+        _note += _size_options_text(provider)
+    # 模型选项提示：默认full，要curated一句话即切（V5/V4.5同规则）
+    if provider == "novelai":
+        _note += _model_options_text(provider, _model)
+    # 复述口吻 per-bot (2026-10-12): 与 dispatcher 同源, 取不到角色名走中性版
+    _char_n = ""
+    try:
+        from ..service.tavern_client import get_character_for_self_id as _get_card
+
+        _char_n = str((_get_card(str(bot_id)) or {}).get("name", "") or "")
+    except Exception:
+        _char_n = ""
+    return False, build_repeat_text(spec_view, note=_note, char_name=_char_n), {}
+
+
 async def execute_generate_image(params: dict, tool_context: dict | None = None) -> str:
     """执行 generate_image 工具 — 调用云端 AI 绘图 API 生成图片。
 
     图片字节通过 _pending_images 侧通道传出，调用方负责发送到 QQ。
     返回文本描述供 LLM 融入回复。
 
-    bot_id 感知: 通过 tool_context["bot_id"] 解析 per-bot 绘图配置,
-    peer bot 用 Gemini (gemini-3-pro-image-preview), 主 bot 用 gpt-image-2。
+    bot_id 感知: 通过 tool_context["bot_id"] 读面板绘图分配，
+    NovelAI 走 NovelAIClient，PixAI 走 PixAIClient (建任务→轮询→下载)。
     """
     prompt = params.get("prompt", "").strip()
     orientation = params.get("orientation", "portrait").strip()
@@ -1554,29 +4036,109 @@ async def execute_generate_image(params: dict, tool_context: dict | None = None)
     if not prompt:
         return "❌ 绘图失败: 未提供图片描述 (prompt 为空)"
 
-    # ── 门控 1: 好感等级 ≥ Lv.3 ──
+    # ── 总开关: 默认关闭 (面板可按 bot 重开)。放最前，不耗任何额度 ──
+    _draw_bid = (tool_context if tool_context is not None else {}).get("bot_id", "")
+    _draw_bid = _draw_bid or _current_bot_id.get()
+    if _draw_bid and not _draw_switch(_draw_bid, "generate_image"):
+        return _DRAW_SWITCH_OFF_TEXT
+
+    # ── 双相确认门 (2026-10-11)：首次返回复述单，确认后用单中译文执行 ──
+    _proceed, _repeat, _spec = await _draw_confirm_gate(
+        params, tool_context, tool="generate_image", orientation=orientation,
+    )
+    if not _proceed:
+        return _repeat
+    prompt = _spec.get("prompt", "") or prompt
+    orientation = _spec.get("orientation", "") or orientation
+    # 单中尺寸即所复述的执行尺寸（门内已按限定档校验）；缺失回面板
+    _staged_size = str(_spec.get("size", "") or "").strip()
+
+    # ── Per-bot 后端分发 (先分发，门控按后端分级；NovelAI 免费通道更宽) ──
+    # F1: 无工具上下文路径记忆上下文为空，回退显式 ctx/任务级共享 trigger
+    # (身份必须在分发前算好 —— 计费后端只认主人, 模型按身份分档)
+    bot_id = (tool_context if tool_context is not None else {}).get("bot_id", "")
+    trigger_uid = str((tool_context or {}).get("trigger_user_id", "") or "")
+    trigger_uid = trigger_uid or _get_memory_ctx().get("trigger_user_id", "")
+    if not trigger_uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv_q1
+            trigger_uid = str(_trigger_cv_q1() or "")
+        except Exception:
+            pass
+    provider, _ncfg, _pcfg = _resolve_draw_backend(
+        bot_id, trigger_uid, _scene_group_id(tool_context),
+        private=_is_private_ctx(tool_context),
+    )
+    if provider == "none":
+        return _draw_backend_missing_text(provider, False)
+    if provider == "novelai" and not (_ncfg.get("token") or "").strip():
+        return _draw_backend_missing_text(provider, True)
+    if provider == "pixai" and not (_pcfg.get("key") or "").strip():
+        return _draw_backend_missing_text(provider, True)
+    _pool = provider if provider in ("novelai", "pixai") else ""
+    _min_level = _get_draw_min_level(_draw_bid or bot_id or "", "generate_image", fallback=2)
+
+    # ── 门控 1: 好感等级 (正式档跟随面板；NovelAI 低好感 Lv.0+ 转体验档) ──
     # 注: Gate 已在工具列表层面过滤, LLM 能调到本工具说明 Gate 已授权, 无需二次校验
-    trigger_uid = _get_memory_ctx().get("trigger_user_id", "")
     admin_qq_ctx = (tool_context if tool_context is not None else {}).get("admin_qq")
+    # 主人不限制次数 (2026-10-12)：直接认 draw_access 主人，不依赖 admin_qq 透传
+    # (后台任务/dispatcher 路 tool_context 常无 admin_qq，主人会被误计限额)。
+    _draw_master = _is_draw_master(_draw_bid or _current_bot_id.get() or "", trigger_uid or "")
+    _is_trial = False
+    # ── NSFW 主人专属门（QQ 号校验）：非主人 NSFW 直接礼貌拒绝，不进确认/配额/API ──
+    if trigger_uid and not _draw_master and _is_nsfw_request(prompt):
+        logger.info("🎨 [Tool] generate_image 非主人NSFW拒绝 user=%s", (trigger_uid or "?")[:8])
+        return _nsfw_master_only_text(bot_id or _draw_bid)
     if trigger_uid:
         can_generate_image = _deps.can_generate_image
-        if not can_generate_image(trigger_uid, admin_qq=admin_qq_ctx, self_id=_current_bot_id.get()):
-            return _get_tool_rejection(
-                _current_bot_id.get(), "image_gen_affinity",
-            )
+        _aff_self = _draw_bid or _current_bot_id.get()
+        _aff_ok = can_generate_image(
+            trigger_uid, admin_qq=admin_qq_ctx, self_id=_aff_self, min_level=_min_level,
+        )
+        if not _aff_ok:
+            # 低好感体验档：NovelAI 非主人且好感≥Lv.0 转 V4.5 full 试用（日限3），PixAI/主人不转
+            if provider == "novelai" and not _draw_master and can_generate_image(
+                trigger_uid, admin_qq=admin_qq_ctx, self_id=_aff_self, min_level=0,
+            ):
+                try:
+                    _t_ok, _t_rem = _deps.check_daily_image_limit(
+                        trigger_uid, admin_qq=admin_qq_ctx, pool="novelai_trial",
+                    )
+                except Exception:
+                    _t_ok, _t_rem = False, 0
+                if _t_ok:
+                    _is_trial = True
+                    _aff_ok = True
+                    logger.info(
+                        "🎨 [Tool] generate_image 低好感转体验档 user=%s 剩余=%d",
+                        (trigger_uid or "?")[:8], _t_rem,
+                    )
+            if not _aff_ok:
+                return _get_tool_rejection(
+                    _draw_bid or _current_bot_id.get(), "image_gen_affinity",
+                )
 
-    # ── 门控 2: 每日限额 3 张 ──
-    if trigger_uid:
+    # ── 门控 2: 每日限额 (NovelAI 池 5 张，PixAI 池 3 张，体验池 3 张，各自独立计数；主人不限) ──
+    # NSFW 自主配图不限量 (2026-10-14 用户裁定)：dispatcher 自主分支已三验 zone，
+    # 经该路透传 nsfw_zone_verified 的调用跳过限额（好感门照常）。
+    _nsfw_verified = bool((tool_context or {}).get("nsfw_zone_verified"))
+    if trigger_uid and not _draw_master and not _nsfw_verified and not _is_trial:
         check_daily_image_limit = _deps.check_daily_image_limit
-        allowed, remaining = check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx)
+        allowed, remaining = check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx, pool=_pool)
         if not allowed:
             return _get_tool_rejection(
-                _current_bot_id.get(), "image_gen_daily",
+                _draw_bid or _current_bot_id.get(), "image_gen_daily",
+            )
+    if _is_trial:
+        _t_ok2, _ = _deps.check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx, pool="novelai_trial")
+        if not _t_ok2:
+            return _get_tool_rejection(
+                _draw_bid or _current_bot_id.get(), "image_gen_daily",
             )
 
-    # ── 门控 3: 绘图冷却 3 分钟 (per-bot) ──
-    if trigger_uid:
-        _bid = _current_bot_id.get()
+    # ── 门控 3: 绘图冷却 3 分钟 (per-bot；主人不限) ──
+    if trigger_uid and not _draw_master:
+        _bid = _draw_bid or _current_bot_id.get()
         _cd_key = f"{_bid}:{trigger_uid}" if _bid else trigger_uid
         now = time.time()
         last = _DRAW_COOLDOWN.get(_cd_key, 0.0)
@@ -1588,106 +4150,240 @@ async def execute_generate_image(params: dict, tool_context: dict | None = None)
             )
         # 注意: 此处只检查不记录 — 生成成功后才记录 (避免失败锁冷却)
 
-    # 尺寸映射
-    size = "1024x1536" if orientation == "portrait" else "1536x1024"
+    # ── 导入纯库客户端 (懒加载，缺插件则报未就绪) ──
+    try:
+        if provider == "novelai":
+            from astrbot_plugin_suli_novelai import novelai_client as _nmod
+        else:
+            from astrbot_plugin_suli_pixai import pixai_client as _pmod
+    except ImportError:
+        logger.warning("🎨 [Tool] generate_image: 绘图纯库插件缺失", exc_info=True)
+        return _draw_backend_missing_text(provider, False)
 
-    # ── 构建客户端 ──
-    _draw = _deps.draw_client
-    AuthError = _draw.AuthError
-    ContentModerationError = _draw.ContentModerationError
-    ImageGenClient = _draw.ImageGenClient
-    ImageGenError = _draw.ImageGenError
-    RateLimitError = _draw.RateLimitError
-    TimeoutError = _draw.TimeoutError
-
-    # ── Per-bot 绘图配置: 统一走 vlm_secondary 槽位 ──
-    bot_id = (tool_context if tool_context is not None else {}).get("bot_id", "")
-
-    vlm_cfg = None
-    if bot_id:
-        try:
-            from ..service.bot_config import get_config_service
-            svc = get_config_service()
-            vlm_cfg = svc.resolve_vlm_slot(bot_id, "vlm_secondary")
-        except Exception:
-            logger.warning("generate_image: 解析 vlm_secondary 槽位失败", exc_info=True)
-
-    if vlm_cfg is None:
-        return (
-            "⛔ 绘图功能当前未配置。你的画图能力是正常的——只是后端配置暂未就绪。\n"
-            "不要说自己「没有生图功能」。按你的角色风格自然表达：\n"
-            "「画图功能还在准备中呢，等管理员配好就能帮你画啦～」\n"
-            "说完就停，不追加追问。"
+    # ── 预检: 先验 API 通不通 (纯库 probe，零扣费) ──
+    if provider == "novelai":
+        _nclient = _nmod.NovelAIClient(
+            access_token=_ncfg["token"],
+            default_model=_ncfg.get("model") or "nai-diffusion-4-5-full",
+            default_size=_ncfg.get("size") or "832x1216",
+            default_steps=int(_ncfg.get("steps") or 23),
+            timeout=180,
+        )
+        _probe_ok, _probe_reason = await _nclient.probe()
+    else:
+        _pclient = _pmod.PixAIClient(
+            api_key=_pcfg["key"],
+            default_model=_pcfg.get("model") or "1983308862240288769",
+            default_aspect=_pcfg.get("aspect") or "9:16",
+            default_size=_pcfg.get("size") or "1k",
+        )
+        _probe_ok, _probe_reason = await _pclient.probe()
+    if not _probe_ok:
+        return _DRAW_PROBE_FAIL_TEXT.get(
+            _probe_reason, f"❌ 绘图服务异常（预检 {_probe_reason}），请稍后重试。",
         )
 
-    api_key = vlm_cfg.api_key or ""
-    base_url = vlm_cfg.base_url or "https://api.vectorengine.ai"
-    model = vlm_cfg.model_name or "gemini-3.1-flash-image"
-    timeout_sec = 180
+    if provider == "novelai":
+        # 单中尺寸优先（门内已校验，仍做成员兜底防旧单）；缺失回面板逻辑
+        _src = _staged_size if _staged_size in _NOVELAI_DRAW_SIZES else (_ncfg.get("size") or "832x1216")
+        _w, _, _h = _src.partition("x")
+        try:
+            _nw, _nh = int(_w), int(_h)
+        except (ValueError, TypeError):
+            _nw, _nh = 832, 1216
+        if not _staged_size and orientation != "portrait":
+            _nw, _nh = max(_nw, _nh), min(_nw, _nh)
+        size = f"{_nw}x{_nh}"
+        _nmodel = _ncfg.get("model") or "nai-diffusion-5-full"
+        _nsteps = int(_ncfg.get("steps") or 23)
+        _tier0 = str(_ncfg.get("tier") or ("master" if _is_draw_master(bot_id, trigger_uid) else "public"))
+        _nmodel, _nsteps, _nsampler, _neffort = _apply_v5_effort_and_variant(
+            _nmodel, _nsteps, _tier0, params, prompt,
+        )
+        if _is_trial:
+            _tm, _, _, _ = _apply_v5_effort_and_variant(
+                "nai-diffusion-4-5-full", _nsteps, "trial", params, prompt,
+            )
+            _nmodel, _neffort = _tm, "trial-v45"
+            _nsteps = int(_ncfg.get("steps") or 23)
+            _nsampler = ""
+        logger.info(
+            "🎨 [Tool] generate_image 开始 | bot=%s provider=novelai model=%s size=%s steps=%s effort=%s prompt_len=%d",
+            bot_id, _nmodel, size, _nsteps, _neffort, len(prompt),
+        )
+    else:
+        # 单中尺寸优先（门内已校验，格式 "A S"，仍做成员兜底防旧单）；缺失回面板逻辑
+        _sasp, _ssz = "", ""
+        if _staged_size and " " in _staged_size:
+            _sasp, _, _ssz = _staged_size.partition(" ")
+            _sasp, _ssz = _sasp.strip(), _ssz.strip()
+        if _sasp in _PIXAI_DRAW_ASPECTS and _ssz in _PIXAI_DRAW_SIZES:
+            _asp, _psize = _sasp, _ssz
+        else:
+            _asp = _pcfg.get("aspect") or "9:16"
+            if orientation == "portrait" and _asp in ("16:9", "3:2", "5:3", "3:1"):
+                _asp = "9:16"
+            elif orientation != "portrait" and _asp in ("9:16", "2:3", "3:4", "3:5", "1:3"):
+                _asp = "16:9"
+            _psize = _pcfg.get("size") or "1k"
+        size = f"{_asp} {_psize}"
+        logger.info(
+            "🎨 [Tool] generate_image 开始 | bot=%s provider=pixai model=%s size=%s prompt_len=%d",
+            bot_id, _pcfg.get("model"), size, len(prompt),
+        )
 
-    client = ImageGenClient(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        default_size=size,
-        default_quality="medium",
-        default_format="png",
-        timeout=timeout_sec,
-    )
-
-    logger.info(
-        "🎨 [Tool] generate_image 开始 | bot=%s model=%s prompt_len=%d size=%s timeout=%ds",
-        bot_id, model, len(prompt), size, timeout_sec,
-    )
-
-    # ── 即时通知: 在生图 API 调用前先告知用户 ──
+    # ── 即时通知: 在生图 API 调用前先告知用户（per-bot 开画短语 + 后台任务路钩子）──
     if _notice_sender:
         try:
-            await _notice_sender("收到！正在生成中，稍等一下~")
+            await _notice_sender(draw_start_brace(_draw_bid))
         except Exception:
             logger.warning("生图即时通知发送失败", exc_info=True)
+    await fire_draw_start_hook(_draw_bid or _current_bot_id.get(), trigger_uid)
+
+    def _wrap_png(raw: bytes):
+        return type("GenImg", (), {"bytes_data": raw, "revised_prompt": ""})()
+
+    # ── 多参考图 (Vibe Transfer): 用户给的多张图 → 参考图数组（仅主人，耗Anlas） ──
+    # 「参考这几张」「照这几张的风格画」= 文生图 + 参考图，不是以图生图。
+    # NovelAI 单次上限 16 张；V4+ 需先编码 (客户端内处理，超 4 张每张多 2 Anlas)。
+    # 当前限定 1 张（_max_vibes 默认 1）。
+    _ref_urls = _collect_draw_urls(params, tool_context)
+    if _ref_urls and not _is_draw_master(bot_id or _draw_bid, trigger_uid):
+        logger.info("🎨 非主人显式参考图被忽略 user=%s n=%d", (trigger_uid or "?")[:8], len(_ref_urls))
+        _ref_urls = []
+    _ref_bytes: list[bytes] = []
+    _vmax = _max_vibes()
+    # Pixiv 暂存参考 (对着画流程): use_pixiv_refs=true 时取一次即删。
+    # params 与确认单双通道 (第二相 params 由 dispatcher 重组, flag 走单子透传)。
+    _want_pixiv = bool(params.get("use_pixiv_refs")) or bool(_spec.get("use_pixiv_refs"))
+    if _want_pixiv and not _is_draw_master(bot_id or _draw_bid, trigger_uid):
+        logger.info("🎨 非主人 Pixiv 参考标记被忽略 user=%s", (trigger_uid or "?")[:8])
+        _want_pixiv = False
+    _pixiv_staged: list = []
+    if _want_pixiv and trigger_uid:
+        _pixiv_staged = pop_pending_pixiv_refs(bot_id or _draw_bid, trigger_uid, limit=_vmax)
+        if _pixiv_staged and provider != "novelai":
+            logger.info("🎨 [Tool] PixAI 通道不支持 Vibe, 丢弃暂存参考 %d 张", len(_pixiv_staged))
+            _pixiv_staged = []
+        if _pixiv_staged:
+            logger.info("🎨 [Tool] generate_image 挂载 Pixiv 参考图 %d 张", len(_pixiv_staged))
+        else:
+            logger.info("🎨 [Tool] generate_image 要了 Pixiv 参考但暂存为空 (过期/已被取走/通道不支持), 按纯文字执行")
+    # V5 实测不支持任何参考图字段 (编码端点与生成端点都 500) → 提前丢弃，
+    # 免得带着参考图去撞 500。图照样出，只是不挂参考。
+    # 但若另一档模型支持 Vibe (主人档 V5 / 公共档 V4.5 的情形)，本次先换模型再带参考图
+    # —— 参考图是用户明确给的意图，宁换模型不丢图 (用户裁定: master 默认走 V5，非绝对)。
+    if (_ref_urls or _pixiv_staged) and provider == "novelai":
+        _nmodel, _mnote = _pick_novelai_model(_ncfg, has_refs=True)
+        if _mnote in ("vibe_carve_out", "vibe_fallback_v45"):
+            logger.info(
+                "🎨 参考图通道切模型: %s → %s (原档模型不支持 Vibe)",
+                _ncfg.get("model"), _nmodel,
+            )
+            _nclient = _nmod.NovelAIClient(
+                access_token=_ncfg["token"],
+                default_model=_nmodel,
+                default_size=_ncfg.get("size") or "832x1216",
+                default_steps=int(_ncfg.get("steps") or 23),
+                timeout=180,
+            )
+        elif _mnote == "vibe_unsupported":
+            logger.warning(
+                "🎨 模型 %s 不支持参考图 (Vibe)，已丢弃 %d 张参考图；"
+                "两档模型都不支持参考图 —— 面板换成 V4/V4.5 档即可",
+                _nmodel, len(_ref_urls),
+            )
+            _ref_urls = []
+    if provider == "novelai" and _ref_urls:
+        _ref_bytes = await _collect_ref_images(_ref_urls, limit=_vmax)
+        logger.info(
+            "🎨 [Tool] generate_image 参考图 %d 张 (URL %d 个, 上限 %d)",
+            len(_ref_bytes), len(_ref_urls), _vmax,
+        )
+        if len(_ref_urls) > _vmax:
+            logger.info(
+                "🎨 参考图超上限: %d → %d 张 (当前限定1张)",
+                len(_ref_urls), _vmax,
+            )
+    # Pixiv 暂存拼到显式 URL 参考之后, 总量仍受 _vmax 约束。
+    if _pixiv_staged and provider == "novelai":
+        _room = max(0, _vmax - len(_ref_bytes))
+        for _, _b in _pixiv_staged[:_room]:
+            if _b:
+                _ref_bytes.append(_b)
+        logger.info(
+            "🎨 [Tool] generate_image Pixiv 参考挂载 %d 张 (上限剩余 %d)",
+            min(len(_pixiv_staged), _room), _room,
+        )
 
     try:
-        results = await client.generate(prompt, size=size, n=1)
-    except ContentModerationError as e:
-        logger.warning("🛡️ [Tool] generate_image 审核拦截: %s", e.message)
-        return f"⚠️ 绘图请求被安全策略拦截: {e.message}。请修改描述后重试。"
-    except AuthError as e:
-        logger.error("❌ [Tool] generate_image 认证失败: %s (status=%s)", e.message, getattr(e, 'status', '?'))
-        return "❌ 绘图 API 认证失败，请联系管理员检查 API Key。"
-    except RateLimitError as e:
-        logger.warning("⏳ [Tool] generate_image 频率超限: %s", e.message)
-        return "⏳ 绘图 API 频率超限，请稍等片刻后再试。"
-    except TimeoutError:
-        return "⏰ 绘图生成超时，请稍后重试。"
-    except ImageGenError as e:
-        logger.error("❌ [Tool] generate_image API 错误: %s", e.message)
-        return "❌ 绘图 API 服务异常，请稍后重试。"
+        if provider == "novelai":
+            _gen_kw: dict = dict(
+                model=_nmodel, size=f"{_nw}x{_nh}", steps=_nsteps,
+                references=_ref_bytes or None,
+            )
+            if _nsampler:
+                _gen_kw["sampler"] = _nsampler
+            _raws = await _nclient.generate_images(
+                prompt, confirmed=True, **_gen_kw,
+            )
+            results = [_wrap_png(b) for b in _raws]
+        else:
+            _task = await _pclient.create_image_task(
+                prompt, confirmed=True,
+                aspect_ratio=_asp, size=_psize, batch_size=1,
+            )
+            _done = await _pclient.wait_for_completion(_task.get("id", ""))
+            _urls = ((_done.get("outputs") or {}).get("mediaUrls", []) or [])
+            if not _urls:
+                raise _pmod.PixAIError("任务完成但无成品 URL")
+            results = [_wrap_png(await _pclient.download_bytes(u)) for u in _urls]
     except Exception as e:
+        _mod = _nmod if provider == "novelai" else _pmod
+        _msg = (getattr(e, "message", "") or str(e))[:300]
+        _status = getattr(e, "status", "?")
+        if isinstance(e, _mod.AuthError):
+            logger.error("❌ [Tool] generate_image 认证失败: %s (status=%s)", _msg, _status)
+            return "❌ 绘图 API 认证失败，请联系管理员检查 API Key。"
+        if isinstance(e, _mod.RateLimitError):
+            logger.warning("⏳ [Tool] generate_image 频率超限: %s", _msg)
+            return "⏳ 绘图 API 频率超限，请稍等片刻后再试。"
+        if isinstance(e, _mod.TimeoutError):
+            return "⏰ 绘图生成超时，请稍后重试。"
+        if type(e).__name__ == "TaskFailedError":
+            logger.warning("🛡️ [Tool] generate_image 任务失败: %s", _msg)
+            return f"⚠️ 绘图任务失败: {_msg}。请修改描述后重试。"
+        if isinstance(e, (_mod.NovelAIError if provider == "novelai" else _mod.PixAIError)):
+            logger.error("❌ [Tool] generate_image API 错误: %s", _msg)
+            return "❌ 绘图 API 服务异常，请稍后重试。"
         logger.error("❌ [Tool] generate_image 异常: %s", e, exc_info=True)
         return "❌ 绘图系统异常，请稍后重试。"
 
     if not results:
         return "⚠️ 绘图 API 返回了空结果，请稍后重试。"
 
-    # ── 记录绘图冷却 (per-bot) ──
-    if trigger_uid:
-        _bid = _current_bot_id.get()
+    # ── 记录绘图冷却 (per-bot；主人不记) ──
+    if trigger_uid and not _draw_master:
+        _bid = _draw_bid or _current_bot_id.get()
         _cd_key = f"{_bid}:{trigger_uid}" if _bid else trigger_uid
         _DRAW_COOLDOWN[_cd_key] = time.time()
 
-    # ── 存入侧通道 (per-bot) ──
-    _bid = _current_bot_id.get()
+    # ── 存入侧通道 (per-bot；无 context 路径 _current_bot_id 为空，用显式 _draw_bid) ──
+    _bid = _draw_bid or _current_bot_id.get()
     _pending_images.setdefault(_bid, []).extend(img.bytes_data for img in results)
-
-    # ── 记录每日用量 (生成成功才扣额度) ──
+    # 留一份供后续 edit_image 换装/重绘作源图 (bytes 直发 QQ，没有可回填 URL)
     if trigger_uid:
+        set_last_draw_image(_bid, trigger_uid, results[0].bytes_data)
+
+    # ── 记录每日用量 (生成成功才扣额度，分池计数；主人不计；NSFW 自主不限量不计) ──
+    if trigger_uid and not _draw_master and not _nsfw_verified:
         try:
             record_image_generation = _deps.record_image_generation
-            used = record_image_generation(trigger_uid, admin_qq=admin_qq_ctx)
+            _rec_pool = "novelai_trial" if _is_trial else _pool
+            used = record_image_generation(trigger_uid, admin_qq=admin_qq_ctx, pool=_rec_pool)
             logger.info(
-                "📊 [Tool] generate_image 用户 %s 今日已用 %d/%d 张",
-                trigger_uid, used, 3,
+                "📊 [Tool] generate_image 用户 %s 今日已用 %d 张 (池=%s)",
+                trigger_uid, used, _rec_pool or "shared",
             )
         except Exception:
             logger.warning("记录每日绘图用量失败", exc_info=True)
@@ -1703,6 +4399,8 @@ async def execute_generate_image(params: dict, tool_context: dict | None = None)
         f"【你的回复要求】一句话简短告知即可，如「画好啦~」「给你~」「喏，你要的图~」。"
         f"不要复述 prompt、不要描述图片内容、不要长篇大论。"
     )
+    if _is_trial:
+        msg += "（本次为低好感体验档·V4.5，每日3次）"
     if revised:
         msg += f"\n(参考) AI 优化提示词: {revised}"
     return msg
@@ -1712,15 +4410,20 @@ async def execute_edit_image(params: dict, tool_context: dict | None = None) -> 
     """执行 edit_image 工具 — 以图生图/原图编辑。
 
     与 generate_image 共享好感/每日/冷却门控。
-    调用 /v1/images/edits (multipart/form-data)。
-    mask_url 可选 — 有mask走inpainting，无mask走i2i/prompt-驱导编辑。
+    NovelAI 通道走 img2img (mask 不支持，忽略)；PixAI 通道不支持，引导转 generate_image。
 
-    bot_id 感知: 与 generate_image 共享 per-bot 绘图配置。
+    bot_id 感知: 与 generate_image 共享面板绘图分配。
     """
     image_url = params.get("image_url", "").strip()
     prompt = params.get("prompt", "").strip()
     orientation = params.get("orientation", "portrait").strip()
     mask_url = params.get("mask_url", "").strip() or None
+
+    # ── 总开关: 默认关闭 (面板可按 bot 重开)。放最前，不耗任何额度 ──
+    _draw_bid = (tool_context if tool_context is not None else {}).get("bot_id", "")
+    _draw_bid = _draw_bid or _current_bot_id.get()
+    if _draw_bid and not _draw_switch(_draw_bid, "edit_image"):
+        return _DRAW_SWITCH_OFF_TEXT
 
     logger.info(
         "🎨 [Tool] edit_image 参数: image_url=%s prompt=%s orientation=%s "
@@ -1741,40 +4444,118 @@ async def execute_edit_image(params: dict, tool_context: dict | None = None) -> 
                 image_url[:60],
             )
 
-    if not image_url:
-        return "❌ 以图生图失败: 未提供参考图 URL。"
-    if not image_url.startswith("http"):
-        return "❌ 以图生图失败: 无效的图片 URL。"
-    if err := _validate_image_url(image_url, allow_non_qq=True):
-        return f"❌ 以图生图失败: {err}"
+    # ── 多图分工: 首张作 img2img 底图，其余作 Vibe 参考图 ──
+    # NovelAI 的 img2img 只收 1 张底图 (官方文档 Image2Image)，多图靠参考图通道。
+    _all_urls = _collect_draw_urls(params, tool_context)
+    if not image_url and _all_urls:
+        image_url = _all_urls[0]
+    _extra_ref_urls = [u for u in _all_urls if u != image_url]
+
+    # ★ 这里不再直接失败：URL 空也可能是「换掉我刚生成那张图的衣服」，
+    #   源图在后端确定后回退最近生成图 bytes (见下方 ref_bytes 解析)。
+    if image_url:
+        if not image_url.startswith("http"):
+            return "❌ 以图生图失败: 无效的图片 URL。"
+        if err := _validate_image_url(image_url, allow_non_qq=True):
+            return f"❌ 以图生图失败: {err}"
     if not prompt:
         return "❌ 以图生图失败: 未提供效果描述。"
     if len(prompt) < 4:
         return "❌ 以图生图失败: 效果描述太短，请提供更具体的修改要求。"
 
-    # ── 门控 1: 好感等级 ≥ Lv.3 ──
+    # ── 双相确认门 (2026-10-11)：首次返回复述单，确认后用单中译文+冻结源图执行 ──
+    _proceed, _repeat, _spec = await _draw_confirm_gate(
+        params, tool_context, tool="edit_image",
+        orientation=orientation, image_url=image_url,
+    )
+    if not _proceed:
+        return _repeat
+    prompt = _spec.get("prompt", "") or prompt
+    orientation = _spec.get("orientation", "") or orientation
+    image_url = _spec.get("image_url", "") or image_url
+    # 单中尺寸即所复述的执行尺寸（门内已按限定档校验）；缺失回面板
+    _staged_size = str(_spec.get("size", "") or "").strip()
+
+    # ── Per-bot 后端分发 (先分发，门控按后端分级；与 generate_image 共享额度池) ──
+    # 身份必须在分发前算好: 计费后端只认主人 (非主人自动降级 NovelAI), 模型按身份分档。
+    bot_id = (tool_context if tool_context is not None else {}).get("bot_id", "")
+    trigger_uid = str((tool_context or {}).get("trigger_user_id", "") or "")
+    trigger_uid = trigger_uid or _get_memory_ctx().get("trigger_user_id", "")
+    if not trigger_uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv_q2
+            trigger_uid = str(_trigger_cv_q2() or "")
+        except Exception:
+            pass
+    provider, _ncfg, _pcfg = _resolve_draw_backend(
+        bot_id, trigger_uid, _scene_group_id(tool_context),
+        private=_is_private_ctx(tool_context),
+    )
+    if provider == "none":
+        return _draw_backend_missing_text(provider, False)
+    if provider == "novelai" and not (_ncfg.get("token") or "").strip():
+        return _draw_backend_missing_text(provider, True)
+    if provider == "pixai" and not (_pcfg.get("key") or "").strip():
+        return _draw_backend_missing_text(provider, True)
+    _pool = provider if provider in ("novelai", "pixai") else ""
+    _min_level = _get_draw_min_level(_draw_bid or bot_id or "", "edit_image", fallback=2)
+
+    # ── 门控 1: 好感等级 (正式档跟随面板；NovelAI 低好感 Lv.0+ 转体验档) ──
     # 注: Gate 已在工具列表层面过滤, LLM 能调到本工具说明 Gate 已授权, 无需二次校验
-    trigger_uid = _get_memory_ctx().get("trigger_user_id", "")
     admin_qq_ctx = (tool_context if tool_context is not None else {}).get("admin_qq")
+    # 主人不限制次数 (2026-10-12)：直接认 draw_access 主人，不依赖 admin_qq 透传。
+    _draw_master = _is_draw_master(_draw_bid or _current_bot_id.get() or "", trigger_uid or "")
+    _is_trial = False
+    if trigger_uid and not _draw_master and _is_nsfw_request(prompt):
+        logger.info("🎨 [Tool] edit_image 非主人NSFW拒绝 user=%s", (trigger_uid or "?")[:8])
+        return _nsfw_master_only_text(bot_id or _draw_bid)
     if trigger_uid:
         can_generate_image = _deps.can_generate_image
-        if not can_generate_image(trigger_uid, admin_qq=admin_qq_ctx, self_id=_current_bot_id.get()):
-            return _get_tool_rejection(
-                _current_bot_id.get(), "image_gen_affinity",
-            )
+        _aff_self = _draw_bid or _current_bot_id.get()
+        _aff_ok = can_generate_image(
+            trigger_uid, admin_qq=admin_qq_ctx, self_id=_aff_self, min_level=_min_level,
+        )
+        if not _aff_ok:
+            # 低好感体验档：NovelAI 非主人且好感≥Lv.0 转 V4.5 full 试用（日限3），PixAI/主人不转
+            if provider == "novelai" and not _draw_master and can_generate_image(
+                trigger_uid, admin_qq=admin_qq_ctx, self_id=_aff_self, min_level=0,
+            ):
+                try:
+                    _t_ok, _t_rem = _deps.check_daily_image_limit(
+                        trigger_uid, admin_qq=admin_qq_ctx, pool="novelai_trial",
+                    )
+                except Exception:
+                    _t_ok, _t_rem = False, 0
+                if _t_ok:
+                    _is_trial = True
+                    _aff_ok = True
+                    logger.info(
+                        "🎨 [Tool] edit_image 低好感转体验档 user=%s 剩余=%d",
+                        (trigger_uid or "?")[:8], _t_rem,
+                    )
+            if not _aff_ok:
+                return _get_tool_rejection(
+                    _draw_bid or _current_bot_id.get(), "image_gen_affinity",
+                )
 
-    # ── 门控 2: 每日限额 (与 generate_image 共享) ──
-    if trigger_uid:
+    # ── 门控 2: 每日限额 (与 generate_image 共享分池；主人不限；体验档走 trial 池) ──
+    if trigger_uid and not _draw_master and not _is_trial:
         check_daily_image_limit = _deps.check_daily_image_limit
-        allowed, remaining = check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx)
+        allowed, remaining = check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx, pool=_pool)
         if not allowed:
             return _get_tool_rejection(
-                _current_bot_id.get(), "image_gen_daily",
+                _draw_bid or _current_bot_id.get(), "image_gen_daily",
+            )
+    if _is_trial:
+        _t_ok2, _ = _deps.check_daily_image_limit(trigger_uid, admin_qq=admin_qq_ctx, pool="novelai_trial")
+        if not _t_ok2:
+            return _get_tool_rejection(
+                _draw_bid or _current_bot_id.get(), "image_gen_daily",
             )
 
-    # ── 门控 3: 绘图冷却 3 分钟 (per-bot, 与 generate_image 共享) ──
-    if trigger_uid:
-        _bid = _current_bot_id.get()
+    # ── 门控 3: 绘图冷却 3 分钟 (per-bot, 与 generate_image 共享；主人不限) ──
+    if trigger_uid and not _draw_master:
+        _bid = _draw_bid or _current_bot_id.get()
         _cd_key = f"{_bid}:{trigger_uid}" if _bid else trigger_uid
         now = time.time()
         last = _DRAW_COOLDOWN.get(_cd_key, 0.0)
@@ -1785,119 +4566,185 @@ async def execute_edit_image(params: dict, tool_context: dict | None = None) -> 
                 _bid, "image_gen_cooldown", cooldown_remain=remain,
             )
 
-    size = "1024x1536" if orientation == "portrait" else "1536x1024"
-
-    _draw = _deps.draw_client
-    AuthError = _draw.AuthError
-    ContentModerationError = _draw.ContentModerationError
-    ImageGenClient = _draw.ImageGenClient
-    ImageGenError = _draw.ImageGenError
-    RateLimitError = _draw.RateLimitError
-    TimeoutError = _draw.TimeoutError
-
-    # ── Per-bot 绘图配置: 统一走 vlm_secondary 槽位 ──
-    bot_id = (tool_context if tool_context is not None else {}).get("bot_id", "")
-
-    vlm_cfg = None
-    if bot_id:
-        try:
-            from ..service.bot_config import get_config_service
-            svc = get_config_service()
-            vlm_cfg = svc.resolve_vlm_slot(bot_id, "vlm_secondary")
-        except Exception:
-            logger.warning("edit_image: 解析 vlm_secondary 槽位失败", exc_info=True)
-
-    if vlm_cfg is None:
+    # ── 后端已在上方分发就绪；PixAI 无以图生图 → 引导转文生图 ──
+    # (provider/_ncfg/_pcfg 复用门控前的分发结果，不重复读库)
+    if provider == "pixai":
         return (
-            "⛔ 绘图功能当前未配置。你的画图能力是正常的——只是后端配置暂未就绪。\n"
-            "不要说自己「没有生图功能」。按你的角色风格自然表达：\n"
-            "「画图功能还在准备中呢，等管理员配好就能帮你画啦～」\n"
-            "说完就停，不追加追问。"
+            "PixAI 通道暂不支持以图生图。请直接用文字描述想要的画面，"
+            "改调 generate_image（orientation 按横/竖图选）。说完就停，不追加追问。"
         )
 
-    api_key = vlm_cfg.api_key or ""
-    base_url = vlm_cfg.base_url or "https://api.vectorengine.ai"
-    model = vlm_cfg.model_name or "gemini-3.1-flash-image"
-    timeout_sec = 180
+    try:
+        from astrbot_plugin_suli_novelai import novelai_client as _nmod
+    except ImportError:
+        logger.warning("🎨 [Tool] edit_image: NovelAI 纯库插件缺失", exc_info=True)
+        return _draw_backend_missing_text(provider, False)
 
-    logger.info(
-        "🎨 [Tool] edit_image 配置: bot=%s base_url=%s model=%s",
-        bot_id, base_url, model,
+    # 单中尺寸优先（门内已校验，仍做成员兜底防旧单）；缺失回面板逻辑
+    _src = _staged_size if _staged_size in _NOVELAI_DRAW_SIZES else (_ncfg.get("size") or "832x1216")
+    _w, _, _h = _src.partition("x")
+    try:
+        _nw, _nh = int(_w), int(_h)
+    except (ValueError, TypeError):
+        _nw, _nh = 832, 1216
+    if not _staged_size and orientation != "portrait":
+        _nw, _nh = max(_nw, _nh), min(_nw, _nh)
+    size = f"{_nw}x{_nh}"
+    _nmodel = _ncfg.get("model") or "nai-diffusion-5-full"
+    _nsteps = int(_ncfg.get("steps") or 23)
+    _tier1 = str(_ncfg.get("tier") or ("master" if _is_draw_master(bot_id, trigger_uid) else "public"))
+    _nmodel, _nsteps, _nsampler1, _neffort1 = _apply_v5_effort_and_variant(
+        _nmodel, _nsteps, _tier1, params, prompt,
+    )
+    if _is_trial:
+        _tm1, _, _, _ = _apply_v5_effort_and_variant(
+            "nai-diffusion-4-5-full", _nsteps, "trial", params, prompt,
+        )
+        _nmodel, _neffort1 = _tm1, "trial-v45"
+        _nsteps = int(_ncfg.get("steps") or 23)
+        _nsampler1 = ""
+
+    _nclient = _nmod.NovelAIClient(
+        access_token=_ncfg["token"],
+        default_model=_nmodel, default_size=size, default_steps=_nsteps,
+        timeout=180,
     )
 
-    client = ImageGenClient(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        default_size=size,
-        default_quality="medium",
-        default_format="png",
-        timeout=timeout_sec,
+    # ── 预检 (零扣费) ──
+    _probe_ok, _probe_reason = await _nclient.probe()
+    if not _probe_ok:
+        return _DRAW_PROBE_FAIL_TEXT.get(
+            _probe_reason, f"❌ 绘图服务异常（预检 {_probe_reason}），请稍后重试。",
+        )
+
+    logger.info(
+        "🎨 [Tool] edit_image 配置: bot=%s provider=novelai model=%s size=%s steps=%s effort=%s",
+        bot_id, _nmodel, size, _nsteps, _neffort1,
     )
 
     # ── 检查 QQ 图片预下载缓存: 优先使用 OneBot get_image API 下载的 bytes ──
-    cached_data = get_cached_qq_image(image_url)
+    cached_data = get_cached_qq_image(image_url) if image_url else b""
     if cached_data:
         logger.info("🎨 [Tool] edit_image 命中预下载缓存: %d bytes", len(cached_data))
 
+    # 参考图 bytes: 缓存优先，否则从 URL 下载 (mask 在 NovelAI 通道不支持，直接忽略)
+    if mask_url:
+        logger.info("🎨 [Tool] edit_image 忽略 mask (NovelAI 通道不支持)")
+    ref_bytes = b""
+    if image_url:
+        try:
+            ref_bytes = cached_data or await _download_ref_bytes(image_url)
+        except Exception as e:
+            logger.warning("🎨 [Tool] edit_image 参考图获取失败: %s", e)
+            return "❌ 参考图拿不到，请换一张图或直接文字描述要画的内容 (改调 generate_image)。"
+    if not ref_bytes:
+        # ── 兜底: 该用户最近一次生成的图 ──
+        # 「把衣服换成…重绘」指的通常就是刚发给他那张；图是 bytes 直发 QQ，
+        # 没有 URL 可回填，所以在这里按 (bot, user) 取回。
+        _src_bid = bot_id or _draw_bid or _current_bot_id.get()
+        ref_bytes = get_last_draw_image(_src_bid, trigger_uid)
+        if ref_bytes:
+            logger.info(
+                "🎨 [Tool] edit_image 回退最近生成图作源图: %d bytes (user=%s)",
+                len(ref_bytes), (trigger_uid or "?")[:8],
+            )
+    if not ref_bytes:
+        return (
+            "❌ 以图生图失败: 没找到可改的参考图。"
+            "直接发/引用一张图给我，或直接用文字描述要画什么 (改调 generate_image)。"
+        )
+
     logger.info(
-        "🎨 [Tool] edit_image 开始 | prompt_len=%d size=%s url=[%s] mask=%s cached=%s timeout=%ds",
-        len(prompt), size, image_url,
-        "yes" if mask_url else "no",
-        "yes" if cached_data else "no",
-        timeout_sec,
+        "🎨 [Tool] edit_image 开始 | prompt_len=%d size=%s ref=%d bytes extra_refs=%d",
+        len(prompt), size, len(ref_bytes), len(_extra_ref_urls),
     )
 
-    # ── 即时通知: 在生图 API 调用前先告知用户 ──
+    # 其余图作 Vibe 参考图 (V4+ 由客户端编码；单张失败跳过不影响主流程)
+    # 本档模型不支持 Vibe 时才换模型 (主人档 V5 → 公共档 V4.5)，只换这一次调用。
+    _extra_refs: list[bytes] = []
+    if _extra_ref_urls and not _is_draw_master(bot_id or _draw_bid, trigger_uid):
+        logger.info("🎨 非主人额外参考图被忽略 user=%s n=%d", (trigger_uid or "?")[:8], len(_extra_ref_urls))
+        _extra_ref_urls = []
+    if _extra_ref_urls:
+        _nmodel, _mnote = _pick_novelai_model(_ncfg, has_refs=True)
+        if _mnote in ("vibe_carve_out", "vibe_fallback_v45"):
+            logger.info(
+                "🎨 edit_image 额外参考图切模型: %s → %s (原档模型不支持 Vibe)",
+                _ncfg.get("model"), _nmodel,
+            )
+            _nclient = _nmod.NovelAIClient(
+                access_token=_ncfg["token"],
+                default_model=_nmodel, default_size=size, default_steps=_nsteps,
+                timeout=180,
+            )
+        if _nmod.supports_vibes(str(_nmodel)):
+            _extra_refs = await _collect_ref_images(
+                _extra_ref_urls, limit=max(1, _max_vibes() - 1),
+            )
+        else:
+            logger.warning(
+                "🎨 模型 %s 不支持参考图 (Vibe)，edit_image 丢弃 %d 张额外参考图",
+                _nmodel, len(_extra_ref_urls),
+            )
+
+    # ── 即时通知: 在生图 API 调用前先告知用户（per-bot 开画短语 + 后台任务路钩子）──
     if _notice_sender:
         try:
-            await _notice_sender("收到！正在生成中，稍等一下~")
+            await _notice_sender(draw_start_brace(_draw_bid))
         except Exception:
             logger.warning("生图即时通知发送失败", exc_info=True)
+    await fire_draw_start_hook(_draw_bid or _current_bot_id.get(), trigger_uid)
+
+    def _wrap_png(raw: bytes):
+        return type("GenImg", (), {"bytes_data": raw, "revised_prompt": ""})()
 
     try:
-        results = await client.edit(
-            prompt,
-            image_url=image_url if not cached_data else "",
-            mask_url=mask_url,
-            image_data=cached_data,
-            size=size,
-            n=1,
+        _img_kw: dict = dict(
+            model=_nmodel, size=size, steps=_nsteps,
+            references=_extra_refs or None,
         )
-    except ContentModerationError as e:
-        return f"⚠️ 以图生图被安全策略拦截: {e.message}"
-    except AuthError as e:
-        logger.error("❌ [Tool] edit_image 认证失败: %s (status=%s)", e.message, getattr(e, 'status', '?'))
-        return "❌ 绘图 API 认证失败。"
-    except RateLimitError as e:
-        logger.warning("⏳ [Tool] edit_image 频率超限: %s", e.message)
-        return "⏳ 绘图 API 频率超限。"
-    except TimeoutError:
-        return "⏰ 以图生图超时，请稍后重试。"
-    except ImageGenError as e:
-        logger.error("❌ [Tool] edit_image API 错误: %s", e.message)
-        return "❌ 以图生图 API 服务异常，请稍后重试。"
+        if _nsampler1:
+            _img_kw["sampler"] = _nsampler1
+        _raws = await _nclient.generate_img2img(
+            ref_bytes, prompt, confirmed=True, **_img_kw,
+        )
+        results = [_wrap_png(b) for b in _raws]
     except Exception as e:
+        _msg = (getattr(e, "message", "") or str(e))[:300]
+        if isinstance(e, _nmod.AuthError):
+            logger.error("❌ [Tool] edit_image 认证失败: %s", _msg)
+            return "❌ 绘图 API 认证失败。"
+        if isinstance(e, _nmod.RateLimitError):
+            logger.warning("⏳ [Tool] edit_image 频率超限: %s", _msg)
+            return "⏳ 绘图 API 频率超限。"
+        if isinstance(e, _nmod.TimeoutError):
+            return "⏰ 以图生图超时，请稍后重试。"
+        if isinstance(e, _nmod.NovelAIError):
+            logger.error("❌ [Tool] edit_image API 错误: %s", _msg)
+            return "❌ 以图生图 API 服务异常，请稍后重试。"
         logger.error("❌ [Tool] edit_image 异常: %s", e, exc_info=True)
         return "❌ 以图生图系统异常。"
 
     if not results:
         return "⚠️ 以图生图返回了空结果。"
 
-    # ── 记录冷却 + 每日用量 (与 generate_image 共享) ──
-    if trigger_uid:
-        _bid = _current_bot_id.get()
+    # ── 记录冷却 + 每日用量 (与 generate_image 共享分池；主人不计；体验走 trial 池) ──
+    if trigger_uid and not _draw_master:
+        _bid = _draw_bid or _current_bot_id.get()
         _cd_key = f"{_bid}:{trigger_uid}" if _bid else trigger_uid
         _DRAW_COOLDOWN[_cd_key] = time.time()
         try:
             record_image_generation = _deps.record_image_generation
-            record_image_generation(trigger_uid, admin_qq=admin_qq_ctx)
+            record_image_generation(trigger_uid, admin_qq=admin_qq_ctx, pool="novelai_trial" if _is_trial else _pool)
         except Exception:
             pass
 
-    # ── 存入侧通道 (per-bot) ──
-    _bid = _current_bot_id.get()
+    # ── 存入侧通道 (per-bot；无 context 路径 _current_bot_id 为空，用显式 _draw_bid) ──
+    _bid = _draw_bid or _current_bot_id.get()
     _pending_images.setdefault(_bid, []).extend(img.bytes_data for img in results)
+    # 连续改图: 本次结果成为下一轮的源图
+    if trigger_uid:
+        set_last_draw_image(_bid, trigger_uid, results[0].bytes_data)
 
     orient_label = "竖图" if orientation == "portrait" else "横图"
     revised = results[0].revised_prompt
@@ -1910,6 +4757,8 @@ async def execute_edit_image(params: dict, tool_context: dict | None = None) -> 
         f"【你的回复要求】一句话简短告知即可，如「改好啦~」「喏，按你说的改了~」。"
         f"不要复述 prompt、不要描述图片内容、不要长篇大论。"
     )
+    if _is_trial:
+        msg += "（本次为低好感体验档·V4.5，每日3次）"
     if revised:
         msg += f"\n(参考) AI 优化提示词: {revised}"
     return msg
@@ -1980,6 +4829,63 @@ async def execute_parse_forwarded_message(params: dict, tool_context: dict | Non
     return "\n".join(parts)
 
 
+def _bible_pixiv_query(hit: dict | None) -> str:
+    """圣经命中 → pixiv 查询词 (2026-10-17 断裂修复)。
+
+    优先条目自带 pixiv 字段; 否则从 danbooru 形态取角色裸名:
+    `aemeath_(wuthering_waves)` → `aemeath`, `firefly (honkai: star rail)` → `firefly`。
+    2026-10-17 实弹探针: 裸名直搜 pixiv 命中正主 (aemeath ✓ エイメス/Aemeath;
+    hsin ✓ 心月狐), 而 danbooru 原样 (带下划线括号) 会混进杂图。
+    """
+    p = str((hit or {}).get("pixiv") or "").strip()
+    if p:
+        return p
+    d = str((hit or {}).get("danbooru") or "").strip()
+    if not d:
+        return ""
+    name = d.split(" (")[0].split("_(")[0].strip().rstrip("_")
+    return name.replace("_", " ").strip()
+
+
+def _bible_pixiv_candidates(hit: dict | None) -> list[str]:
+    """圣经命中 → pixiv 查询词候选链 (去重保序)。
+
+    顺序: pixiv 手填字段 → danbooru 裸名 → 中文/其它别名。
+    2026-10-17 实测: 裸名直搜命中正主 (aemeath ✓ / hsin ✓); 候选链兜底的是
+    "英文名在 pixiv 没人用、中文名才是主 tag" 的角色 (如 绯雪/Hiyuki)。
+    """
+    out: list[str] = []
+
+    def _add(x: object) -> None:
+        s = str(x or "").strip()
+        if s and s not in out:
+            out.append(s)
+
+    _add((hit or {}).get("pixiv"))
+    _d = str((hit or {}).get("danbooru") or "").strip()
+    if _d:
+        _add(_d.split(" (")[0].split("_(")[0].strip().rstrip("_").replace("_", " "))
+    for _a in (hit or {}).get("aliases") or []:
+        _add(_a)
+    return out
+
+
+def _pixiv_tag_extra_body(api_base: str, model_name: str, base_extra: dict | None) -> dict | None:
+    """标签提取的 thinking 方言 (2026-10-17 修正)。
+
+    事故: 非 responses 分支裸调 SDK, 不发任何思考参数 → longcat 默认思考开
+    → 提取慢 (7~13s) 且顶着 15s 超时裸奔 (与 llm_lite=off 的配置脱节)。
+    本函数补齐 opencode 方言: longcat → {"thinking":{"disabled"}} (唯一真开关);
+    其余 opencode 模型 → reasoning_effort=none; 非 opencode 基址原样透传
+    (DeepSeek 等不受影响); 显式 thinking.enabled 尊重。
+    """
+    try:
+        from ..service.tavern_client import _apply_opencode_thinking_dialect as _dialect
+        return _dialect(api_base, base_extra, model_name)
+    except Exception:
+        return base_extra
+
+
 async def _llm_extract_search_tags(
     user_message: str, bot_id: str,
 ) -> str:
@@ -2024,6 +4930,46 @@ async def _llm_extract_search_tags(
         "otherwise output the pinyin romanization of the Chinese text (e.g. 绯雪→Feixue, 粟藜→Suli)."
     )
     user_prompt = f"Extract Pixiv tags from: {user_message}"
+    _msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    _base = (llm_cfg.get("api_base") or "").rstrip("/")
+    _is_resp = "/responses" in _base or "muse-spark" in str(llm_cfg.get("model") or "").lower()
+    if _is_resp:
+        # Responses 基址 (…/go/v1/responses) 不能走 SDK chat.completions
+        # (会拼出 …/responses/chat/completions → 404，同 shadow 事故)。
+        # 纯文本标签提取走 tavern 双协议通道。
+        try:
+            from ..service.tavern_client import TavernClient
+
+            _tc = TavernClient()
+            try:
+                tags_raw = await _tc.chat(
+                    messages=_msgs,
+                    model=llm_cfg["model"],
+                    temperature=0.0,
+                    max_tokens=300,
+                    api_base=llm_cfg["api_base"],
+                    api_key=llm_cfg["api_key"],
+                    bot_id=bot_id or "",
+                    extra_params=llm_cfg.get("extra_params"),
+                    slot="pixiv_tag_extract",
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await _tc.close()
+        except Exception:
+            logger.exception("[pixiv_search] 标签提取 LLM 调用失败, 回退关键词兜底")
+            return _fallback_keywords(user_message)
+        tags = (tags_raw or "").strip()
+        tags = tags.split("\n")[0].strip().strip('"').strip("'")
+        logger.info("[pixiv_search] 轻量 LLM 提取标签: 「%s」→「%s」", user_message[:50], tags)
+        if tags and not _is_pure_chinese(tags):
+            return tags
+        fallback = _fallback_keywords(user_message)
+        logger.warning("[pixiv_search] 标签提取失败(空/纯中文), 兜底: 「%s」→「%s」", user_message[:50], fallback)
+        return fallback
 
     try:
         from openai import AsyncOpenAI
@@ -2031,15 +4977,26 @@ async def _llm_extract_search_tags(
             api_key=llm_cfg["api_key"],
             base_url=llm_cfg["api_base"],
             timeout=15.0,
+            default_headers={
+                "User-Agent": "suli-qqbot/1.0",
+                "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+            },
+        )
+        # 2026-10-17: 补 thinking 方言 (之前裸调 = longcat 思考裸奔, 15s 超时风险)
+        _tag_extra_body = _pixiv_tag_extra_body(
+            str(llm_cfg.get("api_base") or ""), str(llm_cfg.get("model") or ""),
+            llm_cfg.get("extra_params"),
         )
         resp = await client.chat.completions.create(
             model=llm_cfg["model"],
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=_msgs,
             max_tokens=300,  # ★ 推理模型 CoT 吃 token, 80→300 够用
             temperature=0.0,
+            **({"extra_body": _tag_extra_body} if _tag_extra_body else {}),
+            extra_headers={
+                "User-Agent": "suli-qqbot/1.0",
+                "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+            },
         )
     except Exception:
         logger.exception("[pixiv_search] 标签提取 LLM 调用失败, 回退关键词兜底")
@@ -2128,8 +5085,8 @@ def _fallback_keywords(user_message: str) -> str:
             pass
 
     if not tags:
-        # 真没提取到 → 清理掉 bot 专属词后返回剩余中文
-        for noise in ("找一张", "搜一张", "帮我找", "有没有", "的图", "来一张"):
+        # 真没提取到 → 清理掉"暮恩/找一张/搜图"等 bot 专属词后返回剩余中文
+        for noise in ("暮恩", "moon", "去找一张", "找一张", "搜一张", "帮我找", "有没有", "的图", "来一张"):
             user_message = user_message.replace(noise, " ")
         remaining = re.findall(r"[一-鿿]{2,}", user_message)
         tags = remaining[:3] if remaining else [user_message.strip()[:30]]
@@ -2201,7 +5158,7 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
         cleaned = user_message
         for noise in (
             "去找一张", "找一张", "搜一张", "帮我找", "有没有",
-            "的图", "来一张", "搜图", "查图", "找图",
+            "的图", "来一张", "暮恩", "moon", "搜图", "查图", "找图",
         ):
             cleaned = cleaned.replace(noise, " ")
         cleaned = cleaned.strip()
@@ -2227,14 +5184,6 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
             logger.warning("[pixiv_search] 标签发现: 无可用背景 LLM")
             return None
 
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(
-            api_key=llm_cfg["api_key"],
-            base_url=llm_cfg["api_base"],
-            timeout=15.0,
-        )
-
         system_prompt = (
             "You are a Pixiv tag discovery assistant.\n"
             "Given web search results about a character/franchise, "
@@ -2253,25 +5202,65 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
             "NEVER return empty — if you cannot determine the exact tag, "
             "output the game name + the most likely romanized character name."
         )
+        _msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": (
+                f"Character/IP to find Pixiv tags for: {cleaned}\n\n"
+                f"Web search results:\n{formatted[:3000]}\n\n"
+                f"Correct Pixiv search tags:"
+            )},
+        ]
+        _base = (llm_cfg.get("api_base") or "").rstrip("/")
+        _is_resp = "/responses" in _base or "muse-spark" in str(llm_cfg.get("model") or "").lower()
+        if _is_resp:
+            # Responses 基址不能走 SDK chat.completions (→ 404)，走 tavern 双协议。
+            from ..service.tavern_client import TavernClient
 
-        resp = await client.chat.completions.create(
-            model=llm_cfg["model"],
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": (
-                    f"Character/IP to find Pixiv tags for: {cleaned}\n\n"
-                    f"Web search results:\n{formatted[:3000]}\n\n"
-                    f"Correct Pixiv search tags:"
-                )},
-            ],
-            max_tokens=400,  # ★ 推理模型 CoT 吃 token, 150→400
-            temperature=0.0,
-        )
+            _tc = TavernClient()
+            try:
+                tags_text = await _tc.chat(
+                    messages=_msgs,
+                    model=llm_cfg["model"],
+                    temperature=0.0,
+                    max_tokens=400,
+                    api_base=llm_cfg["api_base"],
+                    api_key=llm_cfg["api_key"],
+                    bot_id=bot_id or "",
+                    extra_params=llm_cfg.get("extra_params"),
+                    slot="pixiv_tag_discover",
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await _tc.close()
+            tags = (tags_text or "").strip()
+        else:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(
+                api_key=llm_cfg["api_key"],
+                base_url=llm_cfg["api_base"],
+                timeout=15.0,
+                default_headers={
+                    "User-Agent": "suli-qqbot/1.0",
+                    "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                },
+            )
+
+            resp = await client.chat.completions.create(
+                model=llm_cfg["model"],
+                messages=_msgs,
+                max_tokens=400,  # ★ 推理模型 CoT 吃 token, 150→400
+                temperature=0.0,
+                extra_headers={
+                    "User-Agent": "suli-qqbot/1.0",
+                    "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                },
+            )
+            tags = (resp.choices[0].message.content or "").strip()
     except Exception:
         logger.exception("[pixiv_search] 标签发现异常")
         return None
     else:
-        tags = (resp.choices[0].message.content or "").strip()
         tags = tags.split("\n")[0].strip().strip('"').strip("'")
 
         if tags and not _is_pure_chinese(tags):
@@ -2297,9 +5286,13 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
       6. 返回插画信息文本给 LLM
     """
     user_message = params.get("user_message", "").strip()
-    sort = params.get("sort", "date_desc").strip()
-    count = int(params.get("count", 3))
-    send_count = int(params.get("send_count", 1))
+    # LLM 常传 sort=""（key 存在则 .get 默认值不生效）→ 下游 ValueError 整轮失败；
+    # 空/非法一律回落 date_desc。
+    sort = (params.get("sort") or "date_desc").strip() or "date_desc"
+    if sort not in ("date_desc", "popular_desc"):
+        sort = "date_desc"
+    count = int(params.get("count") or 3)
+    send_count = int(params.get("send_count") or 1)
 
     if not user_message:
         return "❌ Pixiv 搜索需要提供 user_message 参数 (用户找图的原始消息)。"
@@ -2307,6 +5300,24 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
         send_count = 1
     if send_count > 2:
         send_count = 2
+    # 2026-10-14 单图任务强制单发：用户说“一张”且没说两张/多张时，
+    # LLM 传 send_count=2 也压回 1。task-29c25bf1 教训：brief 明写找一张，
+    # LLM 仍传 2，一次发出 Top-2（150780681 爱弥斯混 tag + 150826442 心月狐），
+    # 用户只想要一张，多的那张还是错人不说还多占一次触达。
+    # 2026-10-15 花火事故补丁：agent 传的 user_message 是转述（「…同人图，女友感…」），
+    # 单数信号在转述里丢失；同时看触发原文（dispatcher 经共享状态压入），
+    # 词表补「一个/一只/一位/找个」，原文「画一个」也能压回。
+    _SINGLE_HINTS = ("一张", "一幅", "一个", "一只", "一位", "一张图", "一张同人", "一张插画", "一张壁纸", "一个图", "一个同人", "找张", "找个")
+    _MULTI_HINTS = ("两张", "二张", "几张", "多张", "三张", "四张", "五张", "两幅", "来点图", "来些图")
+    try:
+        _trig_raw = get_shared_trigger_text() or ""
+    except Exception:
+        _trig_raw = ""
+    _single_probe = f"{user_message}\n{_trig_raw}"
+    if any(h in _single_probe for h in _SINGLE_HINTS) and not any(h in _single_probe for h in _MULTI_HINTS):
+        if send_count > 1:
+            logger.info("[pixiv_search] 单图任务压回 send_count=1 (LLM 传 %d, user=%s trig=%.20s)", send_count, user_message[:30], _trig_raw[:20])
+            send_count = 1
 
     # ── 调用次数限制: 防 LLM 反复重试烧 token ──
     ctx = tool_context if tool_context is not None else {}
@@ -2320,25 +5331,63 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
         )
     ctx["_pixiv_attempts"] = pixiv_attempts + 1
 
-    # ── 获取 bot_id ──
-    bot_id = ctx.get("bot_id", _current_bot_id.get())
+    # ── 获取 bot_id (contextvars → 模块级共享状态 fallback) ──
+    bot_id = ctx.get("bot_id") or _current_bot_id.get() or get_shared_bot_id()
 
-    # ── 轻量 LLM 提取 Pixiv 检索标签 (不烧主 LLM token) ──
-    query = await _llm_extract_search_tags(user_message, bot_id)
+    # ── 触发人 (主人/R18 判定与参考暂存键用, 与确认门同口径层层回退) ──
+    _pixiv_uid = str(ctx.get("trigger_user_id", "") or "")
+    if not _pixiv_uid:
+        try:
+            _pixiv_uid = _get_memory_ctx().get("trigger_user_id", "") or ""
+        except Exception:
+            _pixiv_uid = ""
+    if not _pixiv_uid:
+        try:
+            from ..service.task_scope import current_trigger as _trigger_cv_px
+            _pixiv_uid = str(_trigger_cv_px() or "")
+        except Exception:
+            pass
+
+    # ── NSFW 主人专属门（QQ 号校验）：非主人点名要 R18/色图类直接礼貌拒绝，不搜不下 ──
+    if _pixiv_uid and not _is_draw_master(bot_id or "", _pixiv_uid) and _is_nsfw_request(user_message):
+        logger.info("🎨 [Tool] pixiv_search 非主人NSFW拒绝 user=%s", (_pixiv_uid or "?")[:8])
+        return _nsfw_master_only_text(bot_id)
+    # ── 圣经先行 (2026-10-17 断裂修复): 热门角色本地秒查, 零网络零成本 ──
+    # 事故: 找图路从不查本地圣经 — 爱弥斯 → LLM 猜 "Aimisi" 搜到别人家的 OC;
+    # 而圣经里 爱弥斯→aemeath_(wuthering_waves) 一直躺着 (此前只有画图路接了)。
+    # 实弹探针 (2026-10-17): 圣经裸名直搜 pixiv 命中正主 (aemeath ✓ / hsin ✓);
+    # 个别角色 pixiv 只认中文名 → 候选链 (裸名 → 别名) 空手自动换词重搜。
+    _bible_qs: list[str] = []
+    try:
+        from ..service.character_bible import lookup as _bible_lookup_px
+        _hit_px = _bible_lookup_px(user_message)
+        if _hit_px:
+            _bible_qs = _bible_pixiv_candidates(_hit_px)
+            if _bible_qs:
+                logger.info("[pixiv_search] 圣经先行: 「%s」→ %s (共 %d 候选)",
+                            user_message[:40], _bible_qs[0], len(_bible_qs))
+    except Exception:
+        logger.debug("[pixiv_search] 圣经查询跳过", exc_info=True)
+
+    # ── 轻量 LLM 提取 Pixiv 检索标签 (圣经未命中时的主路径; 不烧主 LLM token) ──
+    query = _bible_qs[0] if _bible_qs else ""
     if not query:
-        return "❌ 无法从用户消息中提取搜索关键词。"
+        query = await _llm_extract_search_tags(user_message, bot_id)
+        if not query:
+            return "❌ 无法从用户消息中提取搜索关键词。"
 
-    # ★ 标签发现: query 含拼音式片段时, 先网页搜索找到 Pixiv 标准标签再搜
-    # 「星铁 昔涟」→ LLM 产出 "Honkai:StarRail Xilian" → Xilian 是拼音非 Pixiv 标签
-    # → 网页搜索 "星铁 昔涟 pixiv" → LLM 从结果提取标准日/英标签 → 替换拼音再搜
-    if _query_looks_like_pinyin(query):
-        discovered = await _discover_pixiv_tags_via_web(user_message, bot_id)
-        if discovered and discovered != query:
-            logger.info(
-                "[pixiv_search] 标签发现替换: 「%s」→「%s」",
-                query, discovered,
-            )
-            query = discovered
+        # ★ 标签发现: query 含拼音式片段时, 先网页搜索找到 Pixiv 标准标签再搜
+        # 「星铁 昔涟」→ LLM 产出 "Honkai:StarRail Xilian" → Xilian 是拼音非 Pixiv 标签
+        # → 网页搜索 "星铁 昔涟 pixiv" → LLM 从结果提取标准日/英标签 → 替换拼音再搜
+        # (圣经 tag 为实测种子, 不走本步)
+        if _query_looks_like_pinyin(query):
+            discovered = await _discover_pixiv_tags_via_web(user_message, bot_id)
+            if discovered and discovered != query:
+                logger.info(
+                    "[pixiv_search] 标签发现替换: 「%s」→「%s」",
+                    query, discovered,
+                )
+                query = discovered
 
     # ── 即时通知: 告知用户正在搜索 ──
     if _notice_sender and not ctx.get("_pixiv_notice_sent"):
@@ -2384,6 +5433,13 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
             svc.set("pixiv_refresh_token", new_token)
         logger.info("[pixiv_search] refresh_token 已自动轮换并保存")
 
+    def _fresh_pixiv_token() -> str:
+        """取当前最新 token (上次搜索可能已轮换), 读取失败回旧值。"""
+        try:
+            return svc.get(svc._bot_key(bot_id, "pixiv_refresh_token"), "") or refresh_token
+        except Exception:
+            return refresh_token
+
     try:
         results = await search_pixiv(
             query=query,
@@ -2405,32 +5461,87 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
         logger.error("[pixiv_search] 未预期异常: %s", e, exc_info=True)
         return "❌ Pixiv 搜索服务异常，请稍后重试。"
 
+    # ── 圣经候选链空手 → 依次换候选 (danbooru 裸名 → 中文别名) ──
+    if not results and len(_bible_qs) > 1:
+        for _cand in _bible_qs[1:]:
+            try:
+                _r_c = await search_pixiv(
+                    query=_cand, refresh_token=_fresh_pixiv_token(), sort=sort,
+                    count=count, on_token_rotated=_save_new_token,
+                )
+            except Exception:
+                logger.debug("[pixiv_search] 圣经候选「%s」失败", _cand[:20], exc_info=True)
+                continue
+            if _r_c:
+                results = _r_c
+                query = _cand
+                logger.info("[pixiv_search] 圣经候选换词命中: %s → %d 条", _cand[:30], len(_r_c))
+                break
+
+    # ── 圣经全候选空手 → 回退 LLM 标签重搜 (保既有可跑路径不回归) ──
+    if not results and _bible_qs:
+        _q_llm = await _llm_extract_search_tags(user_message, bot_id)
+        if _q_llm and _q_llm not in _bible_qs:
+            if _query_looks_like_pinyin(_q_llm):
+                _disc2 = await _discover_pixiv_tags_via_web(user_message, bot_id)
+                if _disc2:
+                    _q_llm = _disc2
+            logger.info("[pixiv_search] 圣经「%s」空手, 回退 LLM 标签「%s」重搜",
+                        query[:30], _q_llm[:40])
+            try:
+                results = await search_pixiv(
+                    query=_q_llm, refresh_token=_fresh_pixiv_token(), sort=sort,
+                    count=count, on_token_rotated=_save_new_token,
+                )
+                query = _q_llm
+            except Exception:
+                logger.debug("[pixiv_search] 圣经空手回退重搜失败", exc_info=True)
+
     if not results:
         return f"🎨 未在 Pixiv 上找到与「{query}」相关的插画。"
 
-    # ── 过滤 R-18 ──
-    safe_results = [r for r in results if not r.get("is_r18")]
+    # ── R-18 门: 仅「主人 + NSFW 白名单场景」放行, 其余一律过滤 ──
+    # 参考暂存同理只收主人触发的那份 (见发送后暂存块)。
+    _pixiv_master = _is_draw_master(bot_id, _pixiv_uid)
+    _pixiv_r18_ok = _pixiv_master and _in_nsfw_scene(
+        bot_id, _scene_group_id(ctx), _pixiv_uid, _is_private_ctx(ctx),
+    )
+    if _pixiv_r18_ok:
+        safe_results = list(results)
+        logger.info("[pixiv_search] 主人 NSFW 场景: R-18 结果一并放行")
+    else:
+        safe_results = [r for r in results if not r.get("is_r18")]
     r18_filtered = len(results) - len(safe_results)
     if not safe_results:
         return f"🎨 未在 Pixiv 上找到与「{query}」相关的安全插画，请换一个关键词试试。"
 
     # ── 下载 + 发送图片 ──
     # 获取 bot/event 上下文 (复用 sticker 的 contextvars, group_chat 已设置)
+    # 后台任务与主链路不在同一 contextvars 作用域 → 用模块级 _shared_context 兜底
     from ..service import sticker_sender as _ss
 
     pixiv_bot = _ss._sticker_bot.get(None)
     pixiv_event = _ss._sticker_event.get(None)
+    if pixiv_bot is None or pixiv_event is None:
+        # contextvars 未设置 (后台任务路), 尝试共享上下文
+        pixiv_bot = _ss._shared_context.get("bot")
+        pixiv_event = _ss._shared_context.get("event")
 
     if pixiv_bot is None or pixiv_event is None:
-        # 无法发送图片，回退到纯文本结果
+        # 无法发送图片，回退到纯文本结果（必须明示 agent 没发图，禁复述“已发群里”）
         logger.warning("[pixiv_search] bot/event 上下文未设置, 回退到纯文本结果")
-        return format_pixiv_results(safe_results, query)
+        _txt = format_pixiv_results(safe_results, query)
+        return (
+            "⚠️ 注意：本次因发送上下文缺失，图片并未真正发到群里，只拿到文字结果，"
+            "回复用户时绝不能说“图已发/快看”，只能给链接并说明需要重试。\n" + _txt
+        )
 
     # 临时下载目录
     import tempfile
     tmp_dir = tempfile.mkdtemp(prefix="pixiv_")
 
     sent_ids: list[int] = []
+    staged_refs: list = []
     try:
         to_send = safe_results[:send_count]
         for item in to_send:
@@ -2470,6 +5581,14 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
                     "[pixiv_search] 图片已发送: illust=%d title=%s",
                     item["id"], item["title"][:40],
                 )
+                # 发出去的图留一份 bytes 作画参考暂存 (对着画流程用)。
+                # 读缩放后的最终文件: QQ 有界, Vibe 够用, 且与用户看到的是同一张。
+                try:
+                    _ref_b = Path(local_path).read_bytes()
+                    if _ref_b:
+                        staged_refs.append((int(item["id"]), _ref_b))
+                except Exception:
+                    logger.debug("[pixiv_search] 参考暂存读取失败 illust=%d", item["id"])
             except Exception as e:
                 logger.error(
                     "[pixiv_search] 图片下载/发送失败 illust=%d: %s",
@@ -2497,7 +5616,32 @@ async def execute_pixiv_search(params: dict, tool_context: dict | None = None) -
             "[pixiv_search] R-18 过滤: %d 张被排除 (query=%s)",
             r18_filtered, query[:40],
         )
-    return format_pixiv_results(sent_results, query)
+    # ── 发出去的图暂存为作画参考 (所有人; 10 分钟有效) ──
+    # Vibe 直接挂载仅主人 (执行侧卡); 非主人走 describe_pixiv_refs 读特征 +
+    # 纯文字绘制。R-18 能进暂存的前提已在上面卡死 (主人 + NSFW 场景), 这里不二次过滤。
+    _staged_n = 0
+    if staged_refs:
+        _staged_n = set_pending_pixiv_refs(bot_id, _pixiv_uid, staged_refs)
+        if _staged_n:
+            logger.info(
+                "[pixiv_search] 已暂存参考图 %d 张 (10 分钟有效, 取一次即删)",
+                _staged_n,
+            )
+    _ret = format_pixiv_results(sent_results, query)
+    if _staged_n:
+        if _pixiv_master:
+            _ret += (
+                f"\n(已暂存 {_staged_n} 张参考图，10 分钟内有效。"
+                "用户说「对着画/按这个画」时调 generate_image 并传 use_pixiv_refs=true 挂载；"
+                "用户只要美图时不用传。)"
+            )
+        else:
+            _ret += (
+                f"\n(已暂存 {_staged_n} 张参考图，10 分钟内有效。"
+                "用户说「对着画/按这个画」时调 describe_pixiv_refs 读特征，"
+                "再用纯文字调 generate_image；不要传 use_pixiv_refs。)"
+            )
+    return _ret
 
 
 async def execute_video_extract(params: dict, tool_context: dict | None = None) -> str:  # noqa: ARG001
@@ -2578,7 +5722,7 @@ async def execute_video_extract(params: dict, tool_context: dict | None = None) 
     # ── 下载 ──
     # ★ 下载到 AstrBot/data/temp_videos/ (共享卷)
     # 不能放 /tmp — AstrBot 和 NapCat 是不同容器, /tmp 互不可见。
-    # runtime/data-luna 被双方 mount 到 AstrBot/data, 文件存在这里 NapCat 才能读到。
+    # AstrBot 侧与 NapCat 侧都可见的数据目录 (部署在仓库根下)。
     from pathlib import Path as _Path
     _shared_dir = _Path(__file__).resolve().parent.parent.parent / "AstrBot" / "data" / "temp_videos"
     _shared_dir.mkdir(parents=True, exist_ok=True)
@@ -2613,6 +5757,9 @@ async def execute_video_extract(params: dict, tool_context: dict | None = None) 
 
     video_bot = _ss._sticker_bot.get(None)
     video_event = _ss._sticker_event.get(None)
+    if video_bot is None or video_event is None:
+        video_bot = _ss._shared_context.get("bot")
+        video_event = _ss._shared_context.get("event")
     group_id = str(tool_context.get("group_id", "") or "") if tool_context else ""
 
     if video_bot is None:
@@ -2630,8 +5777,11 @@ async def execute_video_extract(params: dict, tool_context: dict | None = None) 
 
     send_ok = False
     try:
-        await video_bot.call_action(
+        # 通过平台适配器发送视频 (QQ: OneBot send_group_msg with video type)
+        from ..platform_adapter import get_adapter as _get_adapter
+        await _get_adapter().call_platform_api(
             "send_group_msg",
+            video_bot,
             group_id=int(group_id),
             message=[
                 {
@@ -2669,24 +5819,100 @@ async def execute_video_extract(params: dict, tool_context: dict | None = None) 
     )
 
 
+async def execute_dispatch_subagents(params: dict, tool_context: dict | None = None) -> str:
+    """Hybrid Main→SubAgent 派发执行器 (Main 唯一工具)。
+
+    Main 保持 persona，子代理无 persona 并发执行。
+    """
+    subtasks = params.get("subtasks", [])
+    if not subtasks or not isinstance(subtasks, list):
+        return (
+            "❌ dispatch_subagents 需要 subtasks 列表 — "
+            "如果你已派发过子代理并收到结果，请基于已返回的子代理结果合成最终角色扮演回复，不要重复派发空任务。"
+            "只有需要新执行任务时才再次调用 dispatch_subagents。"
+        )
+    # 透传上下文给子代理 (group_id/bot_id/user_id)
+    try:
+        from ..transport.subagent import dispatch_hybrid_subagents
+
+        # 子代理可用执行器 = 全量子代理工具 (排除自身防止递归)
+        _sub_executors = {k: v for k, v in TOOL_EXECUTORS.items() if k != "dispatch_subagents"}
+        # 合并 L4D2 等懒加载工具也在 TOOL_EXECUTORS 中，已包含
+        results = await dispatch_hybrid_subagents(subtasks, _sub_executors, tool_context)
+        # 格式化汇总供 Main 合成角色扮演回复 — P0: 结构化 metadata + artifact 引用
+        lines = []
+        for r in results:
+            _fid = r.get("family", "?")
+            _tid = r.get("id", "?")
+            _tool = r.get("tool", _fid)
+            _task = r.get("task", "")[:80]
+            _res = r.get("result", "")
+            _urls = r.get("urls", [])
+            _artifact = r.get("artifact", "")
+            _elapsed = r.get("elapsed", 0)
+            # _res 已是 _concise_for_main 900字压缩，无需再截 4000
+            _header = f"【SubAgent[{_fid}:{_tool}] {_tid}】 {_task} ({_elapsed}s"
+            if _artifact:
+                _header += f", artifact={_artifact}"
+            _header += ")"
+            _block = _header + "\n" + _res
+            if _urls:
+                _block += "\n[来源] " + " | ".join(_urls[:5])
+            lines.append(_block)
+        return "\n\n".join(lines) if lines else "（无子代理结果）"
+    except Exception as e:
+        return f"❌ 子代理派发失败: {e}"
+
+
 # ── 执行器注册表 ─────────────────────────────────────────
 
 TOOL_EXECUTORS: dict[str, callable] = {
-    "check_lport_status": execute_health_check,
-    "list_available_models": execute_list_models,
-    "list_custom_nodes": execute_list_nodes,
+    "dispatch_subagents": execute_dispatch_subagents,
     "search_knowledge": execute_search_knowledge,
     "web_search": execute_web_search,
+    "execute_code": execute_code,
     "send_sticker": execute_send_sticker,
     "describe_image": execute_describe_image,
+    "describe_pixiv_refs": execute_describe_pixiv_refs,
+    "describe_video": execute_describe_video,
+    "describe_voice": execute_describe_voice,
     "remember_memory": execute_remember_memory,
     "get_memory": execute_get_memory,
     "generate_image": execute_generate_image,
     "edit_image": execute_edit_image,
+    "resolve_character_identity": execute_resolve_character_identity,
     "parse_forwarded_message": execute_parse_forwarded_message,
     "pixiv_search": execute_pixiv_search,
     "video_extract": execute_video_extract,
+    # L4D2 工具 — 懒加载 (astrbot_plugin_suli_l4d2 可能未安装)
+    "l4d2_server_status": lambda params: _lazy_load_l4d2("l4d2_server_status", params),
+    "l4d2_list_maps": lambda params: _lazy_load_l4d2("l4d2_list_maps", params),
+    "l4d2_switch_map": lambda params: _lazy_load_l4d2("l4d2_switch_map", params),
+    "l4d2_vote_map": lambda params: _lazy_load_l4d2("l4d2_vote_map", params),
+    "l4d2_start": lambda params: _lazy_load_l4d2("l4d2_start", params),
+    "l4d2_stop": lambda params: _lazy_load_l4d2("l4d2_stop", params),
+    "l4d2_restart": lambda params: _lazy_load_l4d2("l4d2_restart", params),
+    "l4d2_player_score": lambda params: _lazy_load_l4d2("l4d2_player_score", params),
+    "l4d2_player_stats": lambda params: _lazy_load_l4d2("l4d2_player_stats", params),
+    "l4d2_leaderboard": lambda params: _lazy_load_l4d2("l4d2_leaderboard", params),
+    "l4d2_bind_qq": lambda params: _lazy_load_l4d2("l4d2_bind_qq", params),
+    "l4d2_unbind_qq": lambda params: _lazy_load_l4d2("l4d2_unbind_qq", params),
+    "l4d2_bind_link": lambda params: _lazy_load_l4d2("l4d2_bind_link", params),
 }
+
+
+async def _lazy_load_l4d2(exec_name: str, params: dict) -> str:
+    """懒加载 L4D2 执行器。"""
+    try:
+        from astrbot_plugin_suli_l4d2.tools import L4D2_TOOL_EXECUTORS
+        executor = L4D2_TOOL_EXECUTORS.get(exec_name)
+        if executor is None:
+            return f"❌ L4D2 执行器 {exec_name} 不存在"
+        return await executor(params)
+    except ImportError:
+        return "❌ L4D2 插件未安装"
+    except Exception as exc:  # BLE001
+        return f"❌ L4D2 工具执行失败: {exc}"
 
 
 # ── 共享工具调用循环 ──────────────────────────────────────
@@ -2910,7 +6136,7 @@ async def run_tool_loop(
     admin_qq: int | None = None,
     bot_id: str = "",
     tool_context: dict | None = None,  # 透传给 executor(args, tool_context=...)
-    executors: dict[str, object] | None = None,  # 覆盖 TOOL_EXECUTORS (peer bot 注入)
+    executors: dict[str, object] | None = None,  # 覆盖 TOOL_EXECUTORS (调用方注入)
 ) -> str:
     """通用的 function calling 工具调用循环。
 
@@ -2924,7 +6150,7 @@ async def run_tool_loop(
         temperature: LLM 温度
         max_tokens: 回复最大 token 数
         provider: LLM provider (用于缓存策略和 chat_completion_source 映射)
-        model: 模型名 (空字符串 = 使用 tavern 默认值 deepseek-v4-pro)
+        model: 模型名 (空字符串 = 前端 6190 槽位回退，无配置则拒绝调用)
         extra_params: 额外 API 参数 (如 {"reasoning_effort": "xhigh"})
         api_base: 三方代理 base_url (非空时绕过酒馆直连)
         api_key: 三方代理 api_key
@@ -2993,11 +6219,18 @@ async def _run_tool_loop_impl(
     tool_context: dict | None = None,
     executors: dict[str, object] | None = None,
 ) -> str:
+    # 单族搜索任务限轮：近1周等明确查询 3轮足够，6轮×2搜=12搜=135k tok 浪费 → 限4轮
+    _orig_max_rounds = max_rounds
+    if tools and all(
+        t.get("function", {}).get("name") in ("search_knowledge", "web_search", "send_sticker", "parse_forwarded_message")
+        for t in tools
+    ):
+        if max_rounds > 4:
+            logger.info("单族搜索限轮: %d→4 (省 token/时间)", max_rounds)
+            max_rounds = 4
     # 工具调用需要足够 token 空间容纳 JSON 参数 (生图 prompt 可达 500+ tokens)
-    # 工具禁用时保持原始预算
-    _eff_max_tokens = max_tokens
-    if tools:
-        _eff_max_tokens = max(max_tokens, 1024)
+    # 工具禁用时 ≥384 保底 (TRAPS §八#7: flash 长上下文 reasoning 耗尽 128→空 content)
+    _eff_max_tokens = max(max_tokens, 1024) if tools else max(max_tokens, 384)
 
     _tools_used_this_loop = False  # 本轮是否真正调用了工具
     _tool_round_count = 0  # 工具调用轮数 (用于能量消耗计算)
@@ -3008,9 +6241,15 @@ async def _run_tool_loop_impl(
 
     # ── 防阻塞: 总超时 + 每轮超时 ──
     # deepseek-v4-pro 每轮 25-40s, 4+ 轮工具调用 → 120s 不够
-    # 总时限 120→180s, 每轮 45→60s
+    # 总时限 120→180s, 每轮 45→60s；单族搜索（web_search）4轮需 160s，放宽至 240s
+    # Hybrid dispatch_subagents 内含检索，并发子代理需更宽限
     _loop_start = time.monotonic()
-    _loop_deadline = _loop_start + 180.0 if tools else _loop_start + 240.0
+    _is_hybrid = tools and any(t.get("function", {}).get("name") == "dispatch_subagents" for t in tools)
+    _is_search_only = tools and all(
+        t.get("function", {}).get("name") in ("search_knowledge", "web_search", "send_sticker", "parse_forwarded_message")
+        for t in tools
+    )
+    _loop_deadline = _loop_start + (240.0 if (_is_search_only or _is_hybrid) else 180.0) if tools else _loop_start + 240.0
     # 工具轮降低 reasoning_effort → 加快决策速度
     _tool_extra_params = dict(extra_params) if extra_params else {}
     if _tool_extra_params.get("reasoning_effort") in ("high", "max", "xhigh") and tools:
@@ -3065,8 +6304,9 @@ async def _run_tool_loop_impl(
             })
             logger.debug("LLM 工具循环: 第 %d 轮注入收尾提示", _round + 1)
 
-        # ── 超时保护: 工具轮 60s, 最终轮 120s ──
-        _round_timeout = 60.0 if (tools and not is_last) else 120.0
+        # ── 超时保护: 工具轮 60s(Hybrid 90s), 最终轮 120s ──
+        _is_hybrid_round = any(t.get("function", {}).get("name") == "dispatch_subagents" for t in (tools or []))
+        _round_timeout = (90.0 if _is_hybrid_round else 60.0) if (tools and not is_last) else 120.0
         _elapsed = time.monotonic() - _loop_start
         _remaining = _loop_deadline - time.monotonic()
         if _remaining <= 0:
@@ -3075,7 +6315,7 @@ async def _run_tool_loop_impl(
             )
             if _tools_used_this_loop and messages:
                 _emergency = await _try_emergency_summary(
-                    tavern, messages, model or "deepseek-v4-pro",
+                    tavern, messages, model or "",
                     provider, api_base, api_key, bot_id,
                 )
                 if _emergency:
@@ -3118,11 +6358,14 @@ async def _run_tool_loop_impl(
             _tool_names = [t.get("function", {}).get("name", "?") for t in tools] if tools else []
             logger.info(
                 "LLM 工具循环 round=%d/%d: model=%s tools=%s tool_choice=%s msgs_len=%d max_tokens=%d",
-                _round + 1, max_rounds + 1, model or "deepseek-v4-pro",
+                _round + 1, max_rounds + 1, model or "",
                 _tool_names if not is_last else ["(已剥离—最终轮)"],
                 tool_choice, len(str(messages)), _round_max_tokens,
             )
             logger.info("LLM messages: %s", _msg_snippet)
+
+            # ★ TTFT 监控: 记录 LLM 调用开始时间
+            _llm_call_start = time.monotonic()
 
             result = await asyncio.wait_for(
                 tavern.chat_with_tools(
@@ -3132,7 +6375,7 @@ async def _run_tool_loop_impl(
                     temperature=temperature,
                     max_tokens=_round_max_tokens,
                     provider=provider,
-                    model=model or "deepseek-v4-pro",
+                    model=model or "",
                     extra_params=_use_params,
                     api_base=api_base,
                     api_key=api_key,
@@ -3140,12 +6383,32 @@ async def _run_tool_loop_impl(
                 ),
                 timeout=_timeout,
             )
+
+            # ★ TTFT 监控: 计算并记录 LLM 调用延迟
+            _llm_call_elapsed_ms = (time.monotonic() - _llm_call_start) * 1000
+
             # ── 能量统计: 累计本轮 token 消耗 ──
             try:
                 _usage = tavern.get_last_usage()
                 _total_input_tokens += _usage.get("input_tokens", 0)
                 _total_cache_hit += _usage.get("cache_hit_tokens", 0)
                 _total_output_tokens += _usage.get("output_tokens", 0)
+
+                # ★ TTFT + Cache 日志: 每轮 LLM 调用都记录
+                _cache_hit = _usage.get("cache_hit_tokens", 0)
+                _cache_miss = _usage.get("cache_miss_tokens", 0)
+                _cache_rate = (
+                    f"{_cache_hit / (_cache_hit + _cache_miss) * 100:.1f}%"
+                    if (_cache_hit + _cache_miss) > 0 else "N/A"
+                )
+                logger.info(
+                    "LLM 调用性能: round=%d/%d, elapsed=%.0fms, "
+                    "input=%d, output=%d, cache_hit=%d, cache_rate=%s",
+                    _round + 1, max_rounds + 1, _llm_call_elapsed_ms,
+                    _usage.get("input_tokens", 0),
+                    _usage.get("output_tokens", 0),
+                    _cache_hit, _cache_rate,
+                )
             except Exception:
                 pass
         except asyncio.TimeoutError:
@@ -3157,7 +6420,7 @@ async def _run_tool_loop_impl(
             )
             if is_last and messages and _tools_used_this_loop:
                 _emergency = await _try_emergency_summary(
-                    tavern, messages, model or "deepseek-v4-pro",
+                    tavern, messages, model or "",
                     provider, api_base, api_key, bot_id,
                 )
                 if _emergency:
@@ -3217,13 +6480,23 @@ async def _run_tool_loop_impl(
                 "tool_calls": tool_calls,
             })
 
-            # 执行每个工具
-            for tc in tool_calls:
-                _func_name = tc.get("function", {}).get("name", "")
-                _args_str = tc.get("function", {}).get("arguments", "{}")
-                tool_msg = await execute_tool_with_retry(
-                    tc, max_retries=2, tool_context=tool_context, executors=executors,
+            # ── SubAgent 并发派发 (2026-08-27) ──
+            # Main 派发 → SubAgents(按 retrieval/code/vision/...) 并发执行 → Main 汇总
+            # 保持 append-only 前缀缓存友好，Main 在等待期间保持群内活跃（Dispatcher 后台执行，Actor 照常收批，主调度不阻塞）
+            from ..transport.subagent import family_of, run_as_subagent
+
+            async def _exec_one(_tc):
+                _fn = _tc.get("function", {}).get("name", "")
+                _as = _tc.get("function", {}).get("arguments", "{}")
+                _family = family_of(_fn)
+                coro = execute_tool_with_retry(
+                    _tc, max_retries=2, tool_context=tool_context, executors=executors,
                 )
+                _msg = await run_as_subagent(_family, _fn, coro, tool_context)
+                return _tc, _fn, _as, _msg
+
+            _exec_results = await asyncio.gather(*(_exec_one(tc) for tc in tool_calls))
+            for _tc, _func_name, _args_str, tool_msg in _exec_results:
                 # ★ 存原始结果到 buffer（压缩前），供 Phase 3 压缩使用
                 _search_buffer.append({
                     "tool": _func_name,
@@ -3269,7 +6542,7 @@ async def _run_tool_loop_impl(
             # 若有已检索结果, 尝试紧急汇总; 否则回落礼貌提示。
             if is_last and _tools_used_this_loop:
                 _emergency = await _try_emergency_summary(
-                    tavern, messages, model or "deepseek-v4-pro",
+                    tavern, messages, model or "",
                     provider, api_base, api_key, bot_id,
                 )
                 if _emergency:
@@ -3293,7 +6566,10 @@ async def _run_tool_loop_impl(
             )
         # ── 内容清理: XML 剥离 + thread_summary 提取 ──
         content = _strip_xml_tool_calls(content)
-        content = _extract_thread_summary(content)
+        content = _extract_thread_summary(
+            content, bot_id=bot_id, user_id=user_id,
+            group_id=str((tool_context or {}).get("group_id", "") or ""),
+        )
 
         # ── 剥离后空内容保护 ──────────────────────────────────────
         # tool_choice=none 阻止 API 解析 tool_calls，但 DeepSeek 训练数据
@@ -3308,7 +6584,7 @@ async def _run_tool_loop_impl(
                 # 最终轮: 尝试紧急汇总已有检索结果，不浪费已查到的信息
                 if _tools_used_this_loop:
                     _emergency = await _try_emergency_summary(
-                        tavern, messages, model or "deepseek-v4-pro",
+                        tavern, messages, model or "",
                         provider, api_base, api_key, bot_id,
                     )
                     if _emergency:
@@ -3395,7 +6671,7 @@ async def _run_tool_loop_impl(
         # Phase 3: 压缩检索 buffer
         _compressed = await _compress_search_buffer(
             tavern, _search_buffer, _original_query,
-            model=model or "deepseek-v4-pro",
+            model=model or "",
             provider=provider, api_base=api_base, api_key=api_key,
             bot_id=bot_id, timeout=_compress_timeout,
         )
@@ -3449,7 +6725,7 @@ async def _run_tool_loop_impl(
                     temperature=temperature,
                     max_tokens=_synth_budget,
                     provider=provider,
-                    model=model or "deepseek-v4-pro",
+                    model=model or "",
                     extra_params=extra_params or {},
                     api_base=api_base,
                     api_key=api_key,
@@ -3469,7 +6745,10 @@ async def _run_tool_loop_impl(
             content = _synthesis_result.get("content") or ""
             # 清理: XML 剥离 + thread_summary 提取
             content = _strip_xml_tool_calls(content)
-            content = _extract_thread_summary(content)
+            content = _extract_thread_summary(
+                content, bot_id=bot_id, user_id=user_id,
+                group_id=str((tool_context or {}).get("group_id", "") or ""),
+            )
 
             if content.strip():
                 logger.info(
@@ -3512,7 +6791,7 @@ async def _run_tool_loop_impl(
             "content": f"{_emergency_hint}以下是搜索结果 (可能不完整):\n{_compressed[:3000]}",
         })
         _emergency = await _try_emergency_summary(
-            tavern, _emergency_msgs, model or "deepseek-v4-pro",
+            tavern, _emergency_msgs, model or "",
             provider, api_base, api_key, bot_id,
         )
         if _emergency:
@@ -3524,7 +6803,24 @@ async def _run_tool_loop_impl(
             })
             return _emergency
 
-        # 最终回落
+        # 最终回落: 直接返回压缩后的搜索结果（保底可用，不依赖 LLM）
+        if _search_buffer or _compressed:
+            _fallback_src = _compressed if _compressed else "\n".join(
+                f"── {e.get('tool','?')} ──\n{e.get('result','')[:800]}" for e in _search_buffer
+            )
+            _fallback_lines = [
+                "🔍 搜到以下信息（LLM 整理失败，直接展示原始结果，请自行甄别时效）：",
+                _fallback_src[:3500],
+            ]
+            _fallback = "\n".join(_fallback_lines)
+            logger.warning("Clean synthesis 最终回落: 直接返回原始搜索结果 %d字", len(_fallback))
+            set_energy_stats(bot_id, {
+                "total_in": _total_input_tokens,
+                "total_cache_hit": _total_cache_hit,
+                "total_out": _total_output_tokens,
+                "tool_rounds": _tool_round_count,
+            })
+            return _fallback
         set_energy_stats(bot_id, {
             "total_in": _total_input_tokens,
             "total_cache_hit": _total_cache_hit,
@@ -3545,7 +6841,7 @@ async def execute_tool(tool_call: dict, tool_context: dict | None = None, execut
     Args:
         tool_call: {"id": "call_xxx", "function": {"name": "...", "arguments": "..."}}
         tool_context: 透传给 executor 的上下文字典 (如 event / plugin 引用)
-        executors: 覆盖 TOOL_EXECUTORS (peer bot 注入合并执行器)
+        executors: 覆盖 TOOL_EXECUTORS (调用方注入合并执行器)
 
     Returns:
         {"role": "tool", "tool_call_id": "...", "content": "..."}

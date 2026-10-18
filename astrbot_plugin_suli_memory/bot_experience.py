@@ -25,6 +25,8 @@ import logging
 import time
 from pathlib import Path
 
+from .user_memory import is_empty_memory_text
+
 logger = logging.getLogger(__name__)
 
 # ── 存储根目录 ──────────────────────────────────────────────
@@ -389,6 +391,9 @@ class BotExperienceStore:
         except Exception:
             logger.debug("BotExperience: resolve_background_llm 失败", exc_info=True)
 
+        if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+            logger.warning("BotExperience: 前端无可用 LLM 槽位，跳过提取 (bot_id=%r)", _bot_id)
+            return []
         try:
             raw = await asyncio.wait_for(
                 tavern.chat(
@@ -398,10 +403,11 @@ class BotExperienceStore:
                     ],
                     temperature=0.2,
                     max_tokens=200,
-                    model=_bg_llm.get("model", "deepseek-v4-flash"),
+                    model=_bg_llm.get("model", ""),
                     api_base=_bg_llm.get("api_base", ""),
                     api_key=_bg_llm.get("api_key", ""),
                     extra_params=_bg_llm.get("extra_params"),
+                    bot_id=_bot_id,
                 ),
                 timeout=30,
             )
@@ -430,6 +436,9 @@ class BotExperienceStore:
             if not line or len(line) < 5:
                 continue
             if line == "无":
+                continue
+            # 空值拦截: 哨兵 "(空回复)" 绝不落盘 (2026-10-11 教训)
+            if is_empty_memory_text(line):
                 continue
 
             # 收集参与者 (从消息中提取 user_id)
@@ -507,6 +516,9 @@ class BotExperienceStore:
         except Exception:
             logger.debug("BotExperience: resolve_background_llm 失败 (distill)", exc_info=True)
 
+        if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+            logger.warning("BotExperience: 前端无可用 LLM 槽位，跳过蒸馏 (bot_id=%r)", _bot_id)
+            return False
         try:
             raw = await asyncio.wait_for(
                 tavern.chat(
@@ -524,10 +536,11 @@ class BotExperienceStore:
                     ],
                     temperature=0.3,
                     max_tokens=256,
-                    model=_bg_llm.get("model", "deepseek-v4-flash"),
+                    model=_bg_llm.get("model", ""),
                     api_base=_bg_llm.get("api_base", ""),
                     api_key=_bg_llm.get("api_key", ""),
                     extra_params=_bg_llm.get("extra_params"),
+                    bot_id=_bot_id,
                 ),
                 timeout=45,
             )
@@ -549,7 +562,7 @@ class BotExperienceStore:
             cleaned = raw_line.strip().lstrip("- ").lstrip("-")
             if not cleaned or len(cleaned) < 5:
                 continue
-            if cleaned == "无":
+            if cleaned == "无" or is_empty_memory_text(cleaned):
                 continue
             # 去重
             if any(cleaned in existing or existing in cleaned for existing in existing_core):

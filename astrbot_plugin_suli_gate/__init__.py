@@ -1,19 +1,17 @@
-"""astrbot_plugin_suli_gate — 统一 Intent Gate (意图行为闸)。
+"""astrbot_plugin_suli_gate — Slim 意图闸 (现役)。
 
-Full Gate 四大职责:
-  1. group_context — 群聊上下文分析
-  2. task          — 意图/任务判断
-  3. tools         — 工具放行决策
-  4. reply_baseline — 回复基调 (stance/style/sticker_mood)
+现役: GateContext + IntentGate.evaluate_slim → Main 终审。
+旧 Full Gate (FullGateResult 四职责) 已随 Actor 统一删除；
+Relevance/Intent/GracePeriod 仅供 DEPRECATED shim 兼容保留。
 
-+ 加权唤醒分 (compute_wake_weight) + Grace Period + Opportunity Score
++ 加权唤醒分 (compute_wake_weight) + Opportunity Score (opportunity.py)。
 
 零框架耦合。LLM 调用通过 duck-typed tavern.chat() 接口注入。
 
 用法:
   from astrbot_plugin_suli_gate import (
-      GateContext, IntentGate, FullGateResult,
-      GroupContext, TaskDecision, ToolDecision, ReplyBaseline,
+      GateContext, IntentGate,
+      GroupContext,
       GracePeriod, compute_wake_weight, WAKE_THRESHOLD,
   )
 """
@@ -23,18 +21,12 @@ from __future__ import annotations
 from ._gate_protocol import GateResultProtocol
 from .intent_gate import (
     WAKE_THRESHOLD,
-    CrossBotAction,
-    FullGateResult,
     GateContext,
     GracePeriod,
     GroupContext,
-    GroupSituation,
     IntentGate,
     IntentResult,
     RelevanceResult,
-    ReplyBaseline,
-    TaskDecision,
-    ToolDecision,
     compute_wake_weight,
 )
 from .opportunity import (
@@ -43,18 +35,16 @@ from .opportunity import (
     OpportunityCache,
     OpportunityScore,
     PendingOpportunity,
+    compute_rule_score,
 )
 
 __all__ = [
     "WAKE_THRESHOLD",
     "ActiveMotive",
-    "CrossBotAction",
-    "FullGateResult",
     "GateContext",
     "GateResultProtocol",
     "GracePeriod",
     "GroupContext",
-    "GroupSituation",
     "IntentGate",
     "IntentResult",
     "MotiveType",
@@ -62,8 +52,6 @@ __all__ = [
     "OpportunityScore",
     "PendingOpportunity",
     "RelevanceResult",
-    "ReplyBaseline",
-    "TaskDecision",
-    "ToolDecision",
+    "compute_rule_score",
     "compute_wake_weight",
 ]

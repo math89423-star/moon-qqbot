@@ -176,8 +176,8 @@ class ImageGenClient:
     """
 
     api_key: str
-    base_url: str = "https://api.vectorengine.ai"
-    model: str = "gpt-image-2"
+    base_url: str = ""  # 前端 6190 唯一真相源: 必须由调用方传入 vlm_secondary 槽位
+    model: str = ""  # 前端唯一真相源: 必须由调用方传入
     default_size: str = "1024x1536"
     default_quality: str = "medium"
     default_format: str = "png"
@@ -197,6 +197,46 @@ class ImageGenClient:
         image_data: bytes | None = None, size: str = "", n: int = 1,
     ) -> list[ImageResult]:
         return await self._edit_chat(prompt, image_url, image_data, size or self.default_size, n)
+
+    async def probe(self, timeout_sec: float = 12.0) -> tuple[bool, str]:
+        """轻量连通探测 — 先验 API 通不通，再决定是否生图。
+
+        发一次最小 /v1/chat/completions (max_tokens=1, 不带生图参数)，
+        走完全相同的鉴权 + 模型路径。超时独立于 self.timeout。
+
+        Returns:
+            (True, "ok") / (False, reason ∈ empty_key/auth/network/rate/http_{status})。
+        """
+        if not (self.api_key or "").strip() or not (self.base_url or "").strip():
+            return False, "empty_key"
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+            "max_tokens": 1,
+        }
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout_sec)
+            async with (
+                aiohttp.ClientSession(timeout=timeout_obj, trust_env=True) as s,
+                s.post(
+                    self._url("/v1/chat/completions"),
+                    json=payload,
+                    headers=self._auth_headers({"Content-Type": "application/json"}),
+                ) as resp,
+            ):
+                if 200 <= resp.status < 300:
+                    return True, "ok"
+                if resp.status in (401, 403):
+                    return False, "auth"
+                if resp.status == 429:
+                    return False, "rate"
+                return False, f"http_{resp.status}"
+        except (aiohttp.ClientError, OSError, builtins.TimeoutError) as e:
+            logger.debug("ImageGen probe 网络失败: %s", e)
+            return False, "network"
+        except Exception:
+            logger.debug("ImageGen probe 异常", exc_info=True)
+            return False, "network"
 
     # ═══════════════════════════════════════════════════════
     # Chat Completions 多模态输出 (全模型统一)
@@ -314,7 +354,7 @@ class ImageGenClient:
         timeout_obj = aiohttp.ClientTimeout(total=self.timeout)
         try:
             async with (
-                aiohttp.ClientSession(timeout=timeout_obj, trust_env=False) as s,
+                aiohttp.ClientSession(timeout=timeout_obj, trust_env=True) as s,
                 s.post(self._url(path), json=payload, headers=headers) as resp,
             ):
                 body = await resp.json()

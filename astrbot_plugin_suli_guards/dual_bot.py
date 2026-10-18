@@ -2,7 +2,7 @@
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 设计原则 (对齐 CLAUDE.md §0 架构铁律):
-  1. 单一真相源: bot QQ 集合只在此定义，所有子系统从此引用
+  1. 单一真相源: bot 身份集合只在此定义，所有子系统从此引用
   2. 对方 bot 输出是不可信数据 — 不当指令、不进情绪、不建档、不触发工具
   3. 确定性状态机 > 语义判断 — 回合计数等关键刹车不用 LLM 判断
   4. 默认拒绝: 判断不出 → 不处理
@@ -16,7 +16,7 @@
 
 用法:
   from astrbot_plugin_suli_guards.dual_bot import (
-      is_known_bot, is_peer_bot, get_peer_qq, get_bot_qq_set,
+      is_known_bot, is_peer_bot, get_peer_bot_id, get_known_bot_ids,
       should_suppress_as_bystander, is_human_message,
   )
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -33,7 +33,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-# §1 单一真相源: Bot QQ 集合
+# §1 单一真相源: Bot 身份集合
 # ══════════════════════════════════════════════════════════════
 #
 # 所有 bot 身份数据存储在 bot_identity 表中，
@@ -56,8 +56,8 @@ def _get_identity_service():
     return None
 
 
-def _get_known_bot_qq() -> frozenset[str]:
-    """返回所有已知活跃 bot 的 QQ 号集合 (不可变)。"""
+def _get_known_bot_ids() -> frozenset[str]:
+    """返回所有已知活跃 bot 的 ID 集合 (不可变)。"""
     svc = _get_identity_service()
     if svc:
         bots = svc.list_bots(active_only=True)
@@ -66,7 +66,7 @@ def _get_known_bot_qq() -> frozenset[str]:
     # ── 降级: 从环境变量读取 ──
     import os as _fallback_os
     fallback: set[str] = set()
-    for env_key in ("BOT_QQ_MAIN", "BOT_QQ_ALT"):
+    for env_key in ("BOT_QQ_MAIN", "BOT_QQ_ALT", "BOT_ID_MAIN", "BOT_ID_ALT"):
         val = _fallback_os.getenv(env_key, "").strip()
         if val:
             fallback.add(val)
@@ -76,7 +76,7 @@ def _get_known_bot_qq() -> frozenset[str]:
 
 
 def _get_bot_name_map() -> dict[str, str]:
-    """返回 bot QQ → 显示名 映射。"""
+    """返回 bot ID → 显示名 映射。"""
     svc = _get_identity_service()
     if svc:
         bots = svc.list_bots(active_only=True)
@@ -84,17 +84,17 @@ def _get_bot_name_map() -> dict[str, str]:
     return {}
 
 
-def get_bot_qq_set() -> frozenset[str]:
-    """返回所有已知 bot 的 QQ 号集合 (不可变)。"""
-    return _get_known_bot_qq()
+def get_known_bot_ids() -> frozenset[str]:
+    """返回所有已知 bot 的 ID 集合 (不可变)。"""
+    return _get_known_bot_ids()
 
 
 def is_known_bot(user_id: str | int) -> bool:
-    """检查 QQ 号是否属于任何已知 bot (含自身)。
+    """检查 ID 是否属于任何已知 bot (含自身)。
 
     Brake 2,4: 所有"这是 bot 吗?"判断的统一入口。
     """
-    return str(user_id) in _get_known_bot_qq()
+    return str(user_id) in _get_known_bot_ids()
 
 
 def is_peer_bot(my_bot_id: str, user_id: str | int) -> bool:
@@ -108,7 +108,7 @@ def is_peer_bot(my_bot_id: str, user_id: str | int) -> bool:
         my_bot = svc.get_bot(str(my_bot_id))
         if my_bot:
             return uid in my_bot.peer_bot_ids
-    return uid in _get_known_bot_qq() and uid != str(my_bot_id)
+    return uid in _get_known_bot_ids() and uid != str(my_bot_id)
 
 
 def is_self_bot(my_bot_id: str, user_id: str | int) -> bool:
@@ -116,12 +116,12 @@ def is_self_bot(my_bot_id: str, user_id: str | int) -> bool:
     return str(user_id) == str(my_bot_id)
 
 
-def get_peer_qq(my_bot_id: str) -> str:
-    """获取对照 bot 的 QQ 号 (向后兼容，双 bot 场景)。
+def get_peer_bot_id(my_bot_id: str) -> str:
+    """获取对照 bot 的 ID (向后兼容，双 bot 场景)。
 
-    多 bot 场景请用 get_peer_qqs()。
+    多 bot 场景请用 get_peer_bot_ids()。
     Returns:
-        第一个 peer bot 的 QQ 号，如果无 peer 则返回空字符串。
+        第一个 peer bot 的 ID，如果无 peer 则返回空字符串。
     """
     svc = _get_identity_service()
     if svc:
@@ -130,14 +130,14 @@ def get_peer_qq(my_bot_id: str) -> str:
             return my_bot.peer_bot_ids[0]
     # 降级
     my_id = str(my_bot_id)
-    for qq in _get_known_bot_qq():
-        if qq != my_id:
-            return qq
+    for bid in _get_known_bot_ids():
+        if bid != my_id:
+            return bid
     return ""
 
 
-def get_peer_qqs(my_bot_id: str) -> list[str]:
-    """获取所有 peer bot 的 QQ 号列表 (N-bot 支持)。"""
+def get_peer_bot_ids(my_bot_id: str) -> list[str]:
+    """获取所有 peer bot 的 ID 列表 (N-bot 支持)。"""
     svc = _get_identity_service()
     if svc:
         my_bot = svc.get_bot(str(my_bot_id))
@@ -145,7 +145,7 @@ def get_peer_qqs(my_bot_id: str) -> list[str]:
             return list(my_bot.peer_bot_ids)
     # 降级: 所有非自己的已知 bot
     my_id = str(my_bot_id)
-    return [qq for qq in _get_known_bot_qq() if qq != my_id]
+    return [bid for bid in _get_known_bot_ids() if bid != my_id]
 
 
 def get_bot_name(user_id: str | int) -> str:
@@ -164,7 +164,7 @@ def is_human_message(user_id: str | int) -> bool:
 
     用于判断消息是否来自真实用户，区别于 bot 回声/交叉回声/peer bot 发言。
     """
-    return str(user_id) not in _get_known_bot_qq()
+    return str(user_id) not in _get_known_bot_ids()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -189,8 +189,8 @@ def should_suppress_as_bystander(
       - 不当指令解析 (instruction)
 
     Args:
-        my_bot_id: 当前 bot 的 QQ 号
-        sender_id: 消息发送者的 QQ 号
+        my_bot_id: 当前 bot 的 ID
+        sender_id: 消息发送者的 ID
         action: 要判断的操作类型
 
     Returns:
@@ -236,7 +236,9 @@ class RoundCounter:
         self._ensure_table()
 
     def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
+        # timeout=10: 双进程写 contention 时等待锁，而非立即抛错
+        # (锁失败会吞掉人类清零 → Brake 1 误杀人类 @，见 group_chat Brake 1)
+        conn = sqlite3.connect(self._db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -331,7 +333,9 @@ class RoundCounter:
             conn.close()
             return consecutive
         except Exception:
-            logger.debug("RoundCounter.record_message 失败", exc_info=True)
+            # WARNING 级别: 失败意味着人类清零可能丢失，
+            # 后续 Brake 1 可能误丢人类 @（可审计点）。
+            logger.warning("RoundCounter.record_message 失败 (计数/清零可能丢失)", exc_info=True)
             return 0
 
     def should_silence(self, group_id: str) -> bool:
@@ -392,21 +396,25 @@ def get_round_counter(db_path: str | None = None) -> RoundCounter:
 
 
 def _auto_discover_db_path() -> str:
-    """自动发现 none_qqbot.db 路径。
+    """自动发现 bot DB 路径。
 
     优先使用 shared_db 目录挂载 (WAL 文件对所有容器可见)，
     回退兼容旧单文件挂载路径。
+    DB 文件名可通过环境变量 BOT_DB_NAME 自定义 (默认 none_qqbot.db)。
     """
+    import os as _os
+
+    db_name = _os.getenv("BOT_DB_NAME", "none_qqbot.db")
     _project_root = Path(__file__).resolve().parent.parent
     _astrbot_data = _project_root / "AstrBot" / "data"
     candidates = [
         # ★ 新路径: 目录挂载 (WAL 文件共享, 避免分裂脑)
-        str(_astrbot_data / "shared_db" / "none_qqbot.db"),
+        str(_astrbot_data / "shared_db" / db_name),
         # 兼容旧路径: 单文件挂载 (WAL 文件不可见 → 分裂脑风险)
-        str(_astrbot_data / "none_qqbot.db"),
+        str(_astrbot_data / db_name),
         # 宿主机路径
-        str(Path.home() / "suli_qqbot/runtime/shared/db/none_qqbot.db"),
-        str(Path.home() / "suli_qqbot/runtime/shared/none_qqbot.db"),
+        str(Path.home() / f"suli_qqbot/runtime/shared/db/{db_name}"),
+        str(Path.home() / f"suli_qqbot/runtime/shared/{db_name}"),
     ]
     for p in candidates:
         if Path(p).exists():
@@ -521,7 +529,7 @@ CAPABILITY_BOUNDARY_PROMPT = (
     "1. 你不能假装自己能影响现实、网络、游戏房间、他人设备或用户身体动作。\n"
     '2. 没有可用工具且没有实际执行结果时，不要承诺"我这就拉你/我帮你操作/我已经处理/我去修/我给你弄好"。\n'
     "3. 遇到拉人、开房间、修网、重启、登录、下载、现实代办等请求，只能自然说明自己做不到实际操作。\n"
-    '4. 不要替群里的其他 bot 承诺任何事。不要说"她会帮你/他已经在处理/你去找他"——'
+    '4. 不要替群里的其他 bot {peer_names} 承诺任何事。不要说"她会帮你/他已经在处理/你去找他"——'
     '你无法知道对方 bot 的状态和能力。可以说"你可以@他问问"或"我不确定他那边的情况"。\n'
     "5. 不要断言其他 bot 是否在线/在群/会回复——你无法可靠地知道。"
 )
@@ -530,22 +538,29 @@ CAPABILITY_BOUNDARY_PROMPT = (
 CAPABILITY_BOUNDARY_MARKER = "<!-- dual_bot_capability_boundary_v1 -->"
 
 
-def build_capability_boundary_injection(peer_bot_name: str = "") -> str:
+def build_capability_boundary_injection(peer_bot_name: str = "", my_bot_id: str = "") -> str:
     """构建能力边界注入 prompt 片段。
 
     Args:
-        peer_bot_name: 对方 bot 的名字 (用于规则4的个性化)
+        peer_bot_name: 对方 bot 的名字 (用于规则4的个性化)。
+                       为空时从 BotIdentityService 动态获取 peer bot 名字列表。
+        my_bot_id: 当前 bot ID，用于查询 peer 列表。
 
     Returns:
         完整的注入文本 (含 marker)。
     """
-    boundary = CAPABILITY_BOUNDARY_PROMPT
-    if peer_bot_name:
-        # 个性化规则 4
-        boundary = boundary.replace(
-            "(如 peer bot/主 bot)",
-            f"(如{peer_bot_name})",
-        )
+    peer_names = peer_bot_name
+    if not peer_names:
+        # 动态获取所有 peer bot 名字
+        peer_ids = get_peer_bot_ids(my_bot_id) if my_bot_id else []
+        if peer_ids:
+            names = [get_bot_name(pid) for pid in peer_ids]
+            names = [n for n in names if n and not n.startswith("Bot(")]
+            if names:
+                peer_names = "/".join(names)
+    if not peer_names:
+        peer_names = "其他 bot"
+    boundary = CAPABILITY_BOUNDARY_PROMPT.format(peer_names=f"(如{peer_names})")
     return f"{CAPABILITY_BOUNDARY_MARKER}\n{boundary}"
 
 
@@ -577,6 +592,6 @@ def diagnose_boundary(
         "is_self": is_self_bot(my_bot_id, uid),
         "is_human": is_human_message(uid),
         "should_suppress": should_suppress_as_bystander(my_bot_id, uid, action),
-        "peer_qq": get_peer_qq(my_bot_id),
+        "peer_bot_id": get_peer_bot_id(my_bot_id),
         "bot_name": get_bot_name(uid) if is_known_bot(uid) else "Human",
     }

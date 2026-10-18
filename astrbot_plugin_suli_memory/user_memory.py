@@ -48,6 +48,63 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _fmt_day(ts: object) -> str:
+    try:
+        if not ts or float(ts or 0) <= 0:
+            return ""
+        return time.strftime("%m-%d", time.localtime(float(ts or 0)))
+    except Exception:
+        return ""
+
+
+def _fold_timeline(related: list[dict]) -> list[str]:
+    """时间链折叠：同类相邻条目按时间排成一条链，缺时间字段保持原顺序。
+
+    返回展示行，如 `[10-15] 凶我 → [10-16] 和好了`。异常回落原样。
+    """
+    try:
+        items = [f for f in (related or []) if isinstance(f, dict)]
+        if not items:
+            return []
+        has_ts = any(isinstance(f.get("created_at"), (int, float)) for f in items)
+        ordered = sorted(items, key=lambda f: f.get("created_at", 0) or 0) if has_ts else list(items)
+        lines: list[str] = []
+        buf_cat: str | None = None
+        buf: list[str] = []
+
+        def _flush() -> None:
+            if not buf:
+                return
+            lines.append(buf[0] if len(buf) == 1 else " → ".join(buf))
+
+        for f in ordered:
+            cat = str(f.get("category", "") or "")
+            val = str(f.get("value", "") or "").strip()
+            if not val:
+                continue
+            day = _fmt_day(f.get("created_at", 0))
+            if day and cat:
+                seg = f"[{day} {cat}] {val}"
+            elif day:
+                seg = f"[{day}] {val}"
+            else:
+                seg = f"[{cat}] {val}" if cat else val
+            if buf_cat is None:
+                buf_cat, buf = cat, [seg]
+            elif cat == buf_cat:
+                buf.append(seg)
+            else:
+                _flush()
+                buf_cat, buf = cat, [seg]
+        _flush()
+        return lines or [str(f.get("value", "")) for f in ordered if f.get("value")]
+    except Exception:
+        try:
+            return [str(f.get("value", "")) for f in (related or []) if isinstance(f, dict) and f.get("value")]
+        except Exception:
+            return []
+
 # 类别推断关键词表
 _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "设备": ["显卡", "gpu", "cpu", "显存", "vram", "内存",
@@ -71,6 +128,22 @@ _INITIAL_IMPORTANCE: dict[str, float] = {
 
 # 有效类别集合
 _VALID_CATEGORIES = frozenset(_CATEGORY_KEYWORDS.keys()) | {"其他", "风险"}
+
+# 空记忆哨兵 — 此类文本绝不能落盘为记忆。
+# 来源: tavern_client.chat() 在 LLM 空 content 时返回 "(空回复)" (tavern_client.py:642)，
+# 蒸馏/提取链曾将其当正文持久化 (2026-10-11 全库清理 37 条教训)。"无" 是提取 prompt 约定的无结果标记。
+EMPTY_MEMORY_MARKERS = frozenset({"(空回复)", "无", ""})
+
+
+def is_empty_memory_text(text: object) -> bool:
+    """记忆写前过滤：空串/空白/哨兵 → True（跳过持久化）。
+
+    同包唯一真相源：bot_experience / memory_tiers 的写入口共用此函数。
+    """
+    if not isinstance(text, str):
+        return True
+    s = text.strip().lstrip("- ").lstrip("-").strip()
+    return not s or s in EMPTY_MEMORY_MARKERS
 
 
 def _infer_category(value: str) -> str:
@@ -279,18 +352,11 @@ class UserMemoryStore:
             seen_ids.add(uid)
 
             related = self.search(uid, search_query, top_n=top_n)
-            if related:
+            lines = _fold_timeline(related)
+            if lines:
                 mem = self.load(uid) or {}
                 name = mem.get("user_name", uid)
-                parts = []
-                for f in related:
-                    cat = f.get("category", "")
-                    val = f.get("value", "")
-                    if cat:
-                        parts.append(f"[{cat}] {val}")
-                    else:
-                        parts.append(val)
-                hints.append(f"{name}: {' | '.join(parts)}")
+                hints.append(f"{name}：{' | '.join(lines)}")
 
             if len(hints) >= 3:
                 break
@@ -362,17 +428,38 @@ class UserMemoryStore:
         except Exception:
             mem_temp = 0.2
 
+        # ── per-bot 背景 LLM 解析 (与 ProfileAgent/GroupSummarizer 统一) ──
+        # 原逻辑无 bot_id → 读全局 active_llm_id (已删 75) → 空 model → 401
+        # 改为: llm_lite 槽位 (resolve_background_llm) 优先, 失败回退 per-bot active_llm_id
         try:
             from astrbot_plugin_suli_tavern.service.bot_config import get_config_service
-            active_cfg = get_config_service().resolve_active_llm()
-            provider = active_cfg.provider if active_cfg else ""
-            _api_base = active_cfg.normalized_base_url if active_cfg else ""
-            _api_key = active_cfg.api_key if active_cfg else ""
+            svc = get_config_service()
+            bg = svc.resolve_background_llm(self._bot_id, "memory_extract")
+            if bg.get("model") and bg.get("api_key"):
+                # 背景槽位可用 (per-bot llm_lite → mimo-v2.5)
+                _api_model = bg.get("model", "")
+                _api_base = bg.get("api_base", "")
+                _api_key = bg.get("api_key", "")
+                # provider 从槽位配置推导 (与 traverse_client 内部 _resolve_credentials 互补)
+                _slot_cfg = svc.resolve_llm_slot(self._bot_id, "llm_lite") \
+                    or svc.resolve_llm_slot(self._bot_id, "llm_primary") \
+                    or svc.resolve_active_llm(self._bot_id)
+                provider = _slot_cfg.provider if _slot_cfg else ""
+            else:
+                active_cfg = svc.resolve_active_llm(self._bot_id) or svc.resolve_active_llm()
+                provider = active_cfg.provider if active_cfg else ""
+                _api_base = active_cfg.normalized_base_url if active_cfg else ""
+                _api_key = active_cfg.api_key if active_cfg else ""
+                _api_model = active_cfg.model_name if active_cfg else ""
+            # 前端唯一真相源: 空 model 则依赖 tavern 内部的前端槽位回退，无配置则 tavern 拒绝调用
+            if not _api_model:
+                _api_model = ""
         except Exception:
             logger.warning("extract_async: 无法解析 LLM 凭证, 记忆提取将跳过", exc_info=True)
             provider = ""
             _api_base = ""
             _api_key = ""
+            _api_model = ""
 
         try:
             result = await asyncio.wait_for(
@@ -380,9 +467,11 @@ class UserMemoryStore:
                     extract_messages,
                     temperature=mem_temp,
                     max_tokens=128,
+                    model=_api_model,
                     provider=provider,
                     api_base=_api_base,
                     api_key=_api_key,
+                    bot_id=self._bot_id,
                 ),
                 timeout=30,
             )
@@ -412,7 +501,7 @@ class UserMemoryStore:
             new_facts: list[dict] = []
             for line in result.split("\n"):
                 line = line.strip().lstrip("- ").lstrip("-")
-                if not line or line == "无":
+                if is_empty_memory_text(line):
                     continue
 
                 cat: str = "其他"
@@ -430,7 +519,7 @@ class UserMemoryStore:
                 else:
                     cat = _infer_category(value)
 
-                if not value:
+                if is_empty_memory_text(value):
                     continue
 
                 # 去重
@@ -502,7 +591,11 @@ class UserMemoryStore:
         except TimeoutError:
             logger.warning("UserMemoryStore.extract_async: LLM 调用超时 (30s)")
             return
-        except Exception:
+        except RuntimeError as _re:
+            # 上游空 output 重试耗尽（muse-spark incomplete 偶发）：后台提取按无新事实静默跳过
+            if "空 output" in str(_re) or "空 content" in str(_re):
+                logger.debug("用户记忆提取空回复跳过: %s", trigger_user_id)
+                return
             logger.exception("用户记忆提取失败: %s", trigger_user_id)
 
     # ── 显式记忆 (工具调用) ───────────────────────────
@@ -517,6 +610,11 @@ class UserMemoryStore:
         返回 True 表示新增，False 表示去重跳过。
         """
         if not self._config.user_memory_enabled:
+            return False
+
+        # 空值拦截: 哨兵 "(空回复)"/空白绝不落盘 (2026-10-11 教训)
+        if is_empty_memory_text(fact_value):
+            logger.debug("记忆拒绝空值: user=%s", user_id)
             return False
 
         if not category or category not in _VALID_CATEGORIES:

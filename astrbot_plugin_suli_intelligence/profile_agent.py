@@ -346,16 +346,21 @@ async def _do_build_profile(
     except Exception:
         logger.warning("ProfileAgent: resolve_background_llm 失败", exc_info=True)
 
+    # 前端唯一真相源: 无槽位则跳过 (不使用硬编码回退)
+    if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+        logger.warning("ProfileAgent: 前端无可用 LLM 槽位，跳过建档 (bot_id=%r)", bot_id)
+        return
     try:
         raw = await asyncio.wait_for(
             tavern.chat(
                 profile_messages,
                 temperature=0.2,
                 max_tokens=150,
-                model=_bg_llm.get("model", "deepseek-v4-flash"),
+                model=_bg_llm.get("model", ""),
                 api_base=_bg_llm.get("api_base", ""),
                 api_key=_bg_llm.get("api_key", ""),
                 extra_params=_bg_llm.get("extra_params"),
+                bot_id=bot_id,
             ),
             timeout=30,
         )
@@ -528,16 +533,20 @@ async def _do_lightweight_profile(
     except Exception:
         logger.warning("ProfileAgent: resolve_background_llm 失败", exc_info=True)
 
+    if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+        logger.warning("ProfileAgent: 前端无可用 LLM 槽位，跳过轻量建档 (bot_id=%r)", bot_id)
+        return
     try:
         raw = await asyncio.wait_for(
             tavern.chat(
                 profile_messages,
                 temperature=0.2,
                 max_tokens=100,
-                model=_bg_llm.get("model", "deepseek-v4-flash"),
+                model=_bg_llm.get("model", ""),
                 api_base=_bg_llm.get("api_base", ""),
                 api_key=_bg_llm.get("api_key", ""),
                 extra_params=_bg_llm.get("extra_params"),
+                bot_id=bot_id,
             ),
             timeout=30,
         )

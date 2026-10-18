@@ -188,8 +188,8 @@ class BotConfigService:
         "group_chat_nicknames": [],
         "group_chat_talkativeness": 0.5,
         "proactive_enabled": False,
-        "model_router_flash": "deepseek-v4-pro",
-        "model_router_pro": "deepseek-v4-pro",
+        "model_router_flash": "",
+        "model_router_pro": "",
         "model_router_private_default_pro": True,
     }
 

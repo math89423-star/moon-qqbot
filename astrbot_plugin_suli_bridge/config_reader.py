@@ -72,21 +72,19 @@ class LLMConfigRO:
 
 
 class LPortConfigReader:
-    """L-Port 配置只读访问器。
+    """已禁用: 前端 6190 是唯一真相源，禁止从 L-Port 读取配置。
 
-    用法:
-        reader = LPortConfigReader("/path/to/lport_desktop.db")
-        deepseek = reader.get_active_llm()       # 当前激活的云端 LLM
-        vlm = reader.get_active_vlm()            # 当前激活的 VLM
-        all_cfgs = reader.list_all()             # 全部配置
-        one = reader.get_by_id(3)                # 按 ID 查询
+    保留类定义仅为向后兼容 — 所有查询返回空/None 并记录警告。
     """
 
     def __init__(self, db_path: str):
-        if not os.path.exists(db_path):
-            raise FileNotFoundError(f"L-Port 数据库不存在: {db_path}")
-        # file: URI + mode=ro → OS 级只读, 写操作触发 OperationalError
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "LPortConfigReader 已禁用: 前端 6190 为唯一真相源，拒绝读取 %s", db_path
+        )
+        # 保留 file: URI 但不再实际使用 — 后续查询直接返回空
         self._db_uri = f"file:{db_path}?mode=ro"
+        self._disabled = True
 
     # ── 内部 ──────────────────────────────────────────────
 
@@ -110,52 +108,29 @@ class LPortConfigReader:
             token_budget_cap=row["token_budget_cap"],
         )
 
-    # ── 查询接口 ──────────────────────────────────────────
-
+    # ── 查询接口 — 已禁用 (前端唯一真相源) ──────────────
     def list_all(self) -> List[LLMConfigRO]:
-        """列出全部 LLM/VLM 配置"""
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM llm_config ORDER BY id").fetchall()
-            return [self._row_to_config(r) for r in rows]
+        """已禁用: 前端为唯一来源，返回空列表。"""
+        import logging as _logging
+        _logging.getLogger(__name__).warning("LPortConfigReader.list_all 已禁用: 请通过前端 6190 配置")
+        return []
 
     def get_by_id(self, config_id: int) -> Optional[LLMConfigRO]:
-        """按 ID 查询"""
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM llm_config WHERE id = ?", (config_id,)
-            ).fetchone()
-            return self._row_to_config(row) if row else None
+        import logging as _logging
+        _logging.getLogger(__name__).warning("LPortConfigReader.get_by_id 已禁用")
+        return None
 
     def get_active_llm(self) -> Optional[LLMConfigRO]:
-        """获取当前激活的云端 LLM 配置。
-
-        过滤逻辑与 L-Port settings_llm.py:18 一致:
-        包含 provider 不在 VLM_PROVIDERS 中的, 或 provider 在 LOCAL_PROVIDERS 中的。
-        即: 排除纯云端 VLM (gpt4v/claude/gemini/nano_banana)。
-        """
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM llm_config WHERE is_active = 1 ORDER BY id"
-            ).fetchall()
-            for r in rows:
-                cfg = self._row_to_config(r)
-                if cfg.provider not in VLM_PROVIDERS or cfg.provider in LOCAL_PROVIDERS:
-                    return cfg
-            return None
+        import logging as _logging
+        _logging.getLogger(__name__).warning("LPortConfigReader.get_active_llm 已禁用")
+        return None
 
     def get_active_vlm(self) -> Optional[LLMConfigRO]:
-        """获取当前激活的 VLM 配置"""
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM llm_config WHERE is_active = 1 ORDER BY id"
-            ).fetchall()
-            for r in rows:
-                cfg = self._row_to_config(r)
-                if cfg.provider in VLM_PROVIDERS and cfg.provider not in LOCAL_PROVIDERS:
-                    return cfg
-            return None
+        import logging as _logging
+        _logging.getLogger(__name__).warning("LPortConfigReader.get_active_vlm 已禁用")
+        return None
 
     def list_llm(self) -> List[LLMConfigRO]:
-        """列出所有云端 LLM 配置 (非 VLM)"""
-        all_cfgs = self.list_all()
-        return [c for c in all_cfgs if c.provider not in VLM_PROVIDERS or c.provider in LOCAL_PROVIDERS]
+        import logging as _logging
+        _logging.getLogger(__name__).warning("LPortConfigReader.list_llm 已禁用")
+        return []

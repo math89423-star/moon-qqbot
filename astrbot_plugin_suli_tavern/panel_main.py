@@ -27,7 +27,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [Panel] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("loput-panel")
+logger = logging.getLogger("qqbot-main-panel")
 
 
 async def main() -> None:

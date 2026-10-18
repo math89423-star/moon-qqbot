@@ -48,16 +48,114 @@ def _tokenize(text: str) -> set[str]:
     return tokens
 
 
-def _extract_keywords(topic_anchor: str, max_keywords: int = 5) -> list[str]:
-    """从话题锚点提取关键词 (纯规则，零 LLM)。
+# ── 展示/召回用关键词 (规则抽词，零 LLM；与 _tokenize 的 n-gram 汤区分) ──
+# _tokenize 的单字+bigram+trigram 是给召回做模糊匹配的，直接取"最长 token"
+# 当展示关键词必翻车 (如"你自由/个星穹/道花火"——trigram 随机切片，2026-10-15 实测)。
+# 此处按 书名号标题 > 英文词 > 中文内容词 抽可读词；召回侧照常用。
 
-    取 _tokenize 后最长的几个 token 作为关键词。
+_TITLE_RE = _re.compile(r"《([^》]{2,20})》")
+_TITLE_SPLIT_RE = _re.compile(r"[：:·・／/\s]+")
+_FRAG_SPLIT_RE = _re.compile(
+    r"[，。！？；：、\"\"''「」『』（）()【】〈〉…—·\s"
+    r"\u2600-\u27BF\u2B00-\u2BFF\uFE00-\uFE0F"
+    r"\U0001F000-\U0001FAFF\U0001FC00-\U0001FFFF"
+    r"❤️♥✨♪♡❤\*#@~_\-/\\|+=\^<>$%&]+"
+)
+# 内部分词只切最稳的虚词 (地/得/量/极/过会碎地图/记得/质量/积极/过去，不在此切，长句走动词兜底)
+# 2026-10-15 补吧吗呢啊：爱吧昵称→爱/昵称，不然整块当关键词（“爱吧昵称”事故）
+_INNER_SPLIT_RE = _re.compile(r"[的之和与或跟及在对为是将被把由从向往给让使令经因如若但却还并及等比同张个些种样最更太很第着讨论吧吗呢啊呀么]")
+_VERB_SPLIT_RE = _re.compile(r"[问说看听说打吃喝玩聊谈讲读写真画做用查搜找教请帮让叫替求追播讨论高质极量得下过论讨]")
+_STRIP_CHARS = "为给把被在对和与跟向往从由将就才都也还要会能可应该得地着的了过之其每各另别再所而已于吧呢吗啊呀么这那你我他她它是没不很太更最第张个些种样一"
+_STOPWORDS = frozenset({
+    "什么", "怎么", "这样", "那样", "这么", "那么", "这个", "那个", "这些", "那些",
+    "这里", "那里", "哪里", "可以", "应该", "需要", "觉得", "认为", "知道", "看到",
+    "还是", "或者", "以及", "因为", "所以", "虽然", "然后", "但是", "如果", "一个",
+    "一张", "一些", "有点", "非常", "真的", "就是", "不是", "没有", "进行", "通过",
+    "作为", "主人绘制一张",
+})
+_EN_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "and", "or", "for", "with", "is", "are",
+    "it", "this", "that", "you", "your", "can", "please", "me", "my", "we",
+})
+
+
+def _extract_keywords(topic_anchor: str, max_keywords: int = 5) -> list[str]:
+    """从话题锚点提取可读关键词 (纯规则，零 LLM)。
+
+    书名号标题优先 (崩坏：星穹铁道→崩坏/星穹铁道)，再取英文词，
+    中文按标点分片→虚词剥边→内部分词，留 2-6 字内容词，按出现序去重截断。
     """
     if not topic_anchor:
         return []
-    tokens = _tokenize(topic_anchor)
-    sorted_tokens = sorted(tokens, key=len, reverse=True)
-    return sorted_tokens[:max_keywords]
+    kws: list[str] = []
+
+    def _push(w: str) -> None:
+        w = (w or "").strip()
+        # 只收中日韩+字母数字下划线，表情/符号碎片直接丢（“❤️你躺”事故）
+        if not w or not _re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9_]+", w):
+            return
+        if len(w) >= 2 and w not in _STOPWORDS and w not in kws:
+            kws.append(w)
+
+    for title in _TITLE_RE.findall(topic_anchor):
+        title = title.strip()
+        if len(title) <= 8:
+            _push(title)
+        for part in _TITLE_SPLIT_RE.split(title):
+            _push(part)
+    text = _TITLE_RE.sub(" ", topic_anchor)
+    for m in _re.finditer(r"[a-z][a-z0-9_]+", text.lower()):
+        if len(m.group()) >= 2 and m.group() not in _EN_STOPWORDS:
+            _push(m.group())
+    for frag in _FRAG_SPLIT_RE.split(text):
+        frag = frag.strip().strip(_STRIP_CHARS)
+        if not frag:
+            continue
+        if _re.fullmatch(r"[A-Za-z0-9_]+", frag):
+            # 纯英文碎片走英文通道 (小写+停用词过滤，防 "Can" 漏网)
+            _low = frag.lower()
+            if len(_low) >= 2 and _low not in _EN_STOPWORDS:
+                _push(_low)
+            continue
+        for seg in _INNER_SPLIT_RE.split(frag):
+            seg = seg.strip().strip(_STRIP_CHARS)
+            if 2 <= len(seg) <= 6:
+                _push(seg)
+            elif len(seg) > 6:
+                # 长句兜底：先按黏着动词再切，仍超长则抽中日韩/字母 runs，不再盲切首尾4字
+                # (盲切会产出“爱吧昵称”“❤️你躺”这类不可读词，2026-10-15 实测)
+                for sub in _VERB_SPLIT_RE.split(seg):
+                    sub = sub.strip().strip(_STRIP_CHARS)
+                    if 2 <= len(sub) <= 6 and _re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9_]+", sub):
+                        _push(sub)
+                    elif len(sub) > 6:
+                        for run in _re.findall(r"[\u4e00-\u9fff]{2,6}|[A-Za-z][A-Za-z0-9_]{1,15}", sub):
+                            _push(run)
+                            if len(kws) >= max_keywords:
+                                break
+                    if len(kws) >= max_keywords:
+                        break
+    return kws[:max_keywords]
+
+
+def _sanitize_llm_keywords(words: list[str] | None, max_keywords: int = 5) -> list[str]:
+    """清洗 LLM 预抽关键词：只要中日韩+字母数字、2-8 字、去重截断。
+
+    LLM 偶发带解释/序号/emoji（如“1.昵称❤️”），这里只收干净词；
+    洗后为空则调用方回退规则抽词。
+    """
+    if not words:
+        return []
+    out: list[str] = []
+    for w in words:
+        w = (str(w or "")).strip().strip("\"'“”‘’。、，, |.。:：;；!！?？")
+        if not w or not _re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9_]+", w):
+            continue
+        if 2 <= len(w) <= 8 and w not in _STOPWORDS and w not in out:
+            out.append(w)
+        if len(out) >= max_keywords:
+            break
+    return out
 
 
 class EpisodicStore:
@@ -133,11 +231,12 @@ class EpisodicStore:
         summary: str,
         participants: set[str] | list[str] | None = None,
         topic_anchor: str = "",
+        topic_keywords: list[str] | None = None,
     ) -> bool:
         """归档一条情节记录。空 summary 跳过。
 
-        Returns:
-            True 如果成功归档，False 如果跳过 (空 summary)。
+        topic_keywords 由调用方（tavern 侧 LLM）预抽传入；缺省/洗后为空
+        则回退本模块规则抽词（零 LLM）。记忆层保持纯规则，不直连 LLM。
         """
         summary = (summary or "").strip()
         if not summary:
@@ -162,7 +261,10 @@ class EpisodicStore:
         entry = {
             "summary": summary,
             "participants": participants_list,
-            "topic_keywords": _extract_keywords(topic_anchor or summary),
+            # 关键词优先用调用方 LLM 预抽（干净），缺省/洗后为空回退规则。
+            # 规则只看 summary+anchor（summary 优先），不再只看原话。
+            "topic_keywords": _sanitize_llm_keywords(topic_keywords)
+            or _extract_keywords(f"{summary} {topic_anchor or ''}"),
             "created_at": time.time(),
         }
         entries.append(entry)

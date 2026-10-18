@@ -1,9 +1,42 @@
 """L-Port 酒馆桥接插件 — 群聊自然对话配置。
 
 AstrBot 插件配置 — 群聊自然对话参数。可通过环境变量覆盖默认值。
+
+身份类默认值 (管理员 QQ / 对照 bot QQ) 全部从环境变量解析
+(环境变量 / .env)，缺省时 fail-closed (0/空)，
+本文件不含任何 QQ 号明文。
 """
 
+import os
+
 from pydantic import BaseModel, Field
+
+
+def _env_admin_qq() -> int:
+    """SUPER_ADMIN_QQ > ADMIN_QQ，缺省 0 (无人是管理员)。"""
+    for key in ("SUPER_ADMIN_QQ", "ADMIN_QQ"):
+        val = (os.getenv(key, "") or "").strip()
+        if val.isdigit():
+            return int(val)
+    return 0
+
+
+def _env_owner_whitelist() -> set[str]:
+    """OWNER_QQ_WHITELIST (逗号分隔) > SUPER_ADMIN_QQ，缺省空集。"""
+    raw = (os.getenv("OWNER_QQ_WHITELIST", "") or "").strip()
+    if not raw:
+        raw = (os.getenv("SUPER_ADMIN_QQ", "") or os.getenv("ADMIN_QQ", "") or "").strip()
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip().isdigit()}
+
+
+def _env_peer_bot_qq() -> int:
+    """对照 bot QQ：BOT_QQ_ALT > BOT_ID_ALT，缺省 0 (per-container 正确，
+    每个容器读自己的 ALT 指向对方，旧硬编码反而不对)。"""
+    for key in ("BOT_QQ_ALT", "BOT_ID_ALT"):
+        val = (os.getenv(key, "") or "").strip()
+        if val.isdigit():
+            return int(val)
+    return 0
 
 
 class Config(BaseModel):
@@ -140,7 +173,7 @@ class Config(BaseModel):
     )
 
     heat_reply_delay_max: float = Field(
-        default=4.0,
+        default=2.5,
         ge=0.0,
         le=15.0,
         description="回复前最大延迟 (秒)",
@@ -485,16 +518,14 @@ class Config(BaseModel):
         description="全局最大并发 LLM API 调用数",
     )
 
-    # ── 模型路由 ─────────────────────────────────────
-
-    # 各 tier 对应的模型名 (传给 SillyTavern)
+    # ── 模型路由 — 已废弃: 前端 6190 槽位为唯一真相源 (保留字段仅为兼容旧配置加载) ──
     model_router_flash: str = Field(
-        default="deepseek-v4-pro",
-        description="闲聊默认模型 (Tier 1)",
+        default="",
+        description="[已废弃] 请在前端 6190 槽位 llm_lite/pro 配置，保留仅为兼容",
     )
     model_router_pro: str = Field(
-        default="deepseek-v4-pro",
-        description="专业/推理模型 (Tier 2)",
+        default="",
+        description="[已废弃] 请在前端 6190 槽位 llm_lite/pro 配置，保留仅为兼容",
     )
     # 私聊是否默认用 pro 模型
     model_router_private_default_pro: bool = Field(
@@ -531,18 +562,24 @@ class Config(BaseModel):
     )
 
     # Stage 1: Relevance Gate 超时 (秒)
+    # 2026-10-17 修宽: 5→10s, 上限 10→30 (慢模型/带思考起步 3~11s; 此前该值
+    # 未被接线, decide() 恒用 3s 默认 —— 本次一并接上)。
     intent_gate_relevance_timeout: float = Field(
-        default=5.0,
+        default=10.0,
         ge=1.0,
-        le=10.0,
-        description="Stage 1 Relevance Gate LLM 超时秒数",
+        le=30.0,
+        description="Stage 1 Relevance Gate LLM 超时秒数 (慢模型修宽, 上限30)",
     )
 
     # Stage 2: Intent Gate 超时 (秒)
+    # ★ 2026-08-19: 15s 太紧 — mimo-v2.5 处理 ~6k token Gate prompt 需要 20-23s。
+    #   实测唯一成功调用 in=6030 out=515 finish=stop 耗时 ~23s。
+    #   改为 45s 给 API 充足余量, 避免每次 Gate 都 fail-closed。
+    #   API 延迟波动 10-23s, 30s 会偶尔卡边界触发重试。
     intent_gate_intent_timeout: float = Field(
-        default=15.0,
+        default=45.0,
         ge=3.0,
-        le=30.0,
+        le=60.0,
         description="Stage 2 Intent Gate (合并 Full Gate) LLM 超时秒数",
     )
 
@@ -850,17 +887,16 @@ class Config(BaseModel):
 
     # ── 管理员 ─────────────────────────────────────────
 
-    # 全局管理员 QQ 号列表
-    # 请通过环境变量 BOT_ADMIN_QQ / BOT_QQ_MAIN / BOT_QQ_PEER 配置
+    # 全局管理员 QQ 号列表 (真相源: SUPER_ADMIN_QQ 环境变量)
     admin_qq_ids: list[int] = Field(
-        default_factory=lambda: [0],
-        description="全局管理员 QQ 号列表，请通过环境变量 BOT_ADMIN_QQ 配置",
+        default_factory=lambda: [_env_admin_qq()] if _env_admin_qq() else [],
+        description="全局管理员 QQ 号列表",
     )
 
     # 唯一超级管理员 QQ 号 (角色扮演中称呼为「主人」，其他用户称呼为「小可爱」)
     super_admin_qq: int = Field(
-        default=0,
-        description="唯一超级管理员 QQ 号，请通过环境变量 BOT_ADMIN_QQ 配置。角色扮演中享有「主人」称呼特权",
+        default_factory=_env_admin_qq,
+        description="唯一超级管理员 QQ 号，角色扮演中享有「主人」称呼特权",
     )
 
     # ★ 主人 QQ 号白名单 — 身份验证唯一真相源
@@ -868,17 +904,36 @@ class Config(BaseModel):
     # 任何人自称"主人"但其 QQ 号不在此集合中 = 冒充。
     # 请通过环境变量 BOT_ADMIN_QQ 配置 (支持多个, 逗号分隔)。
     OWNER_QQ_WHITELIST: set[str] = Field(
-        default_factory=lambda: set(),
-        description="主人 QQ 号白名单。display name 可伪造，QQ 号不可。鉴权只用此集合。请通过环境变量 BOT_ADMIN_QQ 配置。",
+        default_factory=_env_owner_whitelist,
+        description="主人 QQ 号白名单。display name 可伪造，QQ 号不可。鉴权只用此集合。",
     )
 
     # 同群对照 bot 的 QQ 号 — 其消息不应触发本 bot 的管线
+    # (真相源: BOT_QQ_ALT 环境变量，per-container 自动正确)
     peer_bot_qq: int = Field(
-        default=0,
-        description="同群对照 bot 的 QQ 号，其消息不会触发本 bot 回复。请通过环境变量 BOT_QQ_PEER 配置。",
+        default_factory=_env_peer_bot_qq,
+        description="同群对照 bot 的 QQ 号，其消息不会触发本 bot 回复",
     )
 
     # ── 辅助方法 ──────────────────────────────────────
+
+    # ── Actor 模型 (P0-1 直切，无灰度) ─────────────────────
+    actor_enabled: bool = Field(
+        default=True,
+        description="是否启用 Actor 单写者模型（直切，git 回退即回滚）",
+    )
+    actor_coalesce_window: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=10.0,
+        description="Actor InputCoalescer 累积窗口秒数",
+    )
+    actor_coalesce_max_wait: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=30.0,
+        description="Actor InputCoalescer 同一窗口累计等待上限秒数（防无限续窗）",
+    )
 
     def is_emotion_enabled(self, bot_id: str = "") -> bool:
         """检查指定 bot 的情感系统是否启用。

@@ -946,15 +946,10 @@ class MemeSender(Star):
                 final_meme_file = self._convert_to_gif(meme_file)
 
                 try:
-                    if event.get_platform_name() == "gewechat":
-                        await event.send(
-                            MessageChain([Image.fromFileSystem(final_meme_file)])
-                        )
-                    else:
-                        await self.context.send_message(
-                            event.unified_msg_origin,
-                            MessageChain([Image.fromFileSystem(final_meme_file)]),
-                        )
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain([Image.fromFileSystem(final_meme_file)]),
+                    )
                 except Exception as e:
                     logger.error(f"[suli_meme] 流式模式发送表情失败: {e}")
                 finally:
@@ -1130,11 +1125,10 @@ class MemeSender(Star):
                             #   传入 event 引用以便发送前检查消息是否被后续 handler 抑制。
                             pending = list(emotion_images)
                             origin = event.unified_msg_origin
-                            platform = event.get_platform_name()
                             ctx = self.context
                             tmp = list(temp_files) if temp_files else []
                             asyncio.ensure_future(
-                                self._send_pending_images(pending, origin, platform, ctx, tmp, event)
+                                self._send_pending_images(pending, origin, ctx, tmp, event)
                             )
                     else:
                         pass
@@ -1189,12 +1183,9 @@ class MemeSender(Star):
         )
         try:
             for image in pending_images:
-                if event.get_platform_name() == "gewechat":
-                    await event.send(MessageChain([image]))
-                else:
-                    await self.context.send_message(
-                        event.unified_msg_origin, MessageChain([image])
-                    )
+                await self.context.send_message(
+                    event.unified_msg_origin, MessageChain([image])
+                )
         except Exception as e:
             logger.error(f"发送表情图片失败: {e!s}")
             logger.error(traceback.format_exc())
@@ -1214,7 +1205,6 @@ class MemeSender(Star):
         self,
         images: list,
         origin,
-        platform: str,
         ctx,
         temp_files: list,
         event=None,
@@ -1260,10 +1250,7 @@ class MemeSender(Star):
         try:
             for image in images:
                 try:
-                    if platform == "gewechat":
-                        await ctx.send_message(origin, MessageChain([image]))
-                    else:
-                        await ctx.send_message(origin, MessageChain([image]))
+                    await ctx.send_message(origin, MessageChain([image]))
                 except Exception as e:
                     logger.error(f"[suli_meme] 延迟发送表情失败: {e}")
         finally:

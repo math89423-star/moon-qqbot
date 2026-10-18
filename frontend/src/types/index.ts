@@ -12,6 +12,7 @@ export interface LLMConfigItem {
   is_llm: boolean
   api_key_preview: string
   config_type: string
+  context_window?: number | null
 }
 
 export interface LLMActive {
@@ -31,6 +32,7 @@ export interface LLMConfigCreate {
   vlm_resize_max_dim?: number | null
   token_budget_cap?: number | null
   config_type?: string
+  context_window?: number | null
 }
 
 export interface LLMConfigUpdate {
@@ -43,6 +45,7 @@ export interface LLMConfigUpdate {
   vlm_resize_max_dim?: number | null
   token_budget_cap?: number | null
   config_type?: string
+  context_window?: number | null
 }
 
 export interface TemperatureMap {
@@ -237,11 +240,22 @@ export interface BotSettings {
   group_chat_enabled: boolean
   private_chat_enabled: boolean
   reasoning_enabled: boolean
+  thinking_effort: string
+  slot_efforts: Record<string, string>
   shadow_agent_enabled: boolean
   shadow_agent_model: string
   owner_qq: string
+  nsfw_enabled: boolean
+  nsfw_groups: string
+  nsfw_users: string
+  /** 私聊 NSFW 通道 — 私聊没有群号, 群白名单不适用, 单列一个开关。默认 false */
+  nsfw_private: boolean
   llm_slots: Record<string, number | null>
   vlm_slots: Record<string, number | null>
+  /** NSFW 专属 LLM 槽位 (null = 跟随 SFW; 2026-10-18) */
+  nsfw_slots: Record<string, number | null>
+  /** NSFW 专属槽位档位 (follow = 跟随 SFW / 全局) */
+  nsfw_slot_efforts: Record<string, string>
 }
 
 export interface BotIdentityCreate {
@@ -333,6 +347,17 @@ export interface LLMListResponse {
   slots: Record<string, number | null>
   bot_id: string
   bot_name: string
+  /** 请求 scope ('sfw' | 'nsfw'; 2026-10-18 NSFW 分页) */
+  scope?: string
+  /** scope=nsfw 时: SFW 槽位映射 (显示「跟随 SFW」回落目标) */
+  fallback_slots?: Record<string, number | null>
+}
+
+/** NSFW 温度视图 — 生效值 / 覆盖标记 / SFW 回落值 (2026-10-18) */
+export interface NsfwTemperatureView {
+  temperatures: TemperatureMap
+  overrides: Record<string, boolean>
+  sfw: TemperatureMap
 }
 
 // ── 插件发现 ──────────────────────────────────────────
@@ -365,4 +390,56 @@ export interface MemeItem {
 export interface MemeSyncStatus {
   missing_in_config: string[]
   deleted_categories: string[]
+}
+
+// ── 绘图 API (NovelAI + PixAI) ─────────────────────────
+
+export interface DrawNovelAIConfig {
+  token_set: boolean
+  token_masked: string
+  /** 主人档模型（默认 V5 full） */
+  model: string
+  /** 普通用户档模型（默认 V4.5 full，支持参考图 Vibe） */
+  model_public: string
+  /** 主人档模型是否支持参考图 (Vibe) — 只做提示 */
+  model_vibe_ok: boolean
+  /** 普通档模型是否支持参考图 (Vibe) — 只做提示 */
+  model_public_vibe_ok: boolean
+  size: string
+  steps: string
+}
+
+export interface DrawPixAIConfig {
+  key_set: boolean
+  key_masked: string
+  model: string
+  aspect: string
+  size: string
+}
+
+/** 绘图访问策略 — 计费后端准入 (2026-10-12 用户裁定) */
+export interface DrawPolicyConfig {
+  /** 计费后端名单（默认 ["pixai"]） */
+  metered_providers: string[]
+  /** 计费后端仅主人可用 */
+  metered_master_only: boolean
+  /** 主人 NSFW 通路额外放行计费后端 */
+  metered_nsfw_allow: boolean
+}
+
+export interface DrawSpecConfig {
+  route: string
+  effort: string
+  tokens: string
+  temperature: string
+  timeout: string
+}
+
+export interface DrawApiConfig {
+  novelai: DrawNovelAIConfig
+  pixai: DrawPixAIConfig
+  policy?: DrawPolicyConfig
+  spec?: DrawSpecConfig
+  assignments: Record<string, 'novelai' | 'pixai' | 'none'>
+  bots: { id: string; name: string }[]
 }

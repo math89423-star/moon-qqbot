@@ -23,18 +23,33 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 from typing import Optional
 
 import aiohttp
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
+
+# Pillow EXIF/TIFF tag 解析是 DBUG 级刷屏源 (手机照片常见) — 压到 WARNING。
+# 注意：仅降噪音；朝向校正由 _to_static_jpeg 的 exif_transpose 负责。
+logging.getLogger("PIL").setLevel(logging.WARNING)
+
+# ── OpenCode Go 网关必需头 (https://opencode.ai/docs/go/#where-can-i-use-it) ──
+# VLM 槽位同样指向 zen/go 网关, 缺 x-opencode-session 会 400 MissingSessionID。
+# VLM 调用无 bot 上下文, 用稳定常量 session (网关仅要求稳定可路由, 非严格隔离)。
+_OPENCODE_SESSION_HEADER = "x-opencode-session"
+_QQBOT_USER_AGENT = "suli-qqbot/1.0"
+_VLM_SESSION_ID = "suli-qqbot-vlm"
 
 # 图片下载最大尺寸 (bytes) — 5MB，超过自动 resize 压缩
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 # VLM 图片最大尺寸 — 3MB，超过则在 SHA256 之后 resize (保护缓存一致性)
 VLM_MAX_IMAGE_BYTES = 3 * 1024 * 1024
+# VLM 图片最大长边像素 — VLM 不需要高分辨率, 大图只会增加 token + 延迟
+VLM_MAX_LONG_SIDE = 1024
 
 # resize 后最小长边像素 (保持可辨识)
 RESIZE_MIN_LONG_SIDE = 512
@@ -42,11 +57,11 @@ RESIZE_MIN_LONG_SIDE = 512
 # JPEG 渐进压缩质量步进
 RESIZE_QUALITY_STEPS = [85, 70, 55, 40]
 
-# VLM 请求超时 (1024 tokens @ ~30 tok/s ≈ 35s, 留余量)
+# VLM 请求超时 — opencode.ai 实测 ~15s/请求
 # VLM API 总超时 (秒) — aiohttp 层
-VLM_TIMEOUT = 20.0  # 直连 api.vectorengine.ai 实测 ~9s, 20s 充裕
+VLM_TIMEOUT = 60.0  # opencode.ai 实测 3~30s 且偶发排队慢，60s 余量 (经代理后更快)
 # asyncio.wait_for 硬超时 — 防止 aiohttp 超时失效时连接池耗尽 (TRAPS §四)
-VLM_HARD_TIMEOUT = 25.0
+VLM_HARD_TIMEOUT = 70.0
 
 # VLM 描述最大 token (详细描述需要更多空间)
 # 旧值 2048 不够: 新 prompt 输入 ~3000 token + 要求逐项详细输出 + 文字逐字记录 → 频繁截断
@@ -54,6 +69,14 @@ VLM_MAX_TOKENS = 4096
 
 # 单次最多解析图片数 — VLM 调用昂贵，超过此数礼貌拒绝
 MAX_VLM_IMAGES = 2
+
+# ── 视频/语音链 ──
+# QQ 原生视频/语音 (CQ:video / CQ:record) 经此解析。ffmpeg 二进制已在镜像内。
+VIDEO_MAX_BYTES = 60 * 1024 * 1024   # 视频下载上限 60MB，超限直接拒绝
+VOICE_MAX_BYTES = 10 * 1024 * 1024   # 语音下载上限 10MB
+VIDEO_FRAMES = 3                     # 抽帧数 (头/中/尾)，一次 VLM 请求带 N 张图
+VOICE_MAX_SECS = 120.0               # 转写最长 120s，超长截断
+_FFMPEG_BIN: str | None = None       # which 缓存 (None=未探测，""=缺失)
 
 # ═══════════════════════════════════════════════════════════════
 # VLM 结果缓存 — SHA-256 字节级精确匹配，跨 bot 共享
@@ -414,22 +437,28 @@ _vlm_config_provider: callable | None = None  # () → dict | None
 # 此前 VLM 的 token 消耗完全不可见——只在 log 中出现，不写 token_usage 表。
 # 以下模块级变量让调用方可以在 VLM 完成后读取用量并写入统一统计。
 
-_vlm_last_usage: dict = {}  # {"input_tokens": int, "output_tokens": int, "model": str, "provider": str}
+_vlm_last_usage: dict[str, dict] = {}  # {bot_id: {"input_tokens", "output_tokens", "model", "provider"}}
+_vlm_usage_bot: str = ""  # 当前累计桶（由 _reset_vlm_usage 指定；并发交错时以最后一次 reset 为准）
 
 
-def get_last_vlm_usage() -> dict:
+def get_last_vlm_usage(bot_id: str = "") -> dict:
     """读取最近一次 (或累计多次) VLM 调用的 token 用量。
+
+    Args:
+        bot_id: 指定 bot 的累计桶；为空则读当前累计桶。
 
     Returns:
         {"input_tokens": int, "output_tokens": int, "model": str, "provider": str}
         无数据时返回空 dict。
     """
-    return dict(_vlm_last_usage)
+    return dict(_vlm_last_usage.get(bot_id or _vlm_usage_bot, {}))
 
 
-def _reset_vlm_usage() -> None:
-    """重置 VLM 用量累计 (每次群/私聊消息开始前调用)。"""
-    _vlm_last_usage.clear()
+def _reset_vlm_usage(bot_id: str = "") -> None:
+    """重置 VLM 用量累计 (每次群/私聊消息开始前调用，传入所属 bot)。"""
+    global _vlm_usage_bot
+    _vlm_usage_bot = str(bot_id or "")
+    _vlm_last_usage.pop(_vlm_usage_bot, None)
 
 
 def init_vlm_provider(provider: callable) -> None:
@@ -448,32 +477,22 @@ def init_vlm_provider(provider: callable) -> None:
 
 
 def _resolve_vlm_config_from_env() -> Optional[dict]:
-    """从环境变量解析 VLM 配置 (默认 fallback)。"""
-    api_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("VLM_BASE_URL")
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("VLM_API_KEY")
-    model = os.environ.get("VLM_MODEL_NAME") or os.environ.get("OPENAI_MODEL")
-    if api_base and api_key and model:
-        return {
-            "api_base": api_base,
-            "api_key": api_key,
-            "model_name": model,
-            "provider": "env",
-        }
+    """已禁用: 前端 6190 是 VLM 唯一真相源，禁止从环境变量读取。"""
     return None
 
 
 def has_active_vlm() -> bool:
-    """检查是否有可用的 VLM 配置。"""
+    """检查是否有可用的 VLM 配置（仅前端）。"""
     try:
         if _vlm_config_provider is not None:
             return _vlm_config_provider() is not None
-        return _resolve_vlm_config_from_env() is not None
+        return False
     except Exception:
         return False
 
 
 def _get_vlm_config() -> Optional[dict]:
-    """获取活跃 VLM 的配置信息。"""
+    """获取活跃 VLM 的配置信息（仅前端）。"""
     try:
         if _vlm_config_provider is not None:
             vlm = _vlm_config_provider()
@@ -485,7 +504,7 @@ def _get_vlm_config() -> Optional[dict]:
                     "provider": vlm.provider if hasattr(vlm, 'provider') else vlm.get("provider", "custom"),
                 }
             return None
-        return _resolve_vlm_config_from_env()
+        return None
     except Exception:
         logger.warning("无法获取 VLM 配置", exc_info=True)
         return None
@@ -509,6 +528,47 @@ def _detect_image_format(data: bytes) -> str:
     return "jpeg"  # 默认当作 JPEG
 
 
+def _vlm_resize(data: bytes) -> bytes:
+    """VLM 专用尺寸压缩 — 按长边缩放到 VLM_MAX_LONG_SIDE。
+
+    VLM 不需要高分辨率图片。一张 4000x3000 的图缩到 1024x768 后,
+    内容完全可辨识，但 base64 大小减少 ~90%，token 减少 ~70%，
+    API 处理速度也更快。
+
+    Args:
+        data: JPEG 图片字节 (已转为静态 JPEG)
+
+    Returns:
+        压缩后的 JPEG 字节
+    """
+    try:
+        img = Image.open(io.BytesIO(data))
+    except Exception:
+        return data
+
+    w, h = img.size
+    long_side = max(w, h)
+
+    if long_side <= VLM_MAX_LONG_SIDE:
+        return data  # 无需压缩
+
+    ratio = VLM_MAX_LONG_SIDE / long_side
+    new_w, new_h = int(w * ratio), int(h * ratio)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    result = buf.getvalue()
+
+    logger.info(
+        "VLM 尺寸压缩: %dx%d → %dx%d (%.0fKB → %.0fKB, -%.0f%%)",
+        w, h, new_w, new_h,
+        len(data) / 1024, len(result) / 1024,
+        (1 - len(result) / len(data)) * 100,
+    )
+    return result
+
+
 def _to_static_jpeg(data: bytes, img_format: str = "jpeg") -> bytes:
     """将任意图片转为静态 JPEG，消除动画（GIF/APNG）避免 VLM 处理多帧超时。
 
@@ -528,6 +588,13 @@ def _to_static_jpeg(data: bytes, img_format: str = "jpeg") -> bytes:
     except Exception:
         logger.warning("无法解析图片格式，返回原始数据")
         return data
+
+    # EXIF 朝向校正：手机照片常带 Orientation 标记，不转正 VLM 会看到横/倒图。
+    # 必须在取帧/转模式之前做（transpose 可能交换宽高）。
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
 
     # GIF/APNG: 只取第一帧
     if img_format in ("gif", "png"):
@@ -664,8 +731,35 @@ async def _download_image(url: str, bot=None, file_id: str = "") -> Optional[byt
     优先使用 OneBot get_image API (绕过 CDN rkey 鉴权)，
     file_id 为空时 fallback 到 HTTP 下载。
     """
+    # ── 路径 0: 本地文件路径 (AstrBot 框架可能已下载图片到本地) ──
+    if url and (url.startswith("/") or url.startswith("./") or url.startswith("file://")):
+        import os
+        file_path = url.replace("file://", "") if url.startswith("file://") else url
+        if os.path.isfile(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    file_data = f.read()
+                if file_data and len(file_data) > 512:
+                    img_format = _detect_image_format(file_data)
+                    if len(file_data) > MAX_IMAGE_BYTES:
+                        file_data = _resize_image(file_data, img_format)
+                    logger.info("本地文件读取成功: %s (%d bytes)", file_path[:60], len(file_data))
+                    return file_data
+                logger.debug("本地文件过小: %s (%d bytes)", file_path[:60], len(file_data) if file_data else 0)
+            except Exception:
+                logger.debug("本地文件读取失败: %s", file_path[:60], exc_info=True)
+        else:
+            logger.debug("本地文件不存在: %s", file_path[:60])
+            # 本地路径缺失且 file_id 亦为本地/空 → 无法下载，直接失败避免 HTTP 误请求
+            _fid_is_local_early = file_id.startswith("/") or file_id.startswith("./") or file_id.startswith("file://") if file_id else True
+            if _fid_is_local_early:
+                logger.debug("本地图片缺失且无有效 file_id，跳过下载: %s", url[:80])
+                return None
+
     # ── 路径 1: OneBot get_image API (无 rkey 问题) ──
-    if bot is not None and file_id:
+    # file_id 为本地路径时 NapCat 必回 1200，跳过
+    _is_local_fid = file_id.startswith("/") or file_id.startswith("./") or file_id.startswith("file://") if file_id else False
+    if bot is not None and file_id and not _is_local_fid:
         try:
             resp = await bot.call_api("get_image", file=file_id)
             file_data: bytes | None = None
@@ -700,7 +794,7 @@ async def _download_image(url: str, bot=None, file_id: str = "") -> Optional[byt
                 "get_image 数据过小或无效: %d bytes, fallback HTTP",
                 len(file_data) if file_data else 0,
             )
-        except Exception:
+        except BaseException:
             logger.debug("get_image API 失败，fallback HTTP", exc_info=True)
 
     # ── 路径 2: HTTP 下载 (fallback) ──
@@ -812,6 +906,16 @@ async def describe_image_from_url(
     if not vlm_cfg:
         logger.warning("VLM 未配置，跳过图片描述")
         return None
+    _vbase_chk = (vlm_cfg.get("api_base") or "").rstrip("/")
+    if "/responses" in _vbase_chk or "muse-spark" in str(vlm_cfg.get("model_name") or "").lower():
+        # Responses 基址是纯文本 endpoint，不支持 image_url 的 chat-completions
+        # (会拼出 …/responses/chat/completions → 404，同 shadow 事故)。
+        # VLM 识图必须走 chat-completions 兼容槽 (mimo)，此处直接跳过避免 404 刷屏。
+        logger.warning(
+            "VLM 跳过: Responses/spark 基址不支持识图 model=%s base=%s",
+            vlm_cfg.get("model_name"), vlm_cfg.get("api_base"),
+        )
+        return None
 
     # 1. 下载图片 (OneBot get_image 优先，HTTP fallback)
     image_data = await _download_image(image_url, bot=bot, file_id=file_id)
@@ -839,6 +943,9 @@ async def describe_image_from_url(
         return None
     img_format = _detect_image_format(image_data)
     image_data = _to_static_jpeg(image_data, img_format)
+
+    # 3.5 VLM 尺寸压缩: 按长边缩放 (VLM 不需要高分辨率, 减少 token + 延迟)
+    image_data = _vlm_resize(image_data)
 
     # 4. VLM 图片 resize: 超过 3MB 压缩 (减少 API 延迟 + token 消耗)
     if len(image_data) > VLM_MAX_IMAGE_BYTES:
@@ -1047,13 +1154,15 @@ async def describe_image_from_url(
     _start = time.time()
     async def _vlm_request():
         async with aiohttp.ClientSession(
-            trust_env=False,  # 国内 VLM 代理商, 不走 SOCKS5 代理
+            trust_env=True,  # opencode.ai 走 HTTP_PROXY (直连出境半死: SSL EOF/28s+/超时看命)
         ) as session, session.post(
             endpoint,
             json=payload,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": _QQBOT_USER_AGENT,
+                _OPENCODE_SESSION_HEADER: _VLM_SESSION_ID,
             },
             timeout=aiohttp.ClientTimeout(total=VLM_TIMEOUT),
         ) as resp:
@@ -1080,17 +1189,18 @@ async def describe_image_from_url(
                 logger.warning("VLM 返回空 choices, usage=%s", usage)
                 return None
 
-            # ── VLM 用量写入追踪 ──
-            _vlm_last_usage["input_tokens"] = (
-                _vlm_last_usage.get("input_tokens", 0)
+            # ── VLM 用量写入追踪（per-bot 桶，2026-09-08）──
+            _bucket = _vlm_last_usage.setdefault(_vlm_usage_bot, {})
+            _bucket["input_tokens"] = (
+                _bucket.get("input_tokens", 0)
                 + int(usage.get("prompt_tokens", 0) or 0)
             )
-            _vlm_last_usage["output_tokens"] = (
-                _vlm_last_usage.get("output_tokens", 0)
+            _bucket["output_tokens"] = (
+                _bucket.get("output_tokens", 0)
                 + int(usage.get("completion_tokens", 0) or 0)
             )
-            _vlm_last_usage["model"] = model
-            _vlm_last_usage["provider"] = vlm_cfg.get("provider", "?")
+            _bucket["model"] = model
+            _bucket["provider"] = vlm_cfg.get("provider", "?")
             # ────────────────────────────────────────────
 
             choice0 = choices[0]
@@ -1116,35 +1226,45 @@ async def describe_image_from_url(
                 _set_cached_vlm_result_by_key(_cache_key, result)
             return result
 
-    try:
-        result = await asyncio.wait_for(
-            _vlm_request(),
-            timeout=VLM_HARD_TIMEOUT,
-        )
-        return result
-    except asyncio.TimeoutError:
-        _elapsed = time.time() - _start
-        # 区分: aiohttp 20s 超时 vs asyncio.wait_for 25s 硬兜底
-        if _elapsed < VLM_HARD_TIMEOUT - 1.0:
-            logger.warning(
-                "VLM API 超时 — aiohttp 层 %.0fs 限制触发 (已等待 %.1fs, VLM 端点响应过慢)",
-                VLM_TIMEOUT, _elapsed,
+    # 超时重试 1 次 (网关偶发排队慢: 实测 3.4s~45s+ 波动，仅超时重试，非超时错误直接返回)
+    for _attempt in (1, 2):
+        try:
+            result = await asyncio.wait_for(
+                _vlm_request(),
+                timeout=VLM_HARD_TIMEOUT,
             )
-        else:
-            logger.warning(
-                "VLM API 超时 — asyncio.wait_for %.0fs 硬兜底触发 (%.1fs)",
-                VLM_HARD_TIMEOUT, _elapsed,
-            )
-        return None
-    except aiohttp.ClientError as e:
-        logger.warning("VLM API 网络错误: %s", e)
-        return None
-    except Exception:
-        logger.exception("VLM 图片描述异常")
-        return None
+            return result
+        except asyncio.TimeoutError:
+            _elapsed = time.time() - _start
+            # 区分: aiohttp 20s 超时 vs asyncio.wait_for 25s 硬兜底
+            if _elapsed < VLM_HARD_TIMEOUT - 1.0:
+                logger.warning(
+                    "VLM API 超时 — aiohttp 层 %.0fs 限制触发 (已等待 %.1fs, VLM 端点响应过慢)%s",
+                    VLM_TIMEOUT, _elapsed, "，重试 1 次" if _attempt == 1 else "",
+                )
+            else:
+                logger.warning(
+                    "VLM API 超时 — asyncio.wait_for %.0fs 硬兜底触发 (%.1fs)%s",
+                    VLM_HARD_TIMEOUT, _elapsed, "，重试 1 次" if _attempt == 1 else "",
+                )
+            if _attempt == 2:
+                return None
+        except aiohttp.ClientError as e:
+            logger.warning("VLM API 网络错误: %s", e)
+            return None
+        except Exception:
+            logger.exception("VLM 图片描述异常")
+            return None
+    return None
 
 
-async def describe_images_from_urls(image_urls: list[str], bot=None, file_ids: list[str] | None = None, user_query: str = "") -> list[str]:
+async def describe_images_from_urls(
+    image_urls: list[str],
+    bot=None,
+    file_ids: list[str] | None = None,
+    user_query: str = "",
+    vlm_override: dict | None = None,
+) -> list[str]:
     """批量描述多张图片（顺序执行，避免并发冲击 VLM API）。
 
     Args:
@@ -1152,15 +1272,386 @@ async def describe_images_from_urls(image_urls: list[str], bot=None, file_ids: l
         bot: OneBot Bot 实例 (可选)
         file_ids: OneBot 图片 file ID 列表 (可选, 与 image_urls 一一对应)
         user_query: 用户对图片的具体提问 (为空=通用描述)
+        vlm_override: 可选 per-call VLM 覆盖 {"api_base","api_key","model_name"}
+            (NSFW 专属槽用; 缺项/空串 = 走全局配置, 零行为变化)
 
     Returns:
         描述文本列表（只包含成功的结果）
     """
     descriptions: list[str] = []
     fids = file_ids or []
+    _ov = vlm_override or {}
     for i, url in enumerate(image_urls[:MAX_VLM_IMAGES]):
         fid = fids[i] if i < len(fids) else ""
-        desc = await describe_image_from_url(url, bot=bot, file_id=fid, user_query=user_query)
+        desc = await describe_image_from_url(
+            url, bot=bot, file_id=fid, user_query=user_query,
+            api_base=str(_ov.get("api_base") or ""),
+            api_key=str(_ov.get("api_key") or ""),
+            model=str(_ov.get("model_name") or ""),
+        )
         if desc:
             descriptions.append(desc)
     return descriptions
+
+
+# ═══════════════════════════════════════════════════════════════
+# 视频/语音链 (QQ 原生 CQ:video / CQ:record)
+#
+# 视频: 下载 → ffprobe 时长 → ffmpeg 抽 N 帧 → 一次 VLM 多图请求 → 时序描述。
+# 语音: 下载 → ffmpeg 转 wav16k → VLM input_audio 转写 → 不支持则降级为元数据。
+# 零新依赖: 仅用镜像内 ffmpeg/ffprobe + 既有 aiohttp/Pillow。
+# ═══════════════════════════════════════════════════════════════
+
+
+def _ffmpeg_bin() -> str:
+    """ffmpeg 路径缓存 (""=缺失，调用方降级)。"""
+    global _FFMPEG_BIN
+    if _FFMPEG_BIN is None:
+        _FFMPEG_BIN = shutil.which("ffmpeg") or ""
+    return _FFMPEG_BIN
+
+
+async def _run_cmd(cmd: list[str], timeout: float = 30.0) -> tuple[int, str, str]:
+    """跑外部命令，返回 (returncode, stdout, stderr)。超时/缺失返回 (-1, "", err)。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return -1, "", "timeout"
+        return proc.returncode or 0, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
+    except FileNotFoundError as e:
+        return -1, "", f"missing: {e}"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+async def _download_media_bytes(url: str, max_bytes: int, tag: str) -> bytes | None:
+    """通用媒体下载 (视频/语音): 仅 http(s)，上限截断，QQ CDN 不走代理。"""
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return None
+    try:
+        async with aiohttp.ClientSession(trust_env=False) as session, session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=60),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"},
+            max_redirects=3,
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("%s下载失败: HTTP %d url=%s", tag, resp.status, url[:120])
+                return None
+            data = await resp.read()
+            if len(data) < 64:
+                return None
+            if len(data) > max_bytes:
+                logger.warning("%s过大拒绝: %d bytes (上限 %d)", tag, len(data), max_bytes)
+                return None
+            logger.info("%s下载成功: %d bytes", tag, len(data))
+            return data
+    except Exception as e:
+        logger.warning("%s下载异常: %s", tag, e)
+        return None
+
+
+def _parse_ffprobe_duration(text: str) -> float:
+    """解析 ffprobe 裸 duration 输出，失败返回 0。"""
+    try:
+        return max(0.0, float((text or "").strip().split()[0]))
+    except (ValueError, IndexError):
+        return 0.0
+
+
+async def _ffprobe_duration(path: str) -> float:
+    """取媒体时长 (秒)。ffprobe 缺失/失败返回 0。"""
+    ffprobe = shutil.which("ffprobe") or ""
+    if not ffprobe:
+        return 0.0
+    code, out, _ = await _run_cmd(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        timeout=15.0,
+    )
+    return _parse_ffprobe_duration(out) if code == 0 else 0.0
+
+
+async def _extract_video_frames(video_bytes: bytes, count: int = VIDEO_FRAMES) -> tuple[list[bytes], float]:
+    """抽帧 → JPEG 字节列表 + 时长。ffmpeg 缺失返回 ([], 0)。"""
+    if not _ffmpeg_bin():
+        logger.warning("ffmpeg 缺失，视频抽帧跳过")
+        return [], 0.0
+    frames: list[bytes] = []
+    duration = 0.0
+    try:
+        with tempfile.TemporaryDirectory(prefix="qqbot_vframe_") as tmp:
+            src = os.path.join(tmp, "src.mp4")
+            with open(src, "wb") as f:
+                f.write(video_bytes)
+            duration = await _ffprobe_duration(src)
+            stamps = [0.5]
+            if duration > 2.0:
+                stamps = [0.5, duration / 2.0, max(1.0, duration - 0.5)][:count]
+            for i, ts in enumerate(stamps):
+                out = os.path.join(tmp, f"f{i}.jpg")
+                code, _, _ = await _run_cmd(
+                    [_ffmpeg_bin(), "-y", "-v", "error", "-ss", f"{ts:.1f}",
+                     "-i", src, "-frames:v", "1", "-q:v", "4", out],
+                    timeout=30.0,
+                )
+                if code == 0 and os.path.isfile(out):
+                    with open(out, "rb") as f:
+                        raw = f.read()
+                    if len(raw) > 512:
+                        try:
+                            frames.append(_vlm_resize(raw))
+                        except Exception:
+                            frames.append(raw)
+        logger.info("视频抽帧: %d/%d 帧, 时长 %.1fs", len(frames), len(stamps), duration)
+    except Exception:
+        logger.exception("视频抽帧异常")
+    return frames, duration
+
+
+async def _vlm_post_chat(
+    vlm_cfg: dict, model: str, endpoint: str,
+    messages: list[dict], cache_key: str, tag: str,
+) -> Optional[str]:
+    """VLM chat 发送 + 解析 + 用量 + 缓存 (视频/语音与图片同形，tag 区分日志)。"""
+    payload = {"model": model, "messages": messages, "max_tokens": VLM_MAX_TOKENS, "temperature": 0.3}
+    _start = time.time()
+
+    async def _req() -> Optional[str]:
+        async with aiohttp.ClientSession(trust_env=True) as session, session.post(
+            endpoint, json=payload,
+            headers={
+                "Authorization": f"Bearer {vlm_cfg['api_key']}",
+                "Content-Type": "application/json",
+                "User-Agent": _QQBOT_USER_AGENT,
+                _OPENCODE_SESSION_HEADER: _VLM_SESSION_ID,
+            },
+            timeout=aiohttp.ClientTimeout(total=VLM_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("VLM %s 返回 %d: %s", tag, resp.status, (await resp.text())[:200])
+                return None
+            data = await resp.json()
+            choices = data.get("choices", [])
+            usage = data.get("usage", {})
+            if not choices:
+                return None
+            _bucket = _vlm_last_usage.setdefault(_vlm_usage_bot, {})
+            _bucket["input_tokens"] = _bucket.get("input_tokens", 0) + int(usage.get("prompt_tokens", 0) or 0)
+            _bucket["output_tokens"] = _bucket.get("output_tokens", 0) + int(usage.get("completion_tokens", 0) or 0)
+            _bucket["model"] = model
+            content = choices[0].get("message", {}).get("content", "")
+            logger.info("VLM %s完成: %dms content_len=%d", tag, int((time.time() - _start) * 1000), len(content))
+            result = content.strip() if content else None
+            if result:
+                _set_cached_vlm_result_by_key(cache_key, result)
+            return result
+
+    for _attempt in (1, 2):
+        try:
+            return await asyncio.wait_for(_req(), timeout=VLM_HARD_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("VLM %s超时，重试 %d/2", tag, _attempt)
+            if _attempt == 2:
+                return None
+        except Exception:
+            logger.exception("VLM %s异常", tag)
+            return None
+    return None
+
+
+def _resolve_media_vlm(
+    api_base: str, api_key: str, model: str,
+) -> tuple[dict, str, str] | tuple[None, None, None]:
+    """解析 VLM 配置 + endpoint。失败返回 (None, None, None)。"""
+    if api_base and api_key and model:
+        vlm_cfg = {"api_base": api_base, "api_key": api_key, "model_name": model, "provider": "per-bot"}
+    else:
+        vlm_cfg = _get_vlm_config()
+    if not vlm_cfg:
+        return None, None, None
+    base = vlm_cfg["api_base"].rstrip("/")
+    if "/responses" in base or "muse-spark" in str(vlm_cfg.get("model_name") or "").lower():
+        logger.warning(
+            "VLM 媒体跳过: Responses/spark 基址不支持识图 model=%s",
+            vlm_cfg.get("model_name"),
+        )
+        return None, None, None
+    endpoint = f"{base}/chat/completions" if "/v1" in base else f"{base}/v1/chat/completions"
+    return vlm_cfg, vlm_cfg["model_name"], endpoint
+
+
+async def describe_video_from_url(
+    video_url: str,
+    bot=None,
+    file_id: str = "",
+    api_base: str = "",
+    api_key: str = "",
+    model: str = "",
+    user_query: str = "",
+) -> Optional[str]:
+    """QQ 视频解析: 下载 → 抽头/中/尾 3 帧 → 一次 VLM 多图请求 → 时序描述。
+
+    Returns:
+        中文视频描述 (含时长)，失败返回 None。
+    """
+    _ = bot, file_id  # 预留: OneBot 无标准 get_video，当前仅 HTTP 直下
+    vlm_cfg, model_name, endpoint = _resolve_media_vlm(api_base, api_key, model)
+    if not vlm_cfg:
+        logger.warning("VLM 未配置，跳过视频描述")
+        return None
+    if not video_url:
+        return None
+
+    data = await _download_media_bytes(video_url, VIDEO_MAX_BYTES, "视频")
+    if not data:
+        return None
+    sha = _compute_image_sha256(data)
+    cache_key = f"v:{sha}"
+    if user_query and user_query.strip():
+        cache_key = f"v:{sha}:q{hashlib.sha1(user_query.encode()).hexdigest()[:20]}"
+    if (hit := _get_cached_vlm_result_by_key(cache_key)):
+        logger.info("VLM 视频缓存命中: sha256=%s...", sha[:16])
+        return hit
+
+    frames, duration = await _extract_video_frames(data)
+    if not frames:
+        return f"收到一段视频 (约{duration:.0f}秒)，但抽帧失败 (ffmpeg 缺失或文件损坏)，无法解析画面。" if duration else None
+
+    parts: list[dict] = [
+        {"type": "text", "text": (
+            "[视频分析任务]\n"
+            f"这是一段约{duration:.0f}秒视频的 {len(frames)} 个关键帧 (按时间顺序：开头/中间/结尾)。\n"
+            "请按帧顺序描述画面变化，还原视频内容：场景、人物/主体动作、镜头变化、"
+            "字幕/配文逐字记录。最后用一句话总结视频在讲什么。用中文输出。"
+            + (f"\n【用户提问】{user_query.strip()}" if user_query and user_query.strip() else "")
+        )}
+    ]
+    for fr in frames:
+        parts.append({"type": "image_url", "image_url": {
+            "url": f"data:image/jpeg;base64,{base64.b64encode(fr).decode('ascii')}"}})
+    return await _vlm_post_chat(
+        vlm_cfg, model_name, endpoint,
+        [{"role": "user", "content": parts}], cache_key, f"视频({len(frames)}帧)",
+    )
+
+
+async def _download_voice_bytes(url: str, bot=None, file_id: str = "") -> bytes | None:
+    """语音下载: HTTP url 优先 → get_file → get_record (base64 形态才有效)。
+
+    注意: NapCat get_record 常返回其容器内本地路径，跨容器不可读 → 仅 base64 接受。
+    """
+    if url and (url.startswith("http://") or url.startswith("https://")):
+        if (data := await _download_media_bytes(url, VOICE_MAX_BYTES, "语音")):
+            return data
+    if bot is not None and file_id and not file_id.startswith(("/", "./", "file://", "http")):
+        for action, kw in (("get_file", {"file_id": file_id}), ("get_record", {"file": file_id})):
+            try:
+                resp = await bot.call_api(action, **kw)
+            except Exception:
+                continue
+            raw: bytes | None = None
+            if isinstance(resp, dict):
+                for key in ("file", "data", "base64"):
+                    val = resp.get(key)
+                    if isinstance(val, str) and len(val) > 512:
+                        try:
+                            raw = base64.b64decode(val)
+                            break
+                        except Exception:
+                            continue
+                    if isinstance(val, bytes) and len(val) > 512:
+                        raw = val
+                        break
+            elif isinstance(resp, bytes) and len(resp) > 512:
+                raw = resp
+            if raw and len(raw) <= VOICE_MAX_BYTES:
+                logger.info("语音经 %s 获取: %d bytes", action, len(raw))
+                return raw
+    return None
+
+
+async def _transcode_voice(voice_bytes: bytes) -> tuple[bytes | None, float]:
+    """语音转 wav16k 单声道 (VLM input_audio 用) + 时长。ffmpeg 缺失返回 (None, 0)。"""
+    if not _ffmpeg_bin():
+        return None, 0.0
+    try:
+        with tempfile.TemporaryDirectory(prefix="qqbot_voice_") as tmp:
+            src = os.path.join(tmp, "src")
+            with open(src, "wb") as f:
+                f.write(voice_bytes)
+            duration = await _ffprobe_duration(src)
+            cap = f"{min(duration, VOICE_MAX_SECS):.0f}" if duration > VOICE_MAX_SECS else ""
+            out = os.path.join(tmp, "out.wav")
+            args = [_ffmpeg_bin(), "-y", "-v", "error", "-i", src,
+                    "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le"]
+            if cap:
+                args += ["-t", cap]
+            args.append(out)
+            code, _, _ = await _run_cmd(args, timeout=60.0)
+            if code == 0 and os.path.isfile(out):
+                with open(out, "rb") as f:
+                    raw = f.read()
+                if len(raw) > 512:
+                    return raw, duration
+    except Exception:
+        logger.exception("语音转码异常")
+    return None, 0.0
+
+
+async def transcribe_voice_from_url(
+    voice_url: str,
+    bot=None,
+    file_id: str = "",
+    api_base: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> Optional[str]:
+    """QQ 语音解析: 下载 → 转 wav → VLM input_audio 转写。
+
+    provider 不支持音频输入 (400) 时降级返回元数据描述 (时长)，
+    如实告知而非编造。下载失败返回 None。
+    """
+    vlm_cfg, model_name, endpoint = _resolve_media_vlm(api_base, api_key, model)
+    if not vlm_cfg:
+        logger.warning("VLM 未配置，跳过语音解析")
+        return None
+
+    data = await _download_voice_bytes(voice_url, bot, file_id)
+    if not data:
+        return None
+    sha = _compute_image_sha256(data)
+    cache_key = f"a:{sha}"
+    if (hit := _get_cached_vlm_result_by_key(cache_key)):
+        return hit
+
+    wav, duration = await _transcode_voice(data)
+    dur_tag = f"约{duration:.0f}秒" if duration else "时长未知"
+    if not wav:
+        return f"收到一段语音 ({dur_tag})，已下载 {len(data) / 1024:.0f}KB，但转码失败，暂无法转写。"
+
+    b64 = base64.b64encode(wav).decode("ascii")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": (
+            "[语音转写任务]\n请把这段语音逐字转写为文字。只输出转写文本，"
+            "听不清处标注 [听不清]，不要编造。如为非人声/音乐请说明。"
+        )},
+        {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
+    ]}]
+    result = await _vlm_post_chat(vlm_cfg, model_name, endpoint, messages, cache_key, "语音转写")
+    if result:
+        return f"[语音转写 {dur_tag}] {result}"
+    return (
+        f"收到一段语音 ({dur_tag}，{len(data) / 1024:.0f}KB)，"
+        "当前 VLM 不支持音频输入，转写暂不可用。"
+    )

@@ -345,7 +345,7 @@ async def _run_arbitration(
 
     # ── 使用 PRO tier (JUDGE 已于 2026-06-30 移除) ──
     from .model_router import ModelRouter, ModelTier
-    route = ModelRouter.resolve(ModelTier.PRO, default_provider="deepseek")
+    route = ModelRouter.resolve(ModelTier.PRO, default_provider="")
 
     logger.info(
         "OpusArbitrator: 开始仲裁 user=%s model=%s provider=%s",
@@ -564,7 +564,7 @@ class InjectionArbitrator:
         try:
             from .model_router import ModelRouter, ModelTier
             route = ModelRouter.resolve(
-                ModelTier.LITE, default_provider="deepseek",
+                ModelTier.LITE, default_provider="",
             )
         except Exception:
             route = None

@@ -22,7 +22,28 @@ from astrbot.api.message_components import At, Image, Plain, Reply
 logger = logging.getLogger(__name__)
 
 # ── CQ 码解析 — 将 [CQ:at,qq=...] 纯文本转 At 段 ────
-_CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+)\]")
+# 正则从 QQPlatformAdapter 懒加载 (单一真相源)，
+# 模块级编译作为 fallback (适配器未初始化时使用)。
+
+
+def _get_cq_at_re() -> re.Pattern:
+    """获取 CQ:at 解析正则 (优先从平台适配器，fallback 内置)。"""
+    try:
+        from .adapters.qq_adapter import QQPlatformAdapter
+    except Exception:
+        return re.compile(r"\[CQ:at,qq=(\d+)\]")
+    else:
+        return QQPlatformAdapter.CQ_AT_RE
+
+
+_CQ_AT_RE: re.Pattern | None = None  # 懒加载
+
+
+def _get_cq_at_re_cached() -> re.Pattern:
+    global _CQ_AT_RE
+    if _CQ_AT_RE is None:
+        _CQ_AT_RE = _get_cq_at_re()
+    return _CQ_AT_RE
 
 
 def _parse_cq_segments(text: str, *, allowed_qqs: frozenset[str] | None = None) -> list[Plain | At]:
@@ -35,7 +56,8 @@ def _parse_cq_segments(text: str, *, allowed_qqs: frozenset[str] | None = None) 
     """
     segments: list[Plain | At] = []
     pos = 0
-    for m in _CQ_AT_RE.finditer(text):
+    _re = _get_cq_at_re_cached()
+    for m in _re.finditer(text):
         qq = m.group(1)
         if m.start() > pos:
             segments.append(Plain(text[pos:m.start()]))
@@ -109,21 +131,38 @@ def _extract_message_id(event: EventAdapter | AstrMessageEvent) -> str:
     用于 reply/quote 消息锚定 — 返回触发消息的 message_id 字符串。
     返回空字符串表示提取失败。
     """
-    # EventAdapter 有 message_id property (int)
+    # EventAdapter 有 message_id property (int) — 需处理 "0" 视作无效
     if isinstance(event, EventAdapter):
-        mid = getattr(event, "message_id", 0)
-        return str(mid) if mid else ""
+        try:
+            mid = event.message_id
+            if mid and str(mid).strip() not in ("", "0"):
+                return str(mid).strip()
+        except Exception:
+            pass
+        # 回退: 直接读底层 message_obj（若 property 仍返回 0）
+        try:
+            _raw = getattr(event, "_event", None)
+            _mobj = getattr(_raw, "message_obj", None) if _raw is not None else None
+            for _attr in ("message_id", "id"):
+                _val = getattr(_mobj, _attr, None) if _mobj is not None else None
+                if _val is None:
+                    _val = getattr(_raw, _attr, None) if _raw is not None else None
+                if _val is not None and str(_val).strip() not in ("", "0"):
+                    return str(_val).strip()
+        except Exception:
+            pass
+        return ""
 
     # AstrMessageEvent: 尝试多个属性
     msg_obj = getattr(event, "message_obj", None)
     for attr in ("message_id", "id", "seq", "message_seq", "real_id"):
         val = getattr(msg_obj, attr, None) if msg_obj is not None else None
-        if val is not None and str(val).strip():
+        if val is not None and str(val).strip() and str(val).strip() != "0":
             return str(val).strip()
     # 回退: event 自身
     for attr in ("message_id", "id"):
         val = getattr(event, attr, None)
-        if val is not None and str(val).strip():
+        if val is not None and str(val).strip() and str(val).strip() != "0":
             return str(val).strip()
     return ""
 
@@ -225,14 +264,22 @@ class EventAdapter:
 
     @property
     def message_id(self) -> int:
-        try:
-            return int(getattr(self._event, "message_id", 0) or 0)
-        except (TypeError, ValueError):
-            try:
-                message_obj = getattr(self._event, "message_obj", None)
-                return int(getattr(message_obj, "message_id", 0) or 0)
-            except (TypeError, ValueError):
-                return 0
+        # 优先尝试直接属性 (兼容未来直接存 message_id 的事件)
+        for _src in (self._event, getattr(self._event, "message_obj", None)):
+            if _src is None:
+                continue
+            for _attr in ("message_id", "id", "seq"):
+                try:
+                    _val = getattr(_src, _attr, None)
+                    if _val is None:
+                        continue
+                    _s = str(_val).strip()
+                    if not _s or _s == "0":
+                        continue
+                    return int(_s)
+                except (TypeError, ValueError):
+                    continue
+        return 0
 
     @property
     def raw_message(self) -> str:
@@ -313,3 +360,8 @@ class BotAdapter:
         except Exception:
             logger.debug("call_action %s 失败", action, exc_info=True)
             return None
+
+    # 兼容部分代码调用 call_api（vision.py 旧路径）
+    async def call_api(self, action: str, **kwargs: Any) -> Any:
+        """兼容别名：vision.py 中 call_api → 转发至 call_action。"""
+        return await self.call_action(action, **kwargs)

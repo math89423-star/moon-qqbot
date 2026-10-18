@@ -95,13 +95,21 @@ class GroupChatContext:
         return [m for m in self.messages if m.get("timestamp", 0) > self.last_reply_time]
 
     def add_message(
-        self, user_id: str, user_name: str, content: str
+        self, user_id: str, user_name: str, content: str,
+        message_id: str = "", event_id: str = "", group_role: str = "member",
     ) -> None:
-        """添加一条消息到上下文窗口。"""
+        """添加一条消息到上下文窗口。
+
+        D09: 同时记录平台 message_id / 内部 event_id，使任务结果能按
+        origin_message_id 精确定位原文，而不是猜“请求者最近一条”。
+        """
         self.messages.append({
             "user_id": user_id,
             "user_name": user_name,
+            "group_role": str(group_role or "member").strip().lower() or "member",
             "content": content,
             "timestamp": time.time(),
+            "message_id": str(message_id or ""),
+            "event_id": str(event_id or ""),
         })
         self.message_counter += 1

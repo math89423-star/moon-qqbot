@@ -187,16 +187,16 @@ def check_quotas(
     return AbuseVerdict(action="allow", quota_remaining=remaining)
 
 
-def record_reply_quota(user_id: str) -> None:
+def record_reply_quota(user_id: str, bot_id: str = "") -> None:
     if not user_id:
         return
-    _get_quota(user_id).reply_count += 1
+    _get_quota(bot_id, user_id).reply_count += 1
 
 
-def record_advanced_quota(user_id: str) -> None:
+def record_advanced_quota(user_id: str, bot_id: str = "") -> None:
     if not user_id:
         return
-    _get_quota(user_id).advanced_count += 1
+    _get_quota(bot_id, user_id).advanced_count += 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -246,8 +246,16 @@ def check_thread_depth(
     )
 
 
-def reset_thread_depth_counter(thread_key: str) -> None:
+def reset_thread_depth_counter(thread_key: str, bot_id: str = "") -> None:
+    """清零线程深度超限计数。写入键为 `{bot_id}:depth_{user}`（无 bot 时 `depth_{user}`），
+    此处按同一规则组装，bot_id 为空时顺带清理所有 bot 前缀的同名键（管理面全清语义）。"""
+    if bot_id:
+        _depth_exceed_count.pop(f"{bot_id}:depth_{thread_key}", None)
+        return
     _depth_exceed_count.pop(f"depth_{thread_key}", None)
+    _suffix = f"depth_{thread_key}"
+    for _k in [k for k in _depth_exceed_count if k.endswith(_suffix)]:
+        _depth_exceed_count.pop(_k, None)
 
 
 # ═══════════════════════════════════════════════════════════════

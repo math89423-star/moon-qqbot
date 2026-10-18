@@ -62,6 +62,20 @@ def _is_duplicate(illust_id: int) -> bool:
     return illust_id in _recently_shown
 
 
+def has_recent_pixiv_sends(window_secs: float = 120.0) -> bool:
+    """窗口内是否有过 Pixiv 发图（dispatcher 兜底防叠发用）。
+
+    工具直发与兜底直发都会经 mark_illust_shown() 落点到
+    _recently_shown，故此处能看到“本 task 刚发过图”。
+    状态不可用时返回 False（兜底继续，fail-open）。
+    """
+    try:
+        now = time.time()
+        return any((now - ts) < window_secs for ts in _recently_shown.values())
+    except Exception:
+        return False
+
+
 # ── 权重评分 ─────────────────────────────────────────
 # 综合多个信号给每张插画打分，按分排序后选 Top-N。
 
@@ -87,6 +101,11 @@ def _score_illust(item: dict, query_terms: set[str]) -> float:
       - 时效性 (created_at): 指数衰减, 半衰期 30 天 — 权重最高
       - 收藏数 (bookmark_count): log 变换 — 核心质量信号
       - 标签匹配: query 中的词完全命中了某个 tag
+      - 标题匹配 (2026-10-14 新增): 标题含角色名是强归属信号。
+        task-29c25bf1 教训：query=WutheringWaves 心月狐时，
+        Top-1 150780681《睡衣系列》(tag 含心月狐+エイメス+長離等多角色，
+        bm=265) 靠收藏压过 Top-2 150826442《心》(纯心月狐单人)。
+        标题完全不含角色名的多角色拼盘必须降权。
       - 浏览数 (view_count): 参考信号
 
     返回分越高 = 越优先推荐。
@@ -121,7 +140,30 @@ def _score_illust(item: dict, query_terms: set[str]) -> float:
         if hits > 0:
             tag_match_score = hits * _W_TAG_MATCH
 
-    return bm_score + view_score + recency_score + tag_match_score
+    # 标题归属分：标题含 query 词（或被 query 含，覆盖“心”这类单字标题）+2.5
+    title_bonus = 0.0
+    _title = str(item.get("title", "") or "")
+    _title_low = _title.lower()
+    if query_terms and _title:
+        for _qt in query_terms:
+            if not _qt:
+                continue
+            if _qt in _title_low or (_len_ok(_qt, _title) and _title_low in _qt):
+                title_bonus = 2.5
+                break
+
+    # 多角色拼盘降权：tag 数 ≥10 且标题无角色名，大概率是合集/拼盘，×0.9
+    _tags_n = len(item.get("tags", []) or [])
+    _penalty = 1.0
+    if _tags_n >= 10 and title_bonus == 0.0:
+        _penalty = 0.9
+
+    return (bm_score + view_score + recency_score + tag_match_score + title_bonus) * _penalty
+
+
+def _len_ok(qt: str, title: str) -> bool:
+    """标题被 query 含时才算命中：标题至少 1 字，query 词至少 2 字防单字误伤."""
+    return len(title.strip()) >= 1 and len(qt.strip()) >= 2
 
 
 def _rank_results(
@@ -395,13 +437,21 @@ async def download_pixiv_image(url: str, dest_dir: str | Path) -> str:
         ),
     }
 
-    # 获取代理 (aiohttp 不自动读 HTTP_PROXY 环境变量)
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or None
+    # 获取代理: 按 QQBOT_PROXY_URLS 顺序探测 (见 proxy_env.py;
+    # aiohttp 需要 HTTP 代理, 不支持 socks5)。
+    # 其次 HTTPS_PROXY/HTTP_PROXY, 都没有则直连。
+    from .proxy_env import first_reachable
+
+    proxy = first_reachable()
+    if proxy is None:
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or None
+    if not proxy:
+        logger.debug("[pixiv_download] 未检测到代理, 直连下载")
 
     try:
         async with aiohttp.ClientSession(
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=60, sock_read=30),
         ) as session:
             async with session.get(url, proxy=proxy) as resp:
                 if resp.status != 200:
@@ -629,6 +679,24 @@ async def search_pixiv(
             logger.info("Pixiv 兜底搜索补充 %d 条, 共 %d", len(fallback_results), len(raw_results))
         except Exception:
             logger.exception("Pixiv 兜底搜索失败, 仅用首搜结果")
+
+    # ── 兜底 2 (2026-10-17 找图 0 张事故): 多标签全空 → 退回首标签重搜 ──
+    # 案例: 「WutheringWaves zuixin jiaose」(最新角色被拼音化) → 0 张,
+    # 描述性拼音混进标签是常见抽风; 退回 IP 单标签 (WutheringWaves) 一救一个准。
+    if not raw_results and len(query.split()) > 1:
+        _head_tag = query.split()[0]
+        logger.info("Pixiv 全空救援: 「%.40s」→ 退回首标签「%.30s」重搜", query, _head_tag)
+        await asyncio.sleep(1.5)  # 短暂间隔防限流
+        try:
+            rescue_results = await _do_search(_head_tag, "partial_match_for_tags")
+            if rescue_results:
+                raw_results = rescue_results
+                _last_search_time = time.time()
+                logger.info("Pixiv 全空救援成功: 补回 %d 条", len(rescue_results))
+            else:
+                logger.info("Pixiv 全空救援无果: 首标签也没有结果")
+        except Exception:
+            logger.exception("Pixiv 全空救援失败")
 
     # Pixiv 每次 auth 都轮换 refresh_token — 旧 token 立即失效
     if new_token and new_token != refresh_token and on_token_rotated is not None:

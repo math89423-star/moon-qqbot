@@ -8,7 +8,7 @@
 架构:
   本插件在 __init__ 时创建 ProactiveScheduler，在 initialize() 启动后台循环。
   消息监听通过 @astrbot_filter.event_message_type 注册，零侵入对接 AstrBot 事件流。
-  双 bot 通用 — self_id gate 使用 _BOT_QQ_SET 白名单，per-bot 配置隔离。
+  双 bot 通用 — self_id gate 使用 _KNOWN_BOT_IDS 白名单，per-bot 配置隔离。
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ from .scheduler import ProactiveScheduler
 
 logger = logging.getLogger(__name__)
 
-# Bot QQ 号白名单 — 运行时从 dual_bot.get_bot_qq_set() 懒加载
-# 不再硬编码 QQ 号。此常量仅作为模块加载时的 fallback。
-_BOT_QQ_SET: set[str] = set()  # 运行时从 dual_bot 读取
+# Bot ID 白名单 — 运行时从 dual_bot.get_known_bot_ids() 懒加载
+# 不再硬编码。此常量仅作为模块加载时的 fallback。
+_KNOWN_BOT_IDS: set[str] = set()  # 运行时从 dual_bot 读取
 
 
 @register("astrbot_plugin_suli_proactive", "暮恩", "主动行为引擎 (双Bot通用)", "1.0.0")
@@ -41,7 +41,7 @@ class LoputProactivePlugin(Star):
 
     提取自社区插件 private_companion proactive 核心模式, 全部参数化。
     零硬编码 persona 文本 — 所有角色内容来自 per-bot Config。
-    self_id gate 使用 _BOT_QQ_SET 白名单, 双方各自独立调度。
+    self_id gate 使用 _KNOWN_BOT_IDS 白名单, 双方各自独立调度。
     """
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -104,7 +104,7 @@ class LoputProactivePlugin(Star):
             _sid = str(getattr(event, "get_self_id", lambda: "")() or "")
         except Exception:
             _sid = ""
-        if not _sid or _sid not in _BOT_QQ_SET:
+        if not _sid or _sid not in _KNOWN_BOT_IDS:
             return
         try:
             user_id = str(event.get_sender_id())
@@ -121,7 +121,7 @@ class LoputProactivePlugin(Star):
             _sid = str(getattr(event, "get_self_id", lambda: "")() or "")
         except Exception:
             _sid = ""
-        if not _sid or _sid not in _BOT_QQ_SET:
+        if not _sid or _sid not in _KNOWN_BOT_IDS:
             return
         try:
             user_id = str(event.get_sender_id())
@@ -206,7 +206,7 @@ class LoputProactivePlugin(Star):
         try:
             reply = await tavern.chat(
                 messages,
-                model="deepseek-v4-flash",
+                model="",
                 temperature=0.85,
                 max_tokens=256,
             )

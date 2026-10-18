@@ -19,7 +19,7 @@
       challenge_verdict=...,
       tools_enabled=True,
   )
-  route = ModelRouter.resolve(tier, default_provider="deepseek")
+  route = ModelRouter.resolve(tier, default_provider="")
   # route.model → "deepseek-v4-pro", route.provider → "deepseek"
 """
 
@@ -42,12 +42,12 @@ _QUESTION_SIGNAL_RE = re.compile(
 )
 
 # ── 默认模型名映射 ──────────────────────────────────────
-# 可被 CredentialProvider.get_config_model() 覆盖
-# JUDGE 需要切到对应 provider
+# 空字符串 = 必须从 CredentialProvider 读取, 不允许硬编码 fallback。
+# 前端配置: model_router_lite / model_router_pro (管理面板)。
 
 _DEFAULT_TIER_MODELS: dict[ModelTier, str] = {
-    ModelTier.LITE: "deepseek-v4-pro",
-    ModelTier.PRO:   "deepseek-v4-pro",
+    ModelTier.LITE: "",
+    ModelTier.PRO:   "",
 }
 
 
@@ -185,13 +185,30 @@ class ModelRouter:
         """
         # 尝试从 CredentialProvider 读取自定义模型名
         model = _read_model_name(tier)
+        if not model:
+            logger.warning(
+                "模型路由: tier=%s 未配置模型名 — 管理面板 model_router_lite/pro 为空",
+                tier.value,
+            )
+            # 回退到活跃 LLM 配置
+            if _credentials is not None:
+                try:
+                    active = _credentials.resolve_active_llm()
+                    if active is not None:
+                        model = getattr(active, "model_name", "")
+                        logger.info("模型路由: %s → 回退活跃模型 %s", tier.value, model)
+                except Exception:
+                    pass
+            if not model:
+                logger.error("模型路由: tier=%s 无法确定模型 — 无配置且无活跃 LLM", tier.value)
+                model = "unknown"
 
         # provider + reasoning_effort (THINKING tier 枚举未上线, 移除引用)
         if tier == ModelTier.PRO:
-            provider = default_provider or "deepseek"
+            provider = default_provider or ""
             extra = {"reasoning_effort": "max"}     # 技术/推理场景: 深度思考
         else:
-            provider = default_provider or "deepseek"
+            provider = default_provider or ""
             extra = {}                               # FLASH 闲聊: 不开推理, 省 token 提速
 
         # ── API 凭证解析: 通过注入的 CredentialProvider ──
@@ -231,7 +248,7 @@ class ModelRouter:
 
 
 def _read_model_name(tier: ModelTier) -> str:
-    """从 CredentialProvider 读取自定义模型名，fallback 到默认值。"""
+    """从 CredentialProvider 读取自定义模型名，无配置返回空字符串。"""
     config_keys = {
         ModelTier.LITE: "model_router_lite",
         ModelTier.PRO:   "model_router_pro",
@@ -244,7 +261,7 @@ def _read_model_name(tier: ModelTier) -> str:
                 return val.strip()
         except Exception:
             pass
-    return _DEFAULT_TIER_MODELS.get(tier, "deepseek-v4-pro")
+    return _DEFAULT_TIER_MODELS.get(tier, "")
 
 
 def _find_llm_config(model_name: str) -> dict[str, str] | None:

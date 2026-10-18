@@ -401,7 +401,7 @@ class CrossValidator:
                 messages=messages,
                 tools=[],  # 裁判不需要工具
                 tool_choice="none",
-                model="deepseek-v4-pro",
+                model="",
                 temperature=temperature,
                 max_tokens=192,
                 provider=provider,

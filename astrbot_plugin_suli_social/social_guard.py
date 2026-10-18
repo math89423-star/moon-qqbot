@@ -136,9 +136,9 @@ class SocialGuard:
 
     # 自回复速率阈值: 60s 内 N 次回复触发压力
     _SELF_REPLY_WINDOW_S: float = 60.0
-    _SELF_REPLY_LOW_THRESHOLD: int = 3     # ≥3 → LOW
-    _SELF_REPLY_MODERATE_THRESHOLD: int = 5  # ≥5 → MODERATE
-    _SELF_REPLY_HIGH_THRESHOLD: int = 8      # ≥8 → HIGH
+    _SELF_REPLY_LOW_THRESHOLD: int = 2     # ≥2 → LOW
+    _SELF_REPLY_MODERATE_THRESHOLD: int = 4  # ≥4 → MODERATE
+    _SELF_REPLY_HIGH_THRESHOLD: int = 6      # ≥6 → HIGH
 
     def __init__(
         self,
@@ -170,6 +170,7 @@ class SocialGuard:
         is_at_mention: bool = False,
         thread_id: str = "",
         llm_input_nature: str = "",
+        nsfw_zone: bool = False,
     ) -> SocialDecision:
         """评估当前消息的社会压力, 返回发言决策。
 
@@ -181,6 +182,8 @@ class SocialGuard:
             is_at_mention: 是否有 @提及
             thread_id: 对话线程 ID
             llm_input_nature: Gate LLM 的 input_nature 分类结果 (字符串)
+            nsfw_zone: NSFW 隔离区内成人合意 SEXUALIZED 降级为调侃
+                (CSAM/暴力仍由 InjectionGuard 永拦，此处只管回复决策)。
 
         Returns:
             SocialDecision: 发言决策
@@ -193,6 +196,7 @@ class SocialGuard:
                 is_addressed_to_me=is_addressed_to_me,
                 is_at_mention=is_at_mention,
                 llm_input_nature=llm_input_nature,
+                nsfw_zone=nsfw_zone,
             )
         except Exception:
             logger.debug(
@@ -216,14 +220,18 @@ class SocialGuard:
         is_addressed_to_me: bool,
         is_at_mention: bool,
         llm_input_nature: str,
+        nsfw_zone: bool = False,
     ) -> SocialDecision:
         """evaluate() 的实现 — 异常由外层 catch。"""
 
         # ── 步骤 1: 正则预筛选 (零 LLM 成本) ──
+        # ★ 必须把 nsfw_zone 传下去 — 否则 prescreen 会返回 needs_llm=False 的
+        #   SEXUALIZED 短路结果，后面的降级分支拿不到该有的语义。
         prescreen = self._classifier.prescreen(
             content,
             is_addressed_to_me=is_addressed_to_me if is_addressed_to_me else None,
             peer_bot_name=self._peer_bot_name,
+            nsfw_zone=nsfw_zone,
         )
 
         # ── 步骤 2: 合并 Gate LLM 结果 (如果可用) ──
@@ -239,6 +247,10 @@ class SocialGuard:
 
         final_nature = classification.nature
 
+        # ── NSFW Zone: 成人合意 SEXUALIZED 降级为调侃 (允许回复, 仍压制工具) ──
+        if nsfw_zone and final_nature == InputNature.SEXUALIZED:
+            final_nature = InputNature.PLAYFUL_BANTER
+
         # ── 步骤 3: 自回复速率 → 压力修正 ──
         _base_pressure = _PRESSURE_MAP.get(final_nature, PressureLevel.NONE)
         _self_reply_pressure = self._calc_self_reply_pressure(group_id)
@@ -253,6 +265,9 @@ class SocialGuard:
         # ── 步骤 5: 组装决策 ──
         should_reply = final_nature not in _SILENCE_NATURES
         suppress_tools = final_nature in _TOOL_SUPPRESS_NATURES
+        # NSFW Zone 降级后仍压制工具 (亲密 RP 不需要调工具)
+        if nsfw_zone and classification.nature == InputNature.SEXUALIZED:
+            suppress_tools = True
         skip_reason = ""
         if not should_reply:
             skip_reason = f"SocialGuard 硬拦截: input_nature={final_nature.value}"

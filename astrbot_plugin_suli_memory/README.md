@@ -1,20 +1,29 @@
-# 粟藜 · 三层记忆蒸馏
+# 粟藜 · 五层记忆
 
-纯库插件。用户长期记忆的分层存储与检索。
+纯库插件。用户长期记忆 + Bot 自传体记忆的分层存储，per-bot 隔离。
 
-## 三层结构
+## 五层结构
 
-1. **Daily Memory** — 近期对话细节，高保真低延迟
-2. **Core Memory** — 蒸馏后的关键特征，长期保留
-3. **Memory Tier** — 编排层，控制记忆的存取优先级和生命周期
+| 层 | 存储 | 主语 | 时效 | 触发 |
+|---|---|---|---|---|
+| AttentionSlot | 内存 (conversation_session) | bot | 秒~10分钟 | Gate 热度/槽位 |
+| Episodic (情节归档) | `bot_episodes/{bot_id}/{group_id}.json` | bot | 分钟~周 | 槽过期自动归档，零 LLM |
+| Daily Memory | `user_memories/{bot_id}/{user_id}.json` | 用户 | 天~周 | ProfileAgent 蒸馏 |
+| Core Memory | `user_core/{bot_id}/{user_id}.json` | 用户 | 永久 | MemoryTier 升级 (≤30条/人) |
+| Bot自传体经历 | `bot_experiences/{bot_id}/` + SQLite | bot 自己 | 永久 | 定时提取/蒸馏 (recent→core) |
+
+- **编排**: `MemoryTierManager` 控制 daily→core 升级/过期，前端记忆管理走 `bot_db` 统一读写
+- **隔离**: 全部 `{bot_id}/{user_id}.json` per-bot 路径，`get_memory_store(bot_id)` 找不到回 `None` (不跨 bot 回退)
+- **注入**: `prompt_builder` 按 `[注意力槽 → 情节(≤2) → 日常 → 核心 → Bot经历]` 顺序注入 `message[1+]`
 
 ## API
 
-- `remember_memory` — 存入记忆
-- `get_memory` — 检索记忆
-- `MemoryTierManager` — 记忆升级/降级/过期管理
+- `remember_memory` / `get_memory` — 日常记忆读写
+- `MemoryTierManager` — 记忆升级/降级/过期
+- `EpisodicStore` — `archive(slot)` / `get_recent(group_id)` 情节归档
+- `BotExperienceStore` — `get_experience_hints(max_tokens)` Bot 自传体
 
 ## 依赖
 
-suli_emotion（好感度影响记忆权重）
+suli_emotion（好感度影响记忆权重/门控）
 

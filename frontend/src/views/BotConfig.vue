@@ -2,6 +2,7 @@
 /** 机器人配置 — LLM/VLM 槽位(含 Provider CRUD) + 开关 + 温度 + 参数 + 用量 */
 import { ref, inject, onMounted, watch, type Ref } from 'vue'
 import {
+  fetchModelMeta, fetchRemoteModels,
   getBotSettings, updateBotSettings,
   getLLMListWithSlots, getVLMListWithSlots, assignSlot,
   createLLM, updateLLM, deleteLLM,
@@ -9,15 +10,19 @@ import {
   getChatParams, updateChatParams,
   getTokenStats, getStatus,
   getToolSettings, updateToolSettings,
+  getDrawConfig, saveDrawConfig,
+  testLlmConnection,
 } from '@/api/admin'
 import type {
   BotSettings, LLMListResponse, LLMConfigItem, LLMConfigCreate, LLMConfigUpdate,
   TemperatureMap, ChatParamItem, TokenStats, ToolSettingItem, ToolConfig,
+  DrawApiConfig,
 } from '@/types'
+import type { ModelMeta, LlmTestResult } from '@/api/admin'
 import {
   Cpu, Server, Thermometer, Sliders, BarChart3,
-  MessageSquare, User, Brain, Eye, Shield,
-  Plus, Pencil, Trash2, X, Wrench,
+  MessageSquare, User, Brain, Eye, Shield, Flame,
+  Plus, Pencil, Trash2, X, Wrench, Palette,
 } from '@lucide/vue'
 
 // ── Bot 上下文 ──
@@ -26,11 +31,12 @@ const bots = inject<Ref<{ id: string; name: string; icon: string; color: string 
 const switchBot = inject<(id: string) => void>('switchBot')!
 
 // ── Tab 状态 ──
-type TabKey = 'llm' | 'vlm' | 'temp' | 'chat' | 'tools' | 'tokens'
+type TabKey = 'llm' | 'vlm' | 'draw' | 'temp' | 'chat' | 'tools' | 'tokens'
 const activeTab = ref<TabKey>('llm')
 const tabs: { key: TabKey; label: string; icon: any }[] = [
   { key: 'llm', label: 'LLM 槽位', icon: Cpu },
   { key: 'vlm', label: 'VLM 槽位', icon: Server },
+  { key: 'draw', label: '绘图', icon: Palette },
   { key: 'temp', label: '温度设置', icon: Thermometer },
   { key: 'chat', label: '对话参数', icon: Sliders },
   { key: 'tools', label: '工具设置', icon: Wrench },
@@ -47,12 +53,92 @@ async function loadSettings() {
   finally { settingsLoading.value = false }
 }
 
-async function toggleChat(type: 'group_chat_enabled' | 'private_chat_enabled' | 'reasoning_enabled' | 'shadow_agent_enabled', val: boolean) {
+async function toggleChat(type: 'group_chat_enabled' | 'private_chat_enabled' | 'reasoning_enabled' | 'shadow_agent_enabled' | 'nsfw_enabled' | 'nsfw_private', val: boolean) {
   if (!settings.value) return
   try {
     await updateBotSettings(currentBot.value, { [type]: val })
     settings.value[type] = val
   } catch { /* ignore */ }
+}
+
+// ── 默认档位 (per-bot 单一真相源; auto=Gate 按意图动态决定) ──
+const THINKING_EFFORTS = [
+  { value: 'auto', label: '自动 (Gate 决定)' },
+  { value: 'off', label: '关闭' },
+  { value: 'minimal', label: 'minimal' },
+  { value: 'low', label: 'low' },
+  { value: 'medium', label: 'medium' },
+  { value: 'high', label: 'high' },
+  { value: 'xhigh', label: 'xhigh' },
+  { value: 'max', label: 'max' },
+]
+
+async function saveThinkingEffort(val: string) {
+  if (!settings.value) return
+  try {
+    await updateBotSettings(currentBot.value, { thinking_effort: val })
+    settings.value.thinking_effort = val
+  } catch { /* ignore */ }
+}
+
+// ── 槽位旁档位下拉 (档位跟着槽位/模型走; 跟随全局=用顶栏档位) ──
+// 与后端 BotConfigService.SLOT_EFFORT_SLOTS 同步 (llm_secondary 已退役无消费方)。
+const SLOT_EFFORT_SLOTS = new Set(['llm_primary', 'llm_lite', 'llm_pro', 'llm_gate', 'shadow_agent'])
+const SLOT_EFFORT_OPTIONS = [
+  { value: 'follow', label: '跟随全局' },
+  { value: 'off', label: '关闭' },
+  { value: 'minimal', label: 'minimal' },
+  { value: 'low', label: 'low' },
+  { value: 'medium', label: 'medium' },
+  { value: 'high', label: 'high' },
+  { value: 'xhigh', label: 'xhigh' },
+  { value: 'max', label: 'max' },
+]
+
+function showSlotEffort(slotKey: string): boolean {
+  return activeTab.value === 'llm' && SLOT_EFFORT_SLOTS.has(slotKey)
+}
+
+function slotEffort(slotKey: string): string {
+  return settings.value?.slot_efforts?.[slotKey] || 'follow'
+}
+
+async function saveSlotEffort(slotKey: string, val: string) {
+  if (!settings.value) return
+  try {
+    const next = { ...(settings.value.slot_efforts || {}), [slotKey]: val }
+    await updateBotSettings(currentBot.value, { slot_efforts: next })
+    settings.value.slot_efforts = next
+  } catch { /* ignore */ }
+}
+
+// ── 行内测试探针文本 (key 不出后端) ──
+const testPrompt = ref('请只回复：连通正常')
+
+// ── 行内测试 (点哪行测哪行: 用该槽位当前生效档位打探针) ──
+const rowTestRunning = ref<Record<string, boolean>>({})
+const rowTestResult = ref<Record<string, LlmTestResult | null>>({})
+
+function effectiveEffortFor(slotKey: string): string {
+  const s = slotEffort(slotKey)
+  if (s && s !== 'follow') return s
+  return settings.value?.thinking_effort || 'minimal'
+}
+
+async function runRowTest(slotKey: string) {
+  rowTestResult.value[slotKey] = null
+  rowTestRunning.value[slotKey] = true
+  try {
+    rowTestResult.value[slotKey] = await testLlmConnection(
+      currentBot.value, slotKey,
+      effectiveEffortFor(slotKey),
+      testPrompt.value || '请只回复：连通正常',
+    )
+  } catch (e) {
+    rowTestResult.value[slotKey] = { ok: false, error: `请求失败：${e}` }
+  } finally {
+    rowTestRunning.value[slotKey] = false
+  }
 }
 
 async function saveOwnerQQ() {
@@ -62,10 +148,19 @@ async function saveOwnerQQ() {
   } catch { /* ignore */ }
 }
 
-async function saveShadowModel() {
+// ── NSFW 隔离区 (默认关闭; 名单为空=仅超管; 逗号分隔, 数字 only) ──
+const nsfwSaved = ref('')
+let nsfwSavedTimer: number | undefined
+async function saveNsfw() {
   if (!settings.value) return
   try {
-    await updateBotSettings(currentBot.value, { shadow_agent_model: settings.value.shadow_agent_model })
+    await updateBotSettings(currentBot.value, {
+      nsfw_groups: settings.value.nsfw_groups || '',
+      nsfw_users: settings.value.nsfw_users || '',
+    })
+    nsfwSaved.value = new Date().toLocaleTimeString()
+    window.clearTimeout(nsfwSavedTimer)
+    nsfwSavedTimer = window.setTimeout(() => { nsfwSaved.value = '' }, 2500)
   } catch { /* ignore */ }
 }
 
@@ -99,9 +194,199 @@ const errorMsg = ref('')
 const showCreate = ref(false)
 const creating = ref(false)
 
+// ── 绘图分配 (按 Bot 指派 NovelAI / PixAI / 停用；Key 与参数去各自独立配置页) ──
+const drawCfg = ref<DrawApiConfig | null>(null)
+const drawLoading = ref(false)
+const drawSaving = ref(false)
+const drawAssign = ref<Record<string, string>>({})
+
+async function loadDraw() {
+  drawLoading.value = true
+  try {
+    const c = await getDrawConfig()
+    drawCfg.value = c
+    drawAssign.value = { ...c.assignments }
+  } catch (e: any) {
+    errorMsg.value = e?.response?.data?.message || e.message || '绘图配置加载失败'
+  } finally {
+    drawLoading.value = false
+  }
+}
+
+async function saveDrawAssign() {
+  drawSaving.value = true
+  try {
+    const c = await saveDrawConfig({ assignments: drawAssign.value })
+    drawCfg.value = c
+    drawAssign.value = { ...c.assignments }
+    errorMsg.value = ''
+  } catch (e: any) {
+    errorMsg.value = e?.response?.data?.message || e.message || '保存失败'
+  } finally {
+    drawSaving.value = false
+  }
+}
+
 const LLM_PROVIDERS = ['deepseek', 'openai', 'anthropic', 'ollama', 'vectorengine', 'openrouter', 'together', 'custom']
 const VLM_PROVIDERS = ['gpt4v', 'claude', 'gemini', 'nano_banana', 'llama']
-const ALL_PROVIDERS = [...new Set([...LLM_PROVIDERS, ...VLM_PROVIDERS])]
+const ALL_PROVIDERS = [...new Set([...LLM_PROVIDERS, ...VLM_PROVIDERS, 'opencode', 'siliconflow', 'moonshot'])]
+
+// ── Provider 预设: 选名自动填 base_url + 备选模型 ──
+// 注意: opencode models 只是离线兜底, 真实列表以「获取模型」拉取为准
+// (go/v1 全量约 40+ 个, 含 muse-spark-1.3-contributor / mimo-v2.5 等)
+const PROVIDER_PRESETS: Record<string, { base_url: string; models: string[] }> = {
+  deepseek: { base_url: 'https://api.deepseek.com/v1', models: ['deepseek-chat', 'deepseek-reasoner'] },
+  openai: { base_url: 'https://api.openai.com/v1', models: ['gpt-4o', 'gpt-4o-mini'] },
+  anthropic: { base_url: 'https://api.anthropic.com/v1/', models: ['claude-opus-4', 'claude-sonnet-4'] },
+  openrouter: { base_url: 'https://openrouter.ai/api/v1', models: [] },
+  opencode: {
+    base_url: 'https://opencode.ai/zen/go/v1',
+    models: [
+      'muse-spark-1.3-contributor',
+      'muse-spark-1.2-contributor',
+      'mimo-v2.5',
+      'mimo-v2.5-pro',
+      'mimo-v2.6-flash',
+      'deepseek-v4-flash',
+      'glm-5.3',
+      'qwen3.8-max',
+    ],
+  },
+  siliconflow: { base_url: 'https://api.siliconflow.cn/v1', models: ['deepseek-ai/DeepSeek-V3', 'Qwen/Qwen3-8B'] },
+  groq: { base_url: 'https://api.groq.com/openai/v1', models: ['llama-3.3-70b-versatile'] },
+  moonshot: { base_url: 'https://api.moonshot.cn/v1', models: ['kimi-k2-0711-preview'] },
+  together: { base_url: 'https://api.together.xyz/v1', models: [] },
+  ollama: { base_url: 'http://host.docker.internal:11434/v1', models: [] },
+}
+
+const remoteModels = ref<string[]>([])
+const fetchingModels = ref(false)
+// 拉取成功提示 (errorMsg 在弹窗背后看不见, 单独给按钮旁反馈)
+const fetchMsg = ref('')
+// 模型元数据 (effort 上限 + 能力位, 选模型后自动填充, create/edit 各存一份)
+const createMeta = ref<ModelMeta | null>(null)
+const editMeta = ref<ModelMeta | null>(null)
+
+function metaOf(form: 'create' | 'edit'): ModelMeta | null {
+  return form === 'create' ? createMeta.value : editMeta.value
+}
+
+function effortHint(meta: ModelMeta | null): string {
+  if (!meta || !meta.supported_efforts?.length) return ''
+  const src = meta.max_effort_source === 'static' ? '已核定' : '默认全档'
+  const caps: string[] = []
+  if (meta.reasoning === true) caps.push('推理')
+  else if (meta.reasoning === false) caps.push('非推理')
+  if (meta.tool_call === true) caps.push('工具调用')
+  const capStr = caps.length ? ` · ${caps.join('/')}` : ''
+  return `支持档位 ${meta.supported_efforts.join(' / ')}（最高 ${meta.max_effort}，${src}${capStr}）`
+}
+
+// ── OpenCode Go 订阅: 聊天走 /chat/completions, Muse Spark 走 /responses ──
+// base 存全路径 (…/go/v1 或 …/go/v1/responses), 运行时原样使用, 不再二次拼接
+const OPENCODE_GO_URL = 'https://opencode.ai/zen/go/v1'
+const OPENCODE_GO_RESPONSES_URL = 'https://opencode.ai/zen/go/v1/responses'
+const OPENCODE_URLS = [OPENCODE_GO_URL, OPENCODE_GO_RESPONSES_URL]
+
+/** muse-spark 模型 → go 订阅 /responses 全路径, 非 spark 返回 null */
+function resolveBaseUrlForMuseSpark(model: string): string | null {
+  const m = model.trim().toLowerCase()
+  if (!m.includes('muse-spark')) return null
+  return OPENCODE_GO_RESPONSES_URL
+}
+
+/** 选了 muse-spark 自动纠正 base_url (+provider), 不动用户自定义镜像 */
+function autoBaseUrlForMuseSpark(f: Record<string, unknown>): void {
+  const cur = String(f.base_url ?? '')
+  const want = resolveBaseUrlForMuseSpark(String(f.model_name ?? ''))
+  if (want) {
+    const knownUrls = [...Object.values(PROVIDER_PRESETS).map(p => p.base_url), ...OPENCODE_URLS]
+    if (!cur || knownUrls.includes(cur) || cur.includes('opencode.ai')) {
+      if (cur !== want) {
+        f.base_url = want
+        if (String(f.provider ?? '') !== 'opencode') f.provider = 'opencode'
+        fetchMsg.value = `Muse Spark 已自动切换 Base URL → ${want}`
+      }
+    }
+    return
+  }
+  // 反向纠正：已切走非 spark 模型，但基址还停在 /responses（spark 专线）→ 切回 go/v1。
+  // 10-12 教训：deepseek-v4.1-flash 配 /responses，主决策经 Responses 通道 + reasoning_effort 被网关拒收，全员 fallback“我先记下了”。
+  if (cur === OPENCODE_GO_RESPONSES_URL) {
+    f.base_url = OPENCODE_GO_URL
+    fetchMsg.value = `非 Spark 模型已自动切回 Base URL → ${OPENCODE_GO_URL}`
+  }
+}
+
+function providerOptions(current?: string): string[] {
+  const set = new Set([...ALL_PROVIDERS, ...(current ? [current] : [])])
+  return [...set].sort()
+}
+
+function onProviderChange(form: 'create' | 'edit') {
+  const f = (form === 'create' ? createForm.value : editForm.value) as Record<string, unknown> & { base_url?: string }
+  const preset = PROVIDER_PRESETS[String(f.provider ?? '')]
+  if (!preset) { remoteModels.value = []; fetchMsg.value = ''; return }
+  // base_url 为空或等于其他预设值时才覆盖, 不动用户手填的自定义地址
+  // opencode 例外: go/v1 与 go/v1/responses 同属 go 订阅, 已在其中则不强制回 GO
+  const knownUrls = [...Object.values(PROVIDER_PRESETS).map(p => p.base_url), ...OPENCODE_URLS]
+  if (String(f.provider ?? '') === 'opencode' && OPENCODE_URLS.includes(String(f.base_url ?? ''))) {
+    // 保持当前 go 端点, 仅刷新备选模型
+  } else if (!f.base_url || knownUrls.includes(f.base_url)) {
+    f.base_url = preset.base_url
+  }
+  // provider 切到 opencode 时若模型已是 spark, 直接升到 /responses
+  remoteModels.value = preset.models
+  fetchMsg.value = ''
+  autoBaseUrlForMuseSpark(f as Record<string, unknown>)
+}
+
+function modelOptions(form: 'create' | 'edit'): string[] {
+  const f = (form === 'create' ? createForm.value : editForm.value) as Record<string, unknown>
+  return [...new Set([...remoteModels.value, ...(PROVIDER_PRESETS[String(f.provider ?? '')]?.models ?? [])])]
+}
+
+async function doFetchModels(form: 'create' | 'edit') {
+  const f = (form === 'create' ? createForm.value : editForm.value) as Record<string, unknown>
+  if (!f.base_url) { errorMsg.value = '先填 Base URL'; return }
+  fetchingModels.value = true
+  errorMsg.value = ''
+  fetchMsg.value = ''
+  try {
+    const configId = form === 'edit' ? editingId.value ?? undefined : undefined
+    remoteModels.value = await fetchRemoteModels(
+      String(f.base_url), String(f.api_key ?? ''), configId,
+    )
+    if (!remoteModels.value.length) {
+      errorMsg.value = 'Provider 返回空模型列表'
+    } else {
+      // datalist 按输入值过滤, 输入框已有 mimo-v2.5 时用户看不到全量 → 给明确计数 + 下拉直选
+      fetchMsg.value = `已拉取 ${remoteModels.value.length} 个模型, 请从下拉选择`
+    }
+  } catch (e: any) {
+    errorMsg.value = e?.response?.data?.message || e.message || '拉取模型列表失败'
+  } finally { fetchingModels.value = false }
+}
+
+function pickModel(form: 'create' | 'edit', model: string) {
+  const f = (form === 'create' ? createForm.value : editForm.value) as Record<string, unknown>
+  if (!model) return
+  f.model_name = model
+  onModelChange(form)
+}
+
+async function onModelChange(form: 'create' | 'edit') {
+  const f = (form === 'create' ? createForm.value : editForm.value) as Record<string, unknown>
+  const setMeta = form === 'create' ? createMeta : editMeta
+  if (!f.model_name) { setMeta.value = null; return }
+  // 选了 muse-spark 先纠正 base_url (+provider), 再查元数据
+  autoBaseUrlForMuseSpark(f)
+  try {
+    const meta = await fetchModelMeta(String(f.model_name), String(f.provider ?? ''))
+    setMeta.value = meta
+    if (meta.context_window) f.context_window = meta.context_window
+  } catch { setMeta.value = null /* 元数据失败静默, 用户可手填 */ }
+}
 
 function defaultProvider(tab: TabKey): string {
   return tab === 'vlm' ? 'claude' : 'deepseek'
@@ -118,11 +403,14 @@ function openCreate() {
   }
   showCreate.value = true
   errorMsg.value = ''
+  fetchMsg.value = ''
+  createMeta.value = null
 }
 
 function cancelCreate() {
   showCreate.value = false
   errorMsg.value = ''
+  fetchMsg.value = ''
 }
 
 async function doCreate() {
@@ -134,6 +422,8 @@ async function doCreate() {
   errorMsg.value = ''
   try {
     createForm.value.config_type = activeTab.value === 'vlm' ? 'vlm' : 'llm'
+    const cw = createForm.value.context_window
+    if (cw) createForm.value.context_window = Number(cw) || null
     await createLLM(createForm.value)
     showCreate.value = false
     if (activeTab.value === 'llm') await loadLLM()
@@ -153,14 +443,22 @@ function startEdit(c: LLMConfigItem) {
   editForm.value = {
     name: c.name, provider: c.provider, provider_name: c.provider_name,
     model_name: c.model_name, base_url: c.base_url, api_key: '',
+    context_window: c.context_window ?? null,
   }
   errorMsg.value = ''
+  fetchMsg.value = ''
+  editMeta.value = null
+  // 进编辑弹窗即预填该 provider 离线兜底, 避免下拉只有一项
+  remoteModels.value = PROVIDER_PRESETS[String(c.provider ?? '')]?.models ?? []
+  // 有模型名则顺手查一次 effort 上限
+  if (c.model_name) void onModelChange('edit')
 }
 
 function cancelEdit() {
   editingId.value = null
   editForm.value = {}
   errorMsg.value = ''
+  fetchMsg.value = ''
 }
 
 async function doUpdate() {
@@ -389,7 +687,7 @@ function switchTab(key: TabKey) {
   showCreate.value = false
   editingId.value = null
   const loaders: Record<TabKey, () => void> = {
-    llm: loadLLM, vlm: loadVLM, temp: loadTemps, chat: loadChatParams,
+    llm: loadLLM, vlm: loadVLM, draw: loadDraw, temp: loadTemps, chat: loadChatParams,
     tools: loadToolSettings, tokens: loadTokens,
   }
   loaders[key]()
@@ -429,27 +727,34 @@ function currentList() { return activeTab.value === 'llm' ? llmList : vlmList }
 function currentConfigs(): LLMConfigItem[] { return currentList()?.value?.configs ?? [] }
 function currentSlots(): Record<string, number | null> {
   const raw = currentList()?.value?.slots ?? {}
-  // 过滤已移除的槽位 (仲裁功能 2026-06-30 删除)
+  // 过滤已移除/退役的槽位 (仲裁功能 2026-06-30 删除; llm_secondary 无消费方 2026-10-15 退役)
   const filtered: Record<string, number | null> = {}
   for (const [k, v] of Object.entries(raw)) {
-    if (k !== 'llm_judge' && k !== 'llm_opus') filtered[k] = v
+    if (k !== 'llm_judge' && k !== 'llm_opus' && k !== 'llm_secondary') filtered[k] = v
+  }
+  // VLM 页只保留识图 (vlm_secondary 已退役无消费方，绘图走独立绘图页指派)
+  if (activeTab.value === 'vlm') {
+    const kept: Record<string, number | null> = {}
+    if ('vlm_primary' in filtered) kept['vlm_primary'] = filtered['vlm_primary']
+    return kept
   }
   return filtered
 }
 
 function slotLabel(slotKey: string, tab: string): string {
   if (tab === 'llm') {
+    // 链路统一命名 (与后端 CHAIN_SLOT_MAP 同源)：一行 = 一条链路
     const map: Record<string, string> = {
-      llm_primary: '普通聊天',
-      llm_secondary: '进阶',
-      llm_lite: '普通聊天',
-      llm_pro: '进阶',
-      llm_gate: '意图闸',
-      shadow_agent: '影子',
+      llm_primary: '主链·脑/嘴/私聊',
+      llm_lite: '闲聊·后台/压缩',
+      llm_pro: '推理·绘图spec',
+      llm_gate: '意图闸·Slim',
+      llm_judge: '仲裁',
+      shadow_agent: '影子Agent',
     }
     return map[slotKey] || slotKey
   }
-  return slotKey === 'vlm_primary' ? '识图' : '绘图'
+  return '识图'  // VLM 页仅剩 vlm_primary (绘图槽已退役，见 currentSlots)
 }
 </script>
 
@@ -483,22 +788,85 @@ function slotLabel(slotKey: string, tab: string): string {
             @change="toggleChat('reasoning_enabled', ($event.target as HTMLInputElement).checked)" />
         </label>
         <label class="toggle-label">
+          <span>默认档</span>
+          <select class="effort-select" :value="settings.thinking_effort || 'auto'"
+            @change="saveThinkingEffort(($event.target as HTMLSelectElement).value)"
+            title="默认档位: 全局唯一设置, 槽位跟随全局=用它; 自动=Gate 按意图决定, 关闭=硬关">
+            <option v-for="o in THINKING_EFFORTS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
+        </label>
+        <label class="toggle-label">
           <Eye :size="14" />
           <span>影子</span>
           <input type="checkbox" :checked="settings.shadow_agent_enabled"
             @change="toggleChat('shadow_agent_enabled', ($event.target as HTMLInputElement).checked)" />
         </label>
       </div>
-      <div class="owner-row">
-        <label class="owner-label">
+    </div>
+
+    <!-- 管理与隔离区设置 -->
+    <div class="admin-card" v-if="settings">
+      <div class="admin-field">
+        <label class="field-label">
           <Shield :size="14" />
-          <span>管理员QQ</span>
+          <span>管理员 QQ</span>
         </label>
-        <input class="owner-input" type="text" v-model="settings.owner_qq" placeholder="824941143"
+        <input class="input admin-input" type="text" v-model="settings.owner_qq" placeholder="824941143"
           @blur="saveOwnerQQ" @keyup.enter="($event.target as HTMLInputElement).blur()" />
-        <input class="shadow-model-input" type="text" v-model="settings.shadow_agent_model"
-          placeholder="影子模型覆写(空=跟llm_lite)" @blur="saveShadowModel"
-          @keyup.enter="($event.target as HTMLInputElement).blur()" />
+        <p class="field-hint">主人鉴权唯一依据——显示名可伪造，QQ 号不可。</p>
+      </div>
+      <div class="nsfw-panel" :class="{ on: settings.nsfw_enabled }">
+        <div class="nsfw-head">
+          <div class="nsfw-title">
+            <Flame :size="16" />
+            <span>成人向隔离区</span>
+            <span :class="['badge', settings.nsfw_enabled ? 'badge-nsfw-on' : 'badge-nsfw-off']">
+              {{ settings.nsfw_enabled ? '已开启' : '已关闭' }}
+            </span>
+          </div>
+          <label class="switch" title="仅对当前 Bot 生效，默认关闭">
+            <input type="checkbox" :checked="settings.nsfw_enabled"
+              @change="toggleChat('nsfw_enabled', ($event.target as HTMLInputElement).checked)" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="nsfw-desc">
+          指定群 + 指定人放宽成人合意内容，未成年 / 非合意 / 性暴力 / 解除伦理约束永远拦截。
+          改动即时写入 DB，重启对应 Bot 容器生效。
+        </p>
+        <div v-if="settings.nsfw_enabled" class="nsfw-grid">
+          <div class="nsfw-field">
+            <label>生效群 <span class="required">*</span></label>
+            <input class="input" type="text" v-model="settings.nsfw_groups" placeholder="例如 123456789, 987654321"
+              @blur="saveNsfw" @keyup.enter="($event.target as HTMLInputElement).blur()" />
+            <p class="field-hint">群号，逗号分隔；为空则任何群都不生效。</p>
+          </div>
+          <div class="nsfw-field">
+            <label>生效用户</label>
+            <input class="input" type="text" v-model="settings.nsfw_users" placeholder="留空 = 仅超管"
+              @blur="saveNsfw" @keyup.enter="($event.target as HTMLInputElement).blur()" />
+            <p class="field-hint">QQ 号，逗号分隔；留空时只有超管能触发。</p>
+          </div>
+          <div class="nsfw-field nsfw-field-wide">
+            <label>私聊通道</label>
+            <div class="nsfw-inline-toggle">
+              <label class="switch" title="私聊没有群号，群白名单不适用">
+                <input type="checkbox" :checked="settings.nsfw_private"
+                  @change="toggleChat('nsfw_private', ($event.target as HTMLInputElement).checked)" />
+                <span class="slider"></span>
+              </label>
+              <span :class="['badge', settings.nsfw_private ? 'badge-nsfw-on' : 'badge-nsfw-off']">
+                {{ settings.nsfw_private ? '已开启' : '已关闭' }}
+              </span>
+            </div>
+            <p class="field-hint">
+              私聊没有群号，群白名单不适用，所以单列一个开关。
+              开启后「生效用户」名单在私聊同样生效（留空 = 仅超管）。
+              只开群内 NSFW 的话，这里保持关闭即可——两者互不影响。
+            </p>
+          </div>
+        </div>
+        <p v-if="nsfwSaved" class="nsfw-saved">已保存 {{ nsfwSaved }}</p>
       </div>
     </div>
 
@@ -514,17 +882,44 @@ function slotLabel(slotKey: string, tab: string): string {
 
     <!-- LLM / VLM 槽位 (含 Provider CRUD) -->
     <div v-if="activeTab === 'llm' || activeTab === 'vlm'" class="panel">
+      <p v-if="activeTab === 'llm'" class="nsfw-link-hint">
+        <Flame :size="12" />
+        <span>NSFW 隔离区场景的模型 / 档位 / 温度在
+          <router-link to="/nsfw-config">「NSFW 配置」</router-link> 页单独设置；未配置项自动跟随本页（SFW）。</span>
+      </p>
       <!-- 槽位下拉 -->
       <div class="slot-selects">
         <div v-for="(_, slotKey) in currentSlots()" :key="slotKey" class="slot-field">
           <label>{{ slotLabel(slotKey, activeTab) }}</label>
-          <select :value="currentSlots()[slotKey] ?? ''"
-            @change="doAssignSlot(activeTab, slotKey, parseInt(($event.target as HTMLSelectElement).value) || null)">
-            <option value="">— 未分配 —</option>
-            <option v-for="c in currentConfigs()" :key="c.id" :value="c.id">{{ c.name }} ({{ getProviderLabel(c.provider) }})</option>
-          </select>
+          <div class="slot-row">
+            <select :value="currentSlots()[slotKey] ?? ''"
+              @change="doAssignSlot(activeTab, slotKey, parseInt(($event.target as HTMLSelectElement).value) || null)">
+              <option value="">— 未分配 —</option>
+              <option v-for="c in currentConfigs()" :key="c.id" :value="c.id">{{ c.name }} ({{ getProviderLabel(c.provider) }})</option>
+            </select>
+            <select v-if="showSlotEffort(String(slotKey))" class="effort-select" :value="slotEffort(String(slotKey))"
+              @change="saveSlotEffort(String(slotKey), ($event.target as HTMLSelectElement).value)"
+              title="该槽位的思考档位: 跟随全局=用顶栏档位">
+              <option v-for="o in SLOT_EFFORT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <button v-if="activeTab === 'llm'" class="btn btn-xs" :disabled="rowTestRunning[String(slotKey)]"
+              @click="runRowTest(String(slotKey))" title="用本行当前生效档位测连通">
+              {{ rowTestRunning[String(slotKey)] ? '测试中…' : '测试' }}
+            </button>
+          </div>
+          <div v-if="activeTab === 'llm' && rowTestResult[String(slotKey)]" class="fetch-hint"
+            :class="rowTestResult[String(slotKey)]!.ok ? '' : 'error-msg'" style="font-size:12px">
+            <template v-if="rowTestResult[String(slotKey)]!.ok">
+              ✅ {{ rowTestResult[String(slotKey)]!.output_preview }} ·
+              token {{ rowTestResult[String(slotKey)]!.usage?.prompt_tokens }}/{{ rowTestResult[String(slotKey)]!.usage?.completion_tokens }}（思考{{ rowTestResult[String(slotKey)]!.usage?.reasoning_tokens ?? 0 }}）
+              <template v-if="rowTestResult[String(slotKey)]!.tier_warning">⚠️ {{ rowTestResult[String(slotKey)]!.tier_warning }}</template>
+            </template>
+            <template v-else>❌ {{ rowTestResult[String(slotKey)]!.error }}</template>
+          </div>
         </div>
       </div>
+
+      <!-- 行内测试：见各槽位行尾“测试”按钮 -->
 
       <!-- 新建面板 -->
       <div v-if="showCreate" class="create-panel">
@@ -536,18 +931,37 @@ function slotLabel(slotKey: string, tab: string): string {
           </div>
           <div class="form-field">
             <label>Provider</label>
-            <input v-model="createForm.provider" list="provider-list" class="input" placeholder="输入或选择" autocomplete="off" />
-            <datalist id="provider-list">
-              <option v-for="p in ALL_PROVIDERS" :key="p" :value="p" />
-            </datalist>
+            <select v-model="createForm.provider" class="input" @change="onProviderChange('create')">
+              <option v-for="p in providerOptions(createForm.provider)" :key="p" :value="p">{{ p }}</option>
+            </select>
           </div>
           <div class="form-field">
             <label>模型名 <span class="required">*</span></label>
-            <input v-model="createForm.model_name" placeholder="deepseek-v4-flash" class="input" />
+            <div style="display:flex; gap:8px">
+              <input v-model="createForm.model_name" list="create-model-list" placeholder="deepseek-v4-flash" class="input" @change="onModelChange('create')" />
+              <button class="btn btn-sm" :disabled="fetchingModels" @click="doFetchModels('create')">{{ fetchingModels ? '拉取中…' : '获取模型' }}</button>
+            </div>
+            <datalist id="create-model-list"><option v-for="m in modelOptions('create')" :key="m" :value="m" /></datalist>
+            <select
+              v-if="modelOptions('create').length > 1"
+              class="input"
+              :value="String(createForm.model_name ?? '')"
+              @change="pickModel('create', ($event.target as HTMLSelectElement).value)"
+              title="从拉取列表直选"
+            >
+              <option value="">— 从拉取列表选择 ({{ modelOptions('create').length }} 个) —</option>
+              <option v-for="m in modelOptions('create')" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <small v-if="fetchMsg" class="fetch-hint">{{ fetchMsg }}</small>
+            <small v-if="effortHint(metaOf('create'))" class="fetch-hint">⚡ {{ effortHint(metaOf('create')) }}</small>
+          </div>
+          <div class="form-field">
+            <label>上下文窗口 (tokens)</label>
+            <input v-model="createForm.context_window" type="number" class="input" placeholder="选模型后自动填充" />
           </div>
           <div class="form-field" style="grid-column: 1 / -1">
             <label>Base URL</label>
-            <input v-model="createForm.base_url" placeholder="https://api.deepseek.com/v1" class="input" />
+            <input v-model="createForm.base_url" placeholder="选 Provider 自动填充" class="input" />
           </div>
           <div class="form-field" style="grid-column: 1 / -1">
             <label>API Key</label>
@@ -597,6 +1011,27 @@ function slotLabel(slotKey: string, tab: string): string {
         </table>
         <div v-else class="empty-state">暂无配置，点击「新建配置」添加 Provider</div>
       </div>
+    </div>
+
+    <!-- 绘图分配 (按 Bot 指派供应商；Key 与参数去各自独立配置页) -->
+    <div v-if="activeTab === 'draw'" class="panel">
+      <div v-if="drawLoading" class="empty-state">加载中…</div>
+      <template v-else-if="drawCfg">
+        <div class="assign-list">
+          <div v-for="b in drawCfg.bots" :key="b.id" class="assign-row">
+            <span class="assign-name">{{ b.name }} <span class="dimmed">{{ b.id }}</span></span>
+            <label><input type="radio" :name="'draw-' + b.id" value="novelai" v-model="drawAssign[b.id]" />
+              NovelAI <span v-if="!drawCfg.novelai.token_set" class="dimmed">（未配 Key）</span></label>
+            <label><input type="radio" :name="'draw-' + b.id" value="pixai" v-model="drawAssign[b.id]" />
+              PixAI <span v-if="!drawCfg.pixai.key_set" class="dimmed">（未配 Key）</span></label>
+            <label><input type="radio" :name="'draw-' + b.id" value="none" v-model="drawAssign[b.id]" /> 停用</label>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" :disabled="drawSaving" @click="saveDrawAssign">{{ drawSaving ? '保存中...' : '保存分配' }}</button>
+        </div>
+        <p class="field-hint" style="margin-top:12px">构思（意图→提示词）走 LLM 槽位下的推理位，模型与档位去 LLM 槽位页调整。</p>
+      </template>
     </div>
 
     <!-- 温度设置 -->
@@ -679,8 +1114,8 @@ function slotLabel(slotKey: string, tab: string): string {
               <span class="tool-label">{{ t.label }}</span>
               <span class="tool-name-tag">{{ t.name }}</span>
               <span v-if="t.bot === 'both'" class="badge badge-shared">共享</span>
-              <span v-else-if="t.bot === 'loput'" class="badge badge-loput">洛普特</span>
-              <span v-else class="badge badge-luna">露娜</span>
+              <span v-else-if="t.bot === 'loput'" class="badge badge-loput">主 bot</span>
+              <span v-else class="badge badge-luna">对照 bot</span>
               <span class="tool-desc">{{ t.desc }}</span>
             </div>
             <div class="tool-controls">
@@ -751,10 +1186,32 @@ function slotLabel(slotKey: string, tab: string): string {
         </div>
         <div class="form-grid" style="padding:18px 22px">
           <div class="form-field"><label>名称</label><input v-model="editForm.name" class="input" /></div>
-          <div class="form-field"><label>Provider</label><input v-model="editForm.provider" list="edit-provider-list" class="input" placeholder="输入或选择" autocomplete="off" />
-            <datalist id="edit-provider-list"><option v-for="p in ALL_PROVIDERS" :key="p" :value="p" /></datalist>
+          <div class="form-field"><label>Provider</label>
+            <select v-model="editForm.provider" class="input" @change="onProviderChange('edit')">
+              <option v-for="p in providerOptions(String(editForm.provider ?? ''))" :key="p" :value="p">{{ p }}</option>
+            </select>
           </div>
-          <div class="form-field"><label>模型名</label><input v-model="editForm.model_name" class="input" /></div>
+          <div class="form-field"><label>模型名</label>
+            <div style="display:flex; gap:8px">
+              <input v-model="editForm.model_name" list="edit-model-list" class="input" @change="onModelChange('edit')" />
+              <button class="btn btn-sm" :disabled="fetchingModels" @click="doFetchModels('edit')">{{ fetchingModels ? '拉取中…' : '获取模型' }}</button>
+            </div>
+            <datalist id="edit-model-list"><option v-for="m in modelOptions('edit')" :key="m" :value="m" /></datalist>
+            <select
+              v-if="modelOptions('edit').length > 1"
+              class="input"
+              :value="String(editForm.model_name ?? '')"
+              @change="pickModel('edit', ($event.target as HTMLSelectElement).value)"
+              title="从拉取列表直选"
+            >
+              <option value="">— 从拉取列表选择 ({{ modelOptions('edit').length }} 个) —</option>
+              <option v-for="m in modelOptions('edit')" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <small v-if="fetchMsg" class="fetch-hint">{{ fetchMsg }}</small>
+            <small v-if="effortHint(metaOf('edit'))" class="fetch-hint">⚡ {{ effortHint(metaOf('edit')) }}</small>
+            <small v-if="errorMsg" class="fetch-err">{{ errorMsg }}</small>
+          </div>
+          <div class="form-field"><label>上下文窗口 (tokens)</label><input v-model="editForm.context_window" type="number" class="input" placeholder="选模型后自动填充" /></div>
           <div class="form-field" style="grid-column: 1 / -1"><label>Base URL</label><input v-model="editForm.base_url" class="input" /></div>
           <div class="form-field" style="grid-column: 1 / -1"><label>API Key <span class="hint">留空则不修改</span></label><input v-model="editForm.api_key" type="password" placeholder="留空则不修改" class="input" /></div>
         </div>
@@ -797,9 +1254,90 @@ function slotLabel(slotKey: string, tab: string): string {
 .toggle-label input[type="checkbox"] {
   width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary);
 }
+.effort-select {
+  padding: 4px 8px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 12px;
+  background: var(--bg); color: var(--text); cursor: pointer;
+  max-width: 150px;
+}
+
+/* ── 管理与隔离区卡片 ── */
+.admin-card {
+  display: grid; grid-template-columns: 280px 1fr; gap: 16px;
+  margin-bottom: 18px;
+}
+@media (max-width: 900px) { .admin-card { grid-template-columns: 1fr; } }
+.admin-field {
+  padding: 16px 18px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+}
+.field-label {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.admin-input { width: 100%; }
+.field-hint { font-size: 11px; color: var(--text-muted); margin: 6px 0 0; line-height: 1.5; }
+
+/* ── NSFW 隔离区面板 ── */
+.nsfw-panel {
+  padding: 16px 18px; border-radius: var(--radius-lg);
+  background: var(--surface); border: 1px solid var(--border);
+  transition: border-color 0.2s, background 0.2s;
+}
+.nsfw-panel.on {
+  background: linear-gradient(135deg, #fff7ed 0%, var(--danger-light) 100%);
+  border-color: #fecaca;
+}
+.nsfw-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nsfw-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; font-weight: 700; color: var(--text);
+}
+.nsfw-panel.on .nsfw-title { color: #9a3412; }
+.nsfw-title svg { color: var(--text-muted); }
+.nsfw-panel.on .nsfw-title svg { color: #ea580c; }
+.badge-nsfw-on { background: #ffedd5; color: #9a3412; }
+.badge-nsfw-off { background: var(--primary-light); color: var(--text-muted); }
+.nsfw-desc { font-size: 12px; color: var(--text-secondary); margin: 8px 0 0; line-height: 1.6; }
+.nsfw-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px; }
+@media (max-width: 700px) { .nsfw-grid { grid-template-columns: 1fr; } }
+/* 私聊通道横跨两列 —— 它跟「生效群」是并列的通道选择，不是第三个名单 */
+.nsfw-field-wide { grid-column: 1 / -1; }
+.nsfw-inline-toggle { display: flex; align-items: center; gap: 10px; }
+.nsfw-field { display: flex; flex-direction: column; gap: 5px; }
+.nsfw-field label { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.nsfw-field .required { color: var(--danger); }
+.nsfw-saved { font-size: 11px; color: #065f46; margin: 8px 0 0; }
+
+/* ── 开关 (switch) ── */
+.switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; cursor: pointer; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider {
+  position: absolute; inset: 0; border-radius: 9999px;
+  background: var(--border); transition: background 0.2s;
+}
+.switch .slider::before {
+  content: ""; position: absolute; width: 16px; height: 16px;
+  left: 3px; top: 3px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+  transition: transform 0.2s;
+}
+.switch input:checked + .slider { background: #ea580c; }
+.switch input:checked + .slider::before { transform: translateX(18px); }
 
 /* ── Panel ── */
 .panel { padding: 4px 0; }
+
+/* ── NSFW 配置页提示 (LLM 槽位页 → /nsfw-config) ── */
+.nsfw-link-hint {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-muted);
+  margin: 0 0 12px; padding: 8px 12px;
+  background: #fff7ed; border: 1px solid #fed7aa; border-radius: var(--radius);
+}
+.nsfw-link-hint svg { color: #ea580c; flex-shrink: 0; }
+.nsfw-link-hint a { color: #9a3412; font-weight: 600; }
 
 /* ── 槽位选择 ── */
 .slot-selects { display: flex; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
@@ -813,6 +1351,8 @@ function slotLabel(slotKey: string, tab: string): string {
   border-radius: var(--radius-sm); font-size: 13px;
   background: var(--surface); min-width: 240px; color: var(--text);
 }
+.slot-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.slot-row .effort-select { min-width: 110px; }
 .slot-field select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(99,102,241,0.1); }
 
 /* ── Table toolbar ── */
@@ -875,6 +1415,13 @@ function slotLabel(slotKey: string, tab: string): string {
 /* ── Row actions ── */
 .row-actions { display: flex; gap: 4px; }
 .btn-danger-outline { color: var(--danger); border-color: #fecaca; }
+
+/* ── 绘图分配 Tab ── */
+.draw-hint { font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
+.assign-list { display: flex; flex-direction: column; gap: 10px; }
+.assign-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--border-light); border-radius: 8px; }
+.assign-name { font-size: 13px; font-weight: 600; color: var(--text); min-width: 180px; }
+.assign-row label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
 .btn-danger-outline:hover:not(:disabled) { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 /* ── Modal ── */
@@ -905,6 +1452,8 @@ function slotLabel(slotKey: string, tab: string): string {
 
 /* ── 通用 ── */
 .masked-key { font-size: 12px; font-family: var(--mono); }
+.fetch-hint { font-size: 11px; color: #065f46; margin-top: 4px; }
+.fetch-err { font-size: 11px; color: var(--danger); margin-top: 4px; }
 .dimmed { color: var(--text-muted); font-size: 12px; }
 .empty-state { text-align: center; padding: 28px; color: var(--text-muted); font-size: 13px; }
 .overflow-auto { overflow-x: auto; }

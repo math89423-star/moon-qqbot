@@ -237,14 +237,16 @@ class AffinityGates:
     locked: bool = False
 
 
-def _gates_for_user(user_id: str, admin_qq: int | None, peer_bot_qq: int | None = None) -> AffinityGates:
-    """根据用户身份返回好感门控。"""
+def _gates_for_user(
+    user_id: str, admin_qq: int | None, peer_bot_qq: int | None = None, self_id: str = "",
+) -> AffinityGates:
+    """根据用户身份返回好感门控。self_id 非空时查 per-bot 黑名单（历史全局名单始终生效）。"""
     is_admin = admin_qq is not None and user_id == str(admin_qq)
 
     if is_admin:
         return AffinityGates(min_level=5, max_level=5, locked=True)
 
-    if _is_blacklisted(user_id):
+    if _is_blacklisted(user_id, self_id=self_id):
         return AffinityGates(min_level=-2, max_level=-2, locked=True)
 
     # 同群对照 bot: 固定 Lv.4 亲密，锁定不变
@@ -295,56 +297,88 @@ def set_user_nickname(user_id: str, nickname: str) -> str | None:
     rel.nickname = nickname.strip()
     save_user_relation(user_id, rel)
 
-def _load_blacklist() -> set[str]:
+def _blacklist_path(self_id: str = "") -> Path:
+    """per-bot 黑名单路径。self_id 为空时回退历史全局路径（只读兼容）。"""
+    if self_id:
+        return _STORE_DIR / str(self_id) / "blacklist.json"
+    return _BLACKLIST_PATH
+
+
+def _load_blacklist(self_id: str = "") -> set[str]:
     try:
-        data = json.loads(_BLACKLIST_PATH.read_text(encoding="utf-8"))
-        return set(str(uid) for uid in data.get("blacklist", []))
+        return set(_load_blacklist_cached(self_id))
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
 
-def _save_blacklist(bl: set[str]) -> None:
-    _BLACKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _BLACKLIST_PATH.write_text(
+# ── 黑名单 mtime 缓存: 文件未变时跳过读+解析，返回拷贝防外部篡改 ──
+_BL_CACHE: dict[str, tuple[float, frozenset]] = {}
+
+
+def _load_blacklist_cached(self_id: str = "") -> frozenset:
+    """带 mtime 缓存的黑名单读取。文件 mtime 未变 → 命中。"""
+    _path = _blacklist_path(self_id)
+    try:
+        _mtime = _path.stat().st_mtime
+    except OSError:
+        raise FileNotFoundError(str(_path)) from None
+    _key = str(_path)
+    _hit = _BL_CACHE.get(_key)
+    if _hit is not None and _hit[0] == _mtime:
+        return _hit[1]
+    data = json.loads(_path.read_text(encoding="utf-8"))
+    _fs = frozenset(str(uid) for uid in data.get("blacklist", []))
+    _BL_CACHE[_key] = (_mtime, _fs)
+    return _fs
+
+
+def _save_blacklist(bl: set[str], self_id: str = "") -> None:
+    _path = _blacklist_path(self_id) if self_id else _BLACKLIST_PATH
+    _path.parent.mkdir(parents=True, exist_ok=True)
+    _path.write_text(
         json.dumps({"blacklist": sorted(bl)}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-def _is_blacklisted(user_id: str) -> bool:
-    return str(user_id) in _load_blacklist()
+def _is_blacklisted(user_id: str, self_id: str = "") -> bool:
+    """per-bot 黑名单命中即 True；历史全局名单继续生效（fail-closed）。"""
+    _uid = str(user_id)
+    if self_id and _uid in _load_blacklist(self_id):
+        return True
+    return _uid in _load_blacklist()
 
 
-def blacklist_add(user_id: str) -> None:
+def blacklist_add(user_id: str, self_id: str = "") -> None:
     """管理员将用户加入黑名单 → 锁定 Lv.-2。"""
-    bl = _load_blacklist()
+    bl = _load_blacklist(self_id)
     bl.add(str(user_id))
-    _save_blacklist(bl)
+    _save_blacklist(bl, self_id)
     # 同时将好感状态强制设为 Lv.-2
-    rel = get_user_relation(user_id, admin_qq=None)
+    rel = get_user_relation(user_id, admin_qq=None, self_id=self_id)
     rel.affinity.level = -2
     rel.affinity.score = 0.0
     rel.affinity.locked = True
-    save_user_relation(user_id, rel)
-    logger.info("用户 %s 已加入黑名单", user_id)
+    save_user_relation(user_id, rel, self_id=self_id)
+    logger.info("用户 %s 已加入黑名单 (bot=%s)", user_id, self_id or "全局")
 
 
-def blacklist_remove(user_id: str) -> None:
+def blacklist_remove(user_id: str, self_id: str = "") -> None:
     """管理员将用户移出黑名单 → 重置为 Lv.0。"""
-    bl = _load_blacklist()
+    bl = _load_blacklist(self_id)
     bl.discard(str(user_id))
-    _save_blacklist(bl)
-    rel = get_user_relation(user_id, admin_qq=None)
+    _save_blacklist(bl, self_id)
+    rel = get_user_relation(user_id, admin_qq=None, self_id=self_id)
     rel.affinity.level = 0
     rel.affinity.score = 0.0
     rel.affinity.locked = False
-    save_user_relation(user_id, rel)
-    logger.info("用户 %s 已移出黑名单", user_id)
+    save_user_relation(user_id, rel, self_id=self_id)
+    logger.info("用户 %s 已移出黑名单 (bot=%s)", user_id, self_id or "全局")
 
 
-def get_blacklist() -> list[str]:
+def get_blacklist(self_id: str = "") -> list[str]:
     """获取黑名单列表 (供管理面板)。"""
-    return sorted(_load_blacklist())
+    return sorted(_load_blacklist(self_id))
 
 
 
@@ -597,8 +631,8 @@ def can_use_vlm(user_id: str, admin_qq: int | None = None, self_id: str = "") ->
     return rel.affinity.level >= 3
 
 
-def can_generate_image(user_id: str, admin_qq: int | None = None, self_id: str = "") -> bool:
-    """检查用户是否允许 AI 绘图 (好感 ≥ Lv.3 才开放)。
+def can_generate_image(user_id: str, admin_qq: int | None = None, self_id: str = "", min_level: int = 3) -> bool:
+    """检查用户是否允许 AI 绘图 (默认好感 ≥ Lv.3 才开放)。
 
     绘图更昂贵，需要更高的信任门槛。
     管理员不受限制。
@@ -607,6 +641,8 @@ def can_generate_image(user_id: str, admin_qq: int | None = None, self_id: str =
         user_id: 用户 QQ 号
         admin_qq: 管理员 QQ 号 (不受限制)
         self_id: bot 的 QQ 号 (用于 per-bot 好感数据隔离)
+        min_level: 最低好感等级 (2026-10-11: NovelAI 免费通道下放至 Lv.2，
+            调用方按后端传 2；PixAI 按量通道保持 3)
 
     Returns:
         True 表示允许绘图
@@ -614,7 +650,7 @@ def can_generate_image(user_id: str, admin_qq: int | None = None, self_id: str =
     if admin_qq is not None and user_id == str(admin_qq):
         return True
     rel = get_user_relation(user_id, self_id=self_id, admin_qq=admin_qq)
-    return rel.affinity.level >= 3
+    return rel.affinity.level >= min_level
 
 
 # ═══════════════════════════════════════════════════════════
@@ -626,6 +662,10 @@ from pathlib import Path as _Path
 
 _DAILY_IMAGE_COUNT_PATH = _get_plugin_data_dir() / "image_gen_daily.json"
 _DAILY_IMAGE_MAX = 3  # 每人每天最多 3 张 (可通过 configure_limits() 覆盖)
+# 2026-10-11: 按后端分池 — NovelAI 免费通道每人每天 5 张，PixAI 按量通道沿用 _DAILY_IMAGE_MAX。
+_DAILY_IMAGE_NOVELAI_MAX = 5
+_DRAW_POOLS = ("novelai", "pixai", "novelai_trial")
+_DAILY_IMAGE_TRIAL_MAX = 3  # 体验档（低好感 V4.5 试用）每人每天 3 张
 
 
 # ── 运行时覆盖: 由 suli_tavern 在启动时从管理面板配置注入 ──
@@ -645,15 +685,18 @@ def configure_limits(
     """由 suli_tavern 在启动时调用，从管理面板配置注入限制值。
 
     所有参数为 None 表示不覆盖，使用模块级默认值。
+
+    2026-09-26: daily_vlm_max / daily_tools_base 已停用（不限额），传入将被忽略，
+    参数保留仅为调用签名兼容。生图 (daily_image_max) 与冷却仍生效。
     """
     global _daily_image_max_override, _daily_vlm_max_override
     global _daily_tools_base_override, _tool_cooldown_override
     if daily_image_max is not None:
         _daily_image_max_override = daily_image_max
     if daily_vlm_max is not None:
-        _daily_vlm_max_override = daily_vlm_max
+        _daily_vlm_max_override = None  # 已停用：忽略面板传入值
     if daily_tools_base is not None:
-        _daily_tools_base_override = daily_tools_base
+        _daily_tools_base_override = None  # 已停用：忽略面板传入值
     if tool_cooldown_seconds is not None:
         _tool_cooldown_override = tool_cooldown_seconds
 
@@ -681,8 +724,12 @@ def _save_daily_counts(data: dict) -> None:
         logger.warning("每日绘图计数保存失败", exc_info=True)
 
 
-def check_daily_image_limit(user_id: str, admin_qq: int | None = None) -> tuple[bool, int]:
+def check_daily_image_limit(user_id: str, admin_qq: int | None = None, pool: str = "") -> tuple[bool, int]:
     """检查用户今日绘图是否超限。管理员不受限制。
+
+    Args:
+        pool: 后端分池 (""=旧共享池兼容， "novelai"=免费池5张/日， "pixai"=按量池)。
+            旧文件 {date: {user_id: count}} 视为 pixai 池历史 (严格侧继承)。
 
     Returns:
         (allowed, remaining) — allowed 为 True 表示可以继续绘制，
@@ -703,23 +750,54 @@ def check_daily_image_limit(user_id: str, admin_qq: int | None = None) -> tuple[
         del data[d]
 
     today_counts = data.get(today, {})
-    used = today_counts.get(user_id, 0)
-    _max = _daily_image_max_override if _daily_image_max_override is not None else _DAILY_IMAGE_MAX
+    used = 0
+    if pool in _DRAW_POOLS:
+        pool_counts = today_counts.get(pool, {})
+        if isinstance(pool_counts, dict):
+            used = pool_counts.get(user_id, 0)
+        # 旧扁平结构迁移到严格侧 (pixai)，免费池 novelai 从 0 起算
+        if pool == "pixai":
+            legacy = today_counts.get(user_id, 0)
+            if isinstance(legacy, int):
+                used += legacy
+    else:
+        used = today_counts.get(user_id, 0) if isinstance(today_counts.get(user_id), int) else 0
+    if pool == "novelai":
+        _max = _DAILY_IMAGE_NOVELAI_MAX
+    elif pool == "novelai_trial":
+        _max = _DAILY_IMAGE_TRIAL_MAX
+    else:
+        _max = _daily_image_max_override if _daily_image_max_override is not None else _DAILY_IMAGE_MAX
     remaining = _max - used
 
     return (remaining > 0, max(0, remaining))
 
 
-def record_image_generation(user_id: str, admin_qq: int | None = None) -> int:
-    """记录一次绘图使用，返回今日已用次数。管理员不计数。"""
+def record_image_generation(user_id: str, admin_qq: int | None = None, pool: str = "") -> int:
+    """记录一次绘图使用，返回今日已用次数。管理员不计数。
+
+    pool 非空时写入分池 (与 check_daily_image_limit 对应)，空则走旧扁平结构。
+    """
     if admin_qq is not None and user_id == str(admin_qq):
         return 0
     today = time.strftime("%Y-%m-%d")
     data = _load_daily_counts()
-    today_counts = data.get(today, {})
-    used = today_counts.get(user_id, 0) + 1
-    today_counts[user_id] = used
-    data[today] = today_counts
+    if pool in _DRAW_POOLS:
+        today_counts = data.get(today, {})
+        if not isinstance(today_counts, dict):
+            today_counts = {}
+        pool_counts = today_counts.get(pool, {})
+        if not isinstance(pool_counts, dict):
+            pool_counts = {}
+        used = pool_counts.get(user_id, 0) + 1
+        pool_counts[user_id] = used
+        today_counts[pool] = pool_counts
+        data[today] = today_counts
+    else:
+        today_counts = data.get(today, {})
+        used = today_counts.get(user_id, 0) + 1
+        today_counts[user_id] = used
+        data[today] = today_counts
     _save_daily_counts(data)
     return used
 
@@ -729,7 +807,7 @@ def record_image_generation(user_id: str, admin_qq: int | None = None) -> int:
 # ═══════════════════════════════════════════════════════════
 
 _VLM_DAILY_PATH = _get_plugin_data_dir() / "vlm_daily.json"
-_VLM_DAILY_MAX = 5  # 每人每天最多 5 次识图
+_VLM_DAILY_MAX = 5  # 每人每天最多 5 次识图（2026-09-26 起停用：不限额，保留常量仅备查）
 
 
 def _load_vlm_daily() -> dict:
@@ -753,39 +831,27 @@ def _save_vlm_daily(data: dict) -> None:
         logger.warning("VLM 每日配额保存失败", exc_info=True)
 
 
-def check_daily_vlm_limit(user_id: str, admin_qq: int | None = None) -> tuple[bool, int]:
-    """检查用户今日 VLM 识图是否超限。管理员不受限制。"""
-    # 管理员豁免
-    if admin_qq is not None and user_id == str(admin_qq):
-        return (True, 999)
-    today = time.strftime("%Y-%m-%d")
-    data = _load_vlm_daily()
-
-    from datetime import datetime as _dt
-    from datetime import timedelta as _td
-    cutoff = (_dt.now() - _td(days=3)).strftime("%Y-%m-%d")
-    for d in list(data):
-        if d < cutoff:
-            del data[d]
-
-    used = data.get(today, {}).get(user_id, 0)
-    _max = _daily_vlm_max_override if _daily_vlm_max_override is not None else _VLM_DAILY_MAX
-    remaining = _max - used
-    return (remaining > 0, max(0, remaining))
+def _vlm_count_key(user_id: str, self_id: str = "") -> str:
+    """VLM 日限计数键。self_id 非空时 per-bot 隔离（此前跨 bot 共用 5 次）。"""
+    _uid = str(user_id)
+    return f"{self_id}:{_uid}" if self_id else _uid
 
 
-def record_vlm_usage(user_id: str, admin_qq: int | None = None) -> int:
-    """记录一次 VLM 识图使用，返回今日已用次数。管理员不计数。"""
-    if admin_qq is not None and user_id == str(admin_qq):
-        return 0
-    today = time.strftime("%Y-%m-%d")
-    data = _load_vlm_daily()
-    today_counts = data.get(today, {})
-    used = today_counts.get(user_id, 0) + 1
-    today_counts[user_id] = used
-    data[today] = today_counts
-    _save_vlm_daily(data)
-    return used
+def check_daily_vlm_limit(user_id: str, admin_qq: int | None = None, self_id: str = "") -> tuple[bool, int]:  # noqa: ARG001
+    """检查用户今日 VLM 识图是否超限。
+
+    2026-09-26 政策变更: 多模态理解 API 降价，识图不再设每日限额，恒放行。
+    签名保留（调用点零改）。意图门 / VLM 忙线冷却 / 单条 MAX_VLM_IMAGES 照旧生效。
+    """
+    return (True, 999)
+
+
+def record_vlm_usage(user_id: str, admin_qq: int | None = None, self_id: str = "") -> int:  # noqa: ARG001
+    """记录一次 VLM 识图使用（2026-09-26 起 no-op：不限额则不计数）。
+
+    签名保留（调用点零改）。Token 用量统计走 vision.py 的 per-bot 桶，不受影响。
+    """
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -854,36 +920,18 @@ def _save_tools_daily(data: dict) -> None:
         logger.warning("工具每日配额保存失败", exc_info=True)
 
 
-def check_daily_tools_limit(user_id: str, admin_qq: int | None = None, self_id: str = "") -> tuple[bool, int]:
-    """检查用户今日普通工具调用是否超限。管理员不受限制。"""
-    if admin_qq is not None and user_id == str(admin_qq):
-        return (True, 999)
-    today = time.strftime("%Y-%m-%d")
-    data = _load_tools_daily()
-    from datetime import datetime as _dt
-    from datetime import timedelta as _td
-    cutoff = (_dt.now() - _td(days=3)).strftime("%Y-%m-%d")
-    for d in list(data):
-        if d < cutoff:
-            del data[d]
-    used = data.get(today, {}).get(user_id, 0)
-    max_limit = _get_daily_tools_max(user_id, admin_qq=admin_qq, self_id=self_id)
-    remaining = max_limit - used
-    return (remaining > 0, max(0, remaining))
+def check_daily_tools_limit(user_id: str, admin_qq: int | None = None, self_id: str = "") -> tuple[bool, int]:  # noqa: ARG001
+    """检查用户今日普通工具调用是否超限。
+
+    2026-09-26 政策变更: 除生图外工具调用不再设每日限额，恒放行。
+    签名保留（调用点零改）。意图门 / 工具冷却 / 好感门槛 / token 预算照旧生效。
+    """
+    return (True, 999)
 
 
-def record_tools_usage(user_id: str, admin_qq: int | None = None) -> int:
-    """记录一次普通工具使用，返回今日已用次数。管理员不计数。"""
-    if admin_qq is not None and user_id == str(admin_qq):
-        return 0
-    today = time.strftime("%Y-%m-%d")
-    data = _load_tools_daily()
-    today_counts = data.get(today, {})
-    used = today_counts.get(user_id, 0) + 1
-    today_counts[user_id] = used
-    data[today] = today_counts
-    _save_tools_daily(data)
-    return used
+def record_tools_usage(user_id: str, admin_qq: int | None = None) -> int:  # noqa: ARG001
+    """记录一次普通工具使用（2026-09-26 起 no-op：不限额则不计数）。签名保留。"""
+    return 0
 
 
 TOOL_COOLDOWN_SECONDS = 60  # 1 分钟
@@ -922,7 +970,7 @@ def check_tool_cooldown(user_id: str, admin_qq: int | None = None, self_id: str 
 
     # 骚扰惩罚
     if rel.tool_cooldown_violations >= TOOL_HARASS_THRESHOLD:
-        gates = _gates_for_user(user_id, admin_qq)
+        gates = _gates_for_user(user_id, admin_qq, self_id=self_id)
         old_level = rel.affinity.level
         rel.affinity.apply_event(TOOL_HARASS_AFFINITY_PENALTY, "频繁骚扰(工具)", gates, now)
         if rel.affinity.level < old_level:
@@ -956,6 +1004,39 @@ def record_tool_use(user_id: str, self_id: str = "") -> None:
 # ═══════════════════════════════════════════════════════════
 
 
+# ── 关系文件 mtime 缓存: 精确一致 (写必改 mtime)，每次仍构造全新对象 ──
+# key: (self_id, user_id) → (mtime, parsed_dict)。调用方只读 dict 组装新对象，
+# 写路径 save/get 互不干扰；跨容器共享文件也因 stat 精确而安全。
+_REL_DATA_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+
+# ── 好感日志去重: 同一 (self_id, user_id) 等级/名称/score 未变 → 不重复打 ──
+_LAST_LOGGED_AFFINITY: dict = {}
+
+# ── 好感日志降噪 (2026-10-14): get_user_relation 一轮被调多次 (Actor/Brain/
+# Prompt/情绪更新各一次)，等级不变时不重复打，只留变化信号。
+# key: (self_id, user_id) → (level, name)
+_LAST_LOGGED_AFFINITY: dict[tuple[str, str], tuple[int, str]] = {}
+
+
+def _load_relation_data(path, self_id: str, user_id: str) -> dict:
+    """带 mtime 缓存的关系文件读取。mtime 未变 → 跳过读+解析。"""
+    try:
+        _mtime = path.stat().st_mtime
+    except OSError:
+        return {}  # 并发删除等竞态 → 按空数据走默认分支
+    _key = (str(self_id), str(user_id))
+    _hit = _REL_DATA_CACHE.get(_key)
+    if _hit is not None and _hit[0] == _mtime:
+        return _hit[1]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}  # 根非 dict → 按空数据走默认分支（原会直接抛 AttributeError）
+    if len(_REL_DATA_CACHE) > 5000:
+        _REL_DATA_CACHE.pop(next(iter(_REL_DATA_CACHE)))
+    _REL_DATA_CACHE[_key] = (_mtime, data)
+    return data
+
+
 def get_user_relation(
     user_id: str,
     self_id: str = "",
@@ -971,7 +1052,7 @@ def get_user_relation(
         self_id: bot 的 QQ 号 (用于隔离不同 bot 的好感数据)
     """
     path = _relation_path(self_id, user_id)
-    gates = _gates_for_user(user_id, admin_qq, peer_bot_qq=peer_bot_qq)
+    gates = _gates_for_user(user_id, admin_qq, peer_bot_qq=peer_bot_qq, self_id=self_id)
 
     rel = UserRelation()
 
@@ -983,7 +1064,7 @@ def get_user_relation(
         return rel
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = _load_relation_data(path, self_id, user_id)
 
         # Affinity
         a = data.get("affinity", {})
@@ -1006,11 +1087,17 @@ def get_user_relation(
         rel.affinity.locked = gates.locked
         rel.affinity._clamp_with_gates(gates)
 
-        logger.debug(
-            "用户 %s: Affinity(Lv.%+d %s score=%.2f)",
-            user_id,
-            rel.affinity.level, rel.affinity.name, rel.affinity.score,
-        )
+        _log_key = (str(self_id), str(user_id))
+        _cur = (rel.affinity.level, rel.affinity.name, round(rel.affinity.score, 2))
+        if _LAST_LOGGED_AFFINITY.get(_log_key) != _cur:
+            _LAST_LOGGED_AFFINITY[_log_key] = _cur
+            if len(_LAST_LOGGED_AFFINITY) > 5000:
+                _LAST_LOGGED_AFFINITY.pop(next(iter(_LAST_LOGGED_AFFINITY)))
+            logger.debug(
+                "用户 %s: Affinity(Lv.%+d %s score=%.2f)",
+                user_id,
+                rel.affinity.level, rel.affinity.name, rel.affinity.score,
+            )
     except (json.JSONDecodeError, ValueError, KeyError) as e:
         logger.warning("用户 %s: 情感文件损坏，使用默认: %s", user_id, e)
 
@@ -1078,7 +1165,7 @@ def apply_to_user_affinity(
     if now is None:
         now = time.time()
 
-    gates = _gates_for_user(user_id, admin_qq, peer_bot_qq=peer_bot_qq)
+    gates = _gates_for_user(user_id, admin_qq, peer_bot_qq=peer_bot_qq, self_id=self_id)
 
     for evt in events:
         # 记录冷却时间

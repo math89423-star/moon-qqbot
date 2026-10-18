@@ -70,8 +70,7 @@ class WorldBookEntry:
     probability: float = 1.0       # 触发概率 0.0-1.0
     case_sensitive: bool = False   # 关键词是否区分大小写
 
-    # ── 约束 ──
-    inclusion_group: str = ""      # 同组内只激活一条 (随机选)
+    # ── 注入排序 ──
     priority: int = 0              # 排序优先级 (越高越靠前注入)
     scan_depth_override: int = 0   # 覆盖全局扫描深度 (0 = 使用默认)
 
@@ -129,7 +128,6 @@ def load_world_book(json_path: str | Path) -> list[WorldBookEntry]:
                 speaker_ids=raw.get("speaker_ids", []),
                 probability=raw.get("probability", 1.0),
                 case_sensitive=raw.get("case_sensitive", False),
-                inclusion_group=raw.get("inclusion_group", ""),
                 priority=raw.get("priority", 0),
                 scan_depth_override=raw.get("scan_depth_override", 0),
             )
@@ -260,9 +258,6 @@ class WorldBookBuffer:
         # 构建扫描文本: 最近 N 条消息内容
         scan_text = " ".join(self._recent_texts)
 
-        # 按 inclusion_group 去重: 同组只激活一条
-        activated_groups: set[str] = set()
-
         for entry in self.entries:
             eid = entry.id
 
@@ -279,7 +274,7 @@ class WorldBookBuffer:
                 # 始终激活 — 但也要检查 cooldown/delay
                 if not self._can_activate(entry, user_id):
                     continue
-                self._activate(entry, activated_groups)
+                self._activate(entry)
 
             elif entry.trigger == "keyword":
                 # 关键词匹配
@@ -289,7 +284,7 @@ class WorldBookBuffer:
                     continue
                 if not self._can_activate(entry, user_id):
                     continue
-                self._activate(entry, activated_groups)
+                self._activate(entry)
                 logger.debug("WB 关键词命中: %s → %s", entry.keys[:3], eid)
 
             elif entry.trigger == "vectorized":
@@ -297,7 +292,7 @@ class WorldBookBuffer:
                 # TODO: 接入 embedding 服务实现语义匹配
                 if not self._can_activate(entry, user_id):
                     continue
-                self._activate(entry, activated_groups)
+                self._activate(entry)
 
     def _can_activate(self, entry: WorldBookEntry, _user_id: str = "") -> bool:
         """检查条目是否可以激活 (cooldown / delay / probability)。"""
@@ -314,22 +309,8 @@ class WorldBookBuffer:
 
         return True
 
-    def _activate(
-        self,
-        entry: WorldBookEntry,
-        activated_groups: set[str],
-    ) -> None:
-        """激活条目: 加入 active + 设置 cooldown + 记录 inclusion_group。"""
-
-        # Inclusion group 约束: 同组只激活一条
-        if entry.inclusion_group:
-            if entry.inclusion_group in activated_groups:
-                logger.debug(
-                    "WB inclusion_group 冲突: %s (group=%s)",
-                    entry.id, entry.inclusion_group,
-                )
-                return
-            activated_groups.add(entry.inclusion_group)
+    def _activate(self, entry: WorldBookEntry) -> None:
+        """激活条目: 加入 active + 设置 cooldown。"""
 
         # 激活
         if entry.sticky > 0:

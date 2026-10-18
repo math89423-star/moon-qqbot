@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math as _math
 import re
+import sys
 import time
 
 from .heuristic_detector import HeuristicDetector
@@ -48,6 +49,42 @@ _CUMULATIVE_MAX_ENTRIES = 10      # 窗口内最多保留条数
 _CUMULATIVE_BLOCK_THRESHOLD = 18  # 窗口内累积评分 ≥ 此值 → 触发仲裁
 # 模块级状态: {f"{bot_id}:{user_id}": [(timestamp, score), ...]}
 _cumulative_scores: dict[str, list[tuple[float, int]]] = {}
+
+# ── NSFW Zone 放宽名单 (单一真相源: tavern/service/nsfw_zone.py) ──
+# 原则 38 (跨插件耦合用懒加载 + fallback): guards 不能顶层 import tavern
+# (tavern → guards 单向依赖，反向 import 即循环)。成功后缓存；失败不缓存、
+# 下次重试——应对插件加载顺序 (guards 先于 tavern 加载时首次拿不到)。
+# 仅放宽成人合意类；CSAM/暴力/解除伦理永不放宽 (不在名单 = 照常拦截，
+# 故无需 ALWAYS_BLOCK 名单，拦截是结构式保证)。
+_NSFw_RELAXED_FALLBACK: frozenset[str] = frozenset({
+    "safety:诱导性描写",
+    "safety:诱导脱衣",
+    "safety:露骨性词汇(英文)",
+    "safety:对bot性骚扰(中文)",
+    "safety:诱导成人角色设定",
+})
+_nsfw_relaxed_cache: frozenset[str] | None = None
+
+
+def _get_nsfw_relaxed() -> frozenset[str]:
+    """取 NSFW 放宽名单。真相源缺失时回退本地拷贝，绝不抛异常。"""
+    global _nsfw_relaxed_cache
+    if _nsfw_relaxed_cache is not None:
+        return _nsfw_relaxed_cache
+    mod = sys.modules.get("astrbot_plugin_suli_tavern.service.nsfw_zone")
+    if mod is not None:
+        labels = getattr(mod, "NSFW_RELAXED_LABELS", None)
+        if labels is not None:
+            _nsfw_relaxed_cache = frozenset(labels)
+            return _nsfw_relaxed_cache
+    try:
+        from astrbot_plugin_suli_tavern.service import nsfw_zone as _tavern_nsfw
+
+        _nsfw_relaxed_cache = frozenset(_tavern_nsfw.NSFW_RELAXED_LABELS)
+    except Exception:
+        return _NSFw_RELAXED_FALLBACK
+    return _nsfw_relaxed_cache
+
 
 # ── 消息字数动态缩放 ──────────────────────────
 # 警惕值随消息长度动态调整: 短消息命中可能是碰巧, 长消息命中更可疑。
@@ -167,6 +204,14 @@ def _load_unified_patterns() -> list[tuple[re.Pattern, str, int]]:
         (re.compile(r"\[(system|admin)\s*(internal|command)\]\s*:", re.IGNORECASE), "structure:伪造系统标签", 8),
         (re.compile(r"<\s*SYS\s*>|<\s*\/?\s*SYS\s*>", re.IGNORECASE), "structure:SYS标签伪造", 7),
         (re.compile(r"(BEGIN|END)\s+(SYSTEM|PROMPT|INSTRUCTIONS)", re.IGNORECASE), "structure:BEGIN PROMPT", 7),
+        # ── 自家标记伪造 (2026-10-12 审计): Gate/Main 把 [GateHint]/[AllowedIDs]/
+        # [ActiveTasks]/[OverdueTasks]/[Batch]/[Recent]/[触发者身份] 拼在同一 user 块，
+        # 用户可逐字伪造。注意 Guard 扫的是拼好的块，真标记本就出现一次，
+        # 故只认「同一标记出现两次」(真 + 伪造)，单次不算。
+        (re.compile(r"(\[(?:GateHint|AllowedIDs|ActiveTasks|OverdueTasks)\])[\s\S]*\1"),
+         "structure:自家Gate标记伪造", 6),
+        (re.compile(r"(\[触发者身份\])[\s\S]*\1"), "structure:自家身份行伪造", 6),
+        (re.compile(r"(\[(?:Batch\] trigger=|Recent)\])[\s\S]*\1"), "structure:自家上下文标记伪造", 5),
         # 编码/外链载荷
         (re.compile(r"data:[^;]+;base64,[A-Za-z0-9+/]{24,}={0,2}", re.IGNORECASE), "payload:Data URI Base64", 7),
         (re.compile(r"(curl|wget|powershell|bitsadmin|certutil)\s+.*https?://", re.IGNORECASE), "payload:命令行外链", 7),
@@ -214,12 +259,60 @@ class InjectionGuard:
 
     # bot 特定安全回复 — 从角色卡/identity 读取，运行时可扩展
     _SAFETY_REPLIES: dict[str, list[str]] = {}
+    _SAFETY_LOADED: bool = False
 
     _DEFAULT_SAFETY_REPLIES: list[str] = [
         "抱歉，这个请求我不能处理。",
         "…请换个方式说吧。",
         "这种话我不能回应。",
     ]
+
+    @staticmethod
+    def load_bot_safety_replies(force: bool = False) -> int:
+        """从角色卡回填 per-bot 安全拦截话术。
+
+        2026-10-12: 此前 `_SAFETY_REPLIES` 恒为空 dict, 所有硬线拦截都落到
+        `_DEFAULT_SAFETY_REPLIES` 的客服腔 ("抱歉, 这个请求我不能处理")——
+        角色卡里其实早就有「轮不到你。」这种现成口吻, 只是没人接。
+
+        跨插件依赖走懒加载 + fallback (原则 38): 拿不到角色卡就退回默认腔,
+        绝不因为话术问题影响拦截本身。
+
+        Returns:
+            成功回填的 bot 数。
+        """
+        if InjectionGuard._SAFETY_LOADED and not force:
+            return len(InjectionGuard._SAFETY_REPLIES)
+        InjectionGuard._SAFETY_LOADED = True
+        try:
+            from astrbot_plugin_suli_guards.dual_bot import get_known_bot_ids
+            from astrbot_plugin_suli_tavern.service.tavern_client import (
+                get_character_for_self_id,
+            )
+
+            _n = 0
+            for _bid in get_known_bot_ids():
+                try:
+                    _card = get_character_for_self_id(str(_bid)) or {}
+                    _raw = _card.get("safety_replies") or []
+                    _clean = [
+                        str(_x).strip() for _x in _raw if str(_x or "").strip()
+                    ]
+                    if _clean:
+                        InjectionGuard._SAFETY_REPLIES[str(_bid)] = _clean
+                        _n += 1
+                except Exception:
+                    continue
+            if _n:
+                logger.info(
+                    "InjectionGuard: 已回填 %d 个 bot 的角色化拦截话术", _n,
+                )
+            return _n
+        except Exception:
+            logger.debug(
+                "InjectionGuard: 角色化拦截话术回填失败 (改用默认腔)", exc_info=True,
+            )
+            return 0
 
     @staticmethod
     def _pick_safety_reply(bot_id: str = "", is_hardline: bool = False) -> str:
@@ -233,6 +326,7 @@ class InjectionGuard:
             个性化拒绝文本
         """
         import random
+        InjectionGuard.load_bot_safety_replies()
         pool = InjectionGuard._SAFETY_REPLIES.get(
             str(bot_id),
             InjectionGuard._DEFAULT_SAFETY_REPLIES,
@@ -246,6 +340,7 @@ class InjectionGuard:
         user_name: str = "",
         admin_qq: str | None = None,
         bot_id: str = "",
+        nsfw_zone: bool = False,
     ) -> InjectionVerdict:
         """对即将发送给 LLM 的消息进行注入检测。
 
@@ -257,15 +352,21 @@ class InjectionGuard:
             user_name: 触发用户名 (保留, 未使用)
             admin_qq: 管理员 QQ (豁免)
             bot_id: 当前 bot QQ (per-bot 累积评分隔离)
+            nsfw_zone: 是否处于 NSFW 隔离区。True 时放宽成人合意类
+                weight=9 标签, CSAM/暴力/解除伦理永不放宽。
 
         Returns:
             InjectionVerdict
         """
         t0 = time.time()
 
+        # ── NSFW Zone 放宽名单 (真相源见本文件顶部 _get_nsfw_relaxed) ──
+        _nsfw_relaxed = _get_nsfw_relaxed()
+
+        def _is_nsfw_relaxed(_name: str) -> bool:
+            return bool(nsfw_zone) and _name in _nsfw_relaxed
+
         # ── 管理员豁免 ──
-        # 注意: 管理员豁免不覆盖 safety 硬线。D4 儿童安全硬线对任何人 (含管理员) 不豁免——
-        # 管理员账号同样可能被盗 (刚发生过 key 盗用事件), 硬线开口子就不再是硬线。
         # 先扫描 safety 模式, 命中则无视 admin 身份直接拦截。
         if admin_qq and user_id and str(user_id) == str(admin_qq):
             # 快速 safety 预扫描: 仅检查用户消息中是否有 safety 硬线命中
@@ -276,6 +377,8 @@ class InjectionGuard:
             ][:5]
             for _pat, _name, _weight in _UNIFIED_PATTERNS:
                 if _name.startswith("safety:") and _weight >= _SAFETY_IMMEDIATE_BLOCK:
+                    if _is_nsfw_relaxed(_name):
+                        continue
                     for _msg in _admin_user_msgs:
                         if _pat.search(_msg):
                             logger.warning(
@@ -289,7 +392,6 @@ class InjectionGuard:
                         continue
                     break
             else:
-                # 无 safety 命中 → admin 正常豁免
                 return InjectionVerdict()
 
         # ── 提取最近用户消息 (最多 5 条, 每条截断 500 字符) ──
@@ -313,9 +415,11 @@ class InjectionGuard:
         total_score = 0
         matched: list[str] = []
         has_safety_immediate = False
-        safety_hits: list[str] = []  # D4 硬线: 唯一保留即时拦截的类别
+        safety_hits: list[str] = []
 
         for pattern, name, weight in _UNIFIED_PATTERNS:
+            if _is_nsfw_relaxed(name):
+                continue
             for msg in user_msgs:
                 if pattern.search(msg):
                     # 消息字数动态缩放警惕值: 短消息碰巧命中 → 低贡献, 长消息命中 → 高贡献

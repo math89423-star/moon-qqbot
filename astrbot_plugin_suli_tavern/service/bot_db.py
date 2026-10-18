@@ -15,9 +15,11 @@ import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +27,30 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DB_DIR = _PROJECT_ROOT / "AstrBot" / "data"
 DB_PATH = DB_DIR / "shared_db" / "none_qqbot.db"
 
+# ── 知识库索引 MySQL 后端 (2026-08-25: knowledge_sections 迁共享 MySQL) ──
+# env 齐备且 MySQL 表非空时启用; 否则自动回退 SQLite (面板知识库页不受影响)
+KB_MYSQL_HOST = os.environ.get("KNOWLEDGE_MYSQL_HOST", "mysql")
+KB_MYSQL_PORT = int(os.environ.get("KNOWLEDGE_MYSQL_PORT", "3306"))
+KB_MYSQL_DB = os.environ.get("KNOWLEDGE_MYSQL_DB", "qqbot")
+KB_MYSQL_USER = os.environ.get("KNOWLEDGE_MYSQL_USER", "qqbot")
+KB_MYSQL_PASSWORD = os.environ.get("KNOWLEDGE_MYSQL_PASSWORD", "")
+
 # ── Provider 分组 — 与 L-Port llm_config_service.py 一致 ──
 VLM_PROVIDERS = frozenset({"gpt4v", "claude", "gemini", "nano_banana", "llama"})
 LOCAL_PROVIDERS = frozenset({"llama", "ollama"})
 
-# 默认主 bot QQ 号，从环境变量读取（所有模块应统一走 BotIdentityService）
-DEFAULT_BOT = os.environ.get("BOT_QQ_MAIN", "")
+
+def _default_bot_id() -> str:
+    """历史数据归属兜底：BOT_QQ_MAIN > BOT_ID_MAIN > BOT_QQ_ALT > BOT_ID_ALT。
+
+    身份真相源为环境变量 (.env)，本函数不含任何 QQ 号明文。
+    缺省返回空串 (fail-closed：不伪造归属)。
+    """
+    for key in ("BOT_QQ_MAIN", "BOT_ID_MAIN", "BOT_QQ_ALT", "BOT_ID_ALT"):
+        val = (os.environ.get(key, "") or "").strip()
+        if val:
+            return val
+    return ""
 
 
 @dataclass
@@ -48,6 +68,7 @@ class LLMConfigRO:
     vlm_resize_max_dim: int | None
     token_budget_cap: int | None
     config_type: str = ""  # 显式类型: ""=自动, "llm"=强制LLM, "vlm"=强制VLM
+    context_window: int | None = None  # 上下文窗口 (tokens), 面板自动填充
 
     @property
     def is_vlm(self) -> bool:
@@ -71,12 +92,18 @@ class LLMConfigRO:
         """规范化 base_url: 保证以 /v1 结尾, 适配 OpenAI 兼容客户端。
 
         与 L-Port llm_service.py:422-431 逻辑一致。
+        例外: Muse Spark 存 …/go/v1/responses 全路径 (面板自动切换),
+        /responses 是完整 endpoint, 只规范化其前缀, 后缀原样保留。
         """
         url = self.base_url.strip().rstrip("/")
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         if url.endswith("/chat/completions"):
             url = url.replace("/chat/completions", "")
+        if "/responses" in url:
+            head, _, _tail = url.partition("/responses")
+            head = head.removesuffix("/v1").rstrip("/") + "/v1"
+            return head + "/responses"
         url = url.removesuffix("/v1")
         return url.rstrip("/") + "/v1"
 
@@ -154,6 +181,36 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_bot_id
 ON token_usage(bot_id, timestamp)
 """
 
+# 注意力保持落盘 (2026-09-27): AttentionSlot + 对话线程重启不失忆。
+# manager 按 (bot_id, group_id) 整键 REPLACE；threads 按三元主键 UPSERT。
+_TABLE_ATTENTION_SLOTS = """
+CREATE TABLE IF NOT EXISTS attention_slots (
+    bot_id          TEXT NOT NULL,
+    group_id        INTEGER NOT NULL,
+    topic_anchor    TEXT NOT NULL DEFAULT '',
+    participants    TEXT NOT NULL DEFAULT '[]',
+    energy          REAL NOT NULL DEFAULT 0,
+    created_at      REAL NOT NULL DEFAULT 0,
+    last_heated_at  REAL NOT NULL DEFAULT 0,
+    anchor_messages TEXT NOT NULL DEFAULT '[]',
+    thread_summary  TEXT NOT NULL DEFAULT '',
+    state           TEXT NOT NULL DEFAULT 'active',
+    updated_at      REAL NOT NULL,
+    PRIMARY KEY (bot_id, group_id, topic_anchor)
+)
+"""
+
+_TABLE_CONVERSATION_THREADS = """
+CREATE TABLE IF NOT EXISTS conversation_threads (
+    bot_id      TEXT NOT NULL,
+    group_id    INTEGER NOT NULL,
+    user_id     TEXT NOT NULL,
+    thread_json TEXT NOT NULL DEFAULT '{}',
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (bot_id, group_id, user_id)
+)
+"""
+
 _TABLE_LLM_CONFIG = """
 CREATE TABLE IF NOT EXISTS llm_config (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +223,7 @@ CREATE TABLE IF NOT EXISTS llm_config (
     is_active          INTEGER NOT NULL DEFAULT 0,
     vlm_resize_max_dim INTEGER,
     token_budget_cap   INTEGER,
+    context_window     INTEGER,
     created_at         REAL NOT NULL,
     updated_at         REAL NOT NULL
 )
@@ -174,6 +232,10 @@ CREATE TABLE IF NOT EXISTS llm_config (
 
 _MIGRATE_LLM_CONFIG_TYPE = """
 ALTER TABLE llm_config ADD COLUMN config_type TEXT NOT NULL DEFAULT ''
+"""
+
+_MIGRATE_LLM_CONFIG_CTX = """
+ALTER TABLE llm_config ADD COLUMN context_window INTEGER
 """
 
 _TABLE_SUSPECTED_BOTS = """
@@ -224,8 +286,14 @@ CREATE TABLE IF NOT EXISTS group_summaries (
     summary_text TEXT NOT NULL,
     message_range_start INTEGER,
     message_range_end INTEGER,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    bot_id TEXT NOT NULL DEFAULT ''
 )
+"""
+
+# 2026-09-08: 摘要存储 per-bot 隔离（此前同群摘要跨 bot 互读/互覆盖）。
+_MIGRATE_SUMMARY_BOT_ID = """
+ALTER TABLE group_summaries ADD COLUMN bot_id TEXT NOT NULL DEFAULT ''
 """
 
 _IDX_GROUP_SUMMARIES = """
@@ -324,6 +392,10 @@ class BotDatabase:
     def __init__(self, db_path: Path | None = None):
         self._path = db_path or DB_PATH
         self._conn: sqlite3.Connection | None = None
+        # 知识库 MySQL 后端状态 (懒连接 + 失败标记 + 线程锁)
+        self._kb_my: Any | None = None
+        self._kb_my_failed = False
+        self._kb_my_lock = threading.Lock()
 
     # ── 连接管理 ──────────────────────────────────────────
 
@@ -351,8 +423,8 @@ class BotDatabase:
         self._migrate_bot_id_column()    # 2026-06-30: per-bot 记忆隔离
         self._migratejson_memories()
         self._migrate_knowledge_base()
-        self._migrate_llm_configs()
-        self._sync_astrbot_providers()
+        # 前端 6190 是 LLM/VLM 唯一真相源: 禁止从 L-Port / AstrBot 读取配置
+        # _migrate_llm_configs / _sync_astrbot_providers 已剔除 (原 L-Port / cmd_config.json 读取路径)
 
         logger.info(
             "BotDatabase 就绪: %s (%.1f KB)",
@@ -375,8 +447,10 @@ class BotDatabase:
             _TABLE_TOKEN_USAGE,
             _TABLE_LLM_CONFIG,
             _MIGRATE_LLM_CONFIG_TYPE,
+            _MIGRATE_LLM_CONFIG_CTX,
             _TABLE_SUSPECTED_BOTS,
             _TABLE_GROUP_SUMMARIES,
+            _MIGRATE_SUMMARY_BOT_ID,
             _TABLE_BOT_EXPERIENCES,
             _IDX_MEM_USER,
             _IDX_MEM_CATEGORY,
@@ -393,6 +467,8 @@ class BotDatabase:
             _IDX_BOT_COORDINATION_TOKEN,
             _TABLE_BOT_IDENTITY,
             _TABLE_BOT_IDENTITY_META,
+            _TABLE_ATTENTION_SLOTS,
+            _TABLE_CONVERSATION_THREADS,
         ]:
             try:
                 self.conn.execute(stmt)
@@ -454,7 +530,7 @@ class BotDatabase:
         except Exception:
             pass
 
-        main_bot = known_bots[0] if known_bots else DEFAULT_BOT
+        main_bot = known_bots[0] if known_bots else _default_bot_id()
 
         # 现有数据默认归入主 bot
         self.conn.execute(
@@ -593,13 +669,11 @@ class BotDatabase:
         self.conn.commit()
         logger.info("知识库迁移完成: %d 章节 → SQLite", len(kb._sections))
 
-    # ── L-Port → Bot LLM 配置迁移 ───────────────────────────
-
+    # ── L-Port → Bot LLM 配置迁移 — 已剔除 (前端唯一真相源) ──
     def _migrate_llm_configs(self) -> None:
-        """将 L-Port llm_config 表一次性迁移到 bot 自己的 llm_config 表。
+        """已禁用: 前端 6190 是 LLM/VLM 唯一真相源，禁止从 L-Port DB 读取。
 
-        仅在 bot 的 llm_config 表为空且 L-Port DB 存在时执行。
-        迁移后标记 _MIGRATED_LLM_KEY = "done"。
+        保留方法体仅为向后兼容 — 标记迁移完成避免重复触发。
         """
         row = self.conn.execute(
             "SELECT value FROM bot_config WHERE key = ?",
@@ -607,240 +681,20 @@ class BotDatabase:
         ).fetchone()
         if row and row["value"] == "done":
             return
-
-        # 检查是否已有配置 (可能是手动添加的)
-        existing = self.conn.execute(
-            "SELECT COUNT(*) AS cnt FROM llm_config",
-        ).fetchone()
-        if existing and existing["cnt"] > 0:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        # 尝试从 L-Port 迁移
-        lport_db = os.getenv(
-            "LPORT_DB_PATH",
-            "/mnt/d/L-Port-Comfy/app/backend/instance/lport_desktop.db",
-        )
-        if not os.path.exists(lport_db):
-            logger.info("L-Port DB 不存在 (%s)，跳过 LLM 配置迁移", lport_db)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        try:
-            from ...astrbot_plugin_suli_bridge.config_reader import LPortConfigReader
-            reader = LPortConfigReader(lport_db)
-            lport_configs = reader.list_all()
-        except Exception:
-            logger.warning("无法从 L-Port 读取配置，跳过迁移", exc_info=True)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        if not lport_configs:
-            logger.info("L-Port 无 LLM 配置，跳过迁移")
-            self.conn.execute(
-                "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
-                (_MIGRATED_LLM_KEY, time.time()),
-            )
-            self.conn.commit()
-            return
-
-        # 建立 old_id → new_id 映射
-        old_to_new: dict[int, int] = {}
-        now = time.time()
-        migrated = 0
-
-        for cfg in lport_configs:
-            cur = self.conn.execute(
-                "INSERT INTO llm_config "
-                "(name, provider, provider_name, api_key, base_url, model_name, "
-                " is_active, vlm_resize_max_dim, token_budget_cap, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    cfg.name, cfg.provider, cfg.provider_name,
-                    cfg.api_key, cfg.base_url, cfg.model_name,
-                    int(cfg.is_active),
-                    cfg.vlm_resize_max_dim, cfg.token_budget_cap,
-                    now, now,
-                ),
-            )
-            old_to_new[cfg.id] = cur.lastrowid
-            migrated += 1
-
-        # 同步 active_llm_id / active_vlm_id
-        active_llm_id = self.get_config("active_llm_id", "")
-        if active_llm_id:
-            old_id = int(active_llm_id)
-            if old_id in old_to_new:
-                self.set_config("active_llm_id", str(old_to_new[old_id]))
-                active_llm_id = str(old_to_new[old_id])
-            else:
-                active_llm_id = ""
-
-        active_vlm_id = self.get_config("active_vlm_id", "")
-        if active_vlm_id:
-            old_id = int(active_vlm_id)
-            if old_id in old_to_new:
-                self.set_config("active_vlm_id", str(old_to_new[old_id]))
-                active_vlm_id = str(old_to_new[old_id])
-            else:
-                active_vlm_id = ""
-
-        # 回退: 若 active_llm_id 仍为空, 自动选首个 LLM
-        if not active_llm_id:
-            all_configs = self.list_llm_configs()
-            for c in all_configs:
-                if c.is_llm and c.is_active:
-                    self.set_config("active_llm_id", str(c.id))
-                    logger.info("自动选择活跃 LLM (is_active): id=%d name=%s", c.id, c.name)
-                    break
-            else:
-                for c in all_configs:
-                    if c.is_llm:
-                        self.set_config("active_llm_id", str(c.id))
-                        logger.info("自动选择活跃 LLM (首个): id=%d name=%s", c.id, c.name)
-                        break
-
-        # 标记迁移完成
         self.conn.execute(
             "INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?, 'done', ?)",
             (_MIGRATED_LLM_KEY, time.time()),
         )
         self.conn.commit()
-        logger.info(
-            "LLM 配置迁移完成: %d 条配置 ← L-Port (%s)",
-            migrated, lport_db,
-        )
+        logger.info("LLM 迁移已禁用: 前端 6190 为唯一真相源，跳过 L-Port 读取")
 
     def _sync_astrbot_providers(self) -> None:
-        """将 AstrBot 注册的 provider 同步到 llm_config 表。
+        """已禁用: 前端 6190 是 LLM/VLM 唯一真相源，禁止从 AstrBot cmd_config.json 读取。
 
-        每次启动运行，幂等：按 provider + model_name 去重。
-        这样 WebUI 配置面板可以直接列出 AstrBot 中配置的模型。
+        保留方法仅为向后兼容 — 直接返回，不做任何同步。
         """
-        cmd_config_path = str(DB_DIR / "cmd_config.json")
-        if not os.path.exists(cmd_config_path):
-            logger.info("AstrBot cmd_config.json 不存在，跳过 provider 同步")
-            return
-
-        try:
-            with open(cmd_config_path, encoding="utf-8-sig") as f:
-                cfg = json.load(f)
-        except Exception:
-            logger.warning("无法读取 AstrBot cmd_config.json", exc_info=True)
-            return
-
-        provider_entries = cfg.get("provider", [])
-        if not provider_entries:
-            logger.info("AstrBot provider 列表为空，跳过同步")
-            return
-
-        # 构建 source 查找表: provider_source_id → {key, api_base}
-        source_map: dict[str, dict] = {}
-        for src in cfg.get("provider_sources", []):
-            sid = src.get("id") or src.get("provider", "")
-            if sid and src.get("key"):
-                source_map[str(sid)] = src
-
-        # 已删除的 provider 集合 (用户明确删除的，不再同步)
-        deleted_raw = self.get_config(_DELETED_PROVIDERS_KEY, "[]")
-        deleted_providers: set[str] = set()
-        try:
-            deleted_list = json.loads(deleted_raw)
-            if isinstance(deleted_list, list):
-                deleted_providers = set(deleted_list)
-        except Exception:
-            pass
-
-        # 已有配置的 (provider, model_name, config_type) 集合，用于去重。
-        # config_type 必须包含在内: 同一 provider+model 可能同时有 LLM 和 VLM 两条，
-        # 只用 (provider, model_name) 会导致 VLM 条目每次重启都被重复插入。
-        existing = set()
-        for row in self.conn.execute(
-            "SELECT provider, model_name, config_type FROM llm_config"
-        ).fetchall():
-            existing.add((row["provider"], row["model_name"], row["config_type"]))
-
-        now = time.time()
-        synced = 0
-
-        for prov in provider_entries:
-            if not prov.get("enable", True):
-                continue
-
-            # provider 条目: id="deepseek/deepseek-v4-flash", model="deepseek-v4-flash"
-            provider_id = str(prov.get("id") or "")
-            model_name = str(prov.get("model") or "")
-            provider_source_id = str(prov.get("provider_source_id") or "")
-            modalities = prov.get("modalities", [])
-            if not provider_id or not model_name:
-                continue
-
-            # 从 source 获取凭证
-            source = source_map.get(provider_source_id, {})
-            _key_raw = source.get("key", "")
-            if isinstance(_key_raw, list):
-                _key_raw = _key_raw[0] if _key_raw else ""
-            api_key = str(_key_raw).strip()
-            api_base = str(source.get("api_base", ""))
-            if not api_key or not api_base:
-                logger.debug("跳过无凭证的 provider: %s (source=%s)", provider_id, provider_source_id)
-                continue
-
-            # provider_name: 用 provider_source_id (deepseek/openai/anthropic)
-            provider_name = provider_source_id
-
-            # ── LLM 条目 (所有 text-capable provider) ──
-            llm_key = (provider_id, model_name, "llm")
-            llm_deleted_key = f"{provider_id}|{model_name}"
-            if llm_key not in existing and llm_deleted_key not in deleted_providers:
-                self.conn.execute(
-                    "INSERT INTO llm_config "
-                    "(name, provider, provider_name, api_key, base_url, model_name, "
-                    " is_active, config_type, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 1, 'llm', ?, ?)",
-                    (f"{provider_id}/{model_name}", provider_id, provider_name,
-                     api_key, api_base, model_name, now, now),
-                )
-                existing.add(llm_key)
-                synced += 1
-
-            # ── VLM 条目 (image-capable provider) ──
-            if "image" in modalities:
-                vlm_key = (provider_id, model_name, "vlm")
-                vlm_deleted_key = f"{provider_id}|{model_name}_vlm"
-                if vlm_key not in existing and vlm_deleted_key not in deleted_providers:
-                    self.conn.execute(
-                        "INSERT INTO llm_config "
-                        "(name, provider, provider_name, api_key, base_url, model_name, "
-                        " is_active, config_type, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 1, 'vlm', ?, ?)",
-                        (f"{provider_id}/{model_name}(VLM)", provider_id, provider_name,
-                         api_key, api_base, model_name, now, now),
-                    )
-                    existing.add(vlm_key)
-                    synced += 1
-
-        if synced:
-            self.conn.commit()
-            logger.info("从 AstrBot provider 同步了 %d 条 LLM/VLM 配置", synced)
-
-        # 修复历史 bug: 之前 VLM 条目 model_name 与 LLM 相同，导致
-        # (provider, model_name) 去重 key 冲突，每次重启都会插入重复 VLM。
-        # 清理策略: 每组 (provider, model_name, config_type='vlm') 只保留
-        # 最低 ID 的条目，更新槽位引用，删除其余。
-        self._dedup_vlm_entries()
+        logger.info("AstrBot provider 同步已禁用: 前端 6190 为唯一真相源")
+        return
 
     def _dedup_vlm_entries(self) -> None:
         """删除重复的 VLM 条目（同一 provider+model_name 只保留最早的一条）。
@@ -1066,47 +920,150 @@ class BotDatabase:
 
     # ── 知识库 ────────────────────────────────────────────
 
+    # ── 知识库 MySQL 后端 ─────────────────────────────────
+
+    def _kb_sqlite_fallback(self, sql: str, args: tuple) -> list[dict] | None:
+        """SQLite 回退查询。2026-08-25 起 knowledge_sections 表已从 SQLite 删除,
+        此路径仅在 MySQL 不可用且旧库未清理时有效; 表不存在返回 []。"""
+        try:
+            rows = self.conn.execute(sql, args).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError as e:
+            logger.warning("知识库 SQLite 回退查询失败 (%s), 返回空结果", e)
+            return []
+
+    def _kb_mysql(self):
+        """知识库 MySQL 连接 (懒加载, 线程锁保护)。
+
+        启用条件: env 配置齐备 + pymysql 可导入 + 表存在且非空。
+        任一不满足 → 返回 None (调用方回退 SQLite), 连接失败永久标记。
+        """
+        if self._kb_my is not None:
+            return self._kb_my
+        if self._kb_my_failed:
+            return None
+        with self._kb_my_lock:
+            if self._kb_my is not None or self._kb_my_failed:
+                return self._kb_my
+            if not KB_MYSQL_PASSWORD:
+                self._kb_my_failed = True
+                logger.info("KNOWLEDGE_MYSQL_PASSWORD 未配置, 知识库索引走 SQLite")
+                return None
+            empty = False
+            conn = None
+            try:
+                import pymysql
+
+                conn = pymysql.connect(
+                    host=KB_MYSQL_HOST, port=KB_MYSQL_PORT,
+                    user=KB_MYSQL_USER, password=KB_MYSQL_PASSWORD,
+                    database=KB_MYSQL_DB, charset="utf8mb4",
+                    autocommit=True, connect_timeout=5,
+                    cursorclass=pymysql.cursors.DictCursor,
+                )
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS cnt FROM knowledge_sections")
+                    row = cur.fetchone()
+                    empty = row is None or row["cnt"] == 0
+            except Exception as e:  # BLE001 — 连接失败必须回退不能崩
+                self._kb_my_failed = True
+                logger.warning("知识库 MySQL 连接失败 (%s), 回退 SQLite", e)
+                return None
+            if empty:
+                if conn is not None:
+                    conn.close()
+                self._kb_my_failed = True
+                logger.info("MySQL knowledge_sections 为空 (迁移未执行?), 知识库索引走 SQLite")
+                return None
+            self._kb_my = conn
+            logger.info(
+                "知识库索引已切换 MySQL 后端: %s:%s/%s",
+                KB_MYSQL_HOST, KB_MYSQL_PORT, KB_MYSQL_DB,
+            )
+            return conn
+
+    def _kb_mysql_query(
+        self, sql: str, args: tuple, *, one: bool = False,
+    ) -> list[dict[str, Any]] | None:
+        """MySQL 查询, 结果规范化为 list[dict]; 失败返回 None (调用方回退 SQLite)。"""
+        conn = self._kb_mysql()
+        if conn is None:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                if one:
+                    fetched = cur.fetchone()
+                    return [dict(fetched)] if fetched else []
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:  # BLE001 — 单次查询失败回退 SQLite
+            logger.warning("知识库 MySQL 查询失败 (%s), 本次回退 SQLite", e)
+            return None
+
     def get_knowledge_sections(
         self, source: str = "", page: int = 1, per_page: int = 50,
     ) -> tuple[list[dict], int]:
         """分页获取知识库章节。source 为空则返回全部。"""
         offset = (page - 1) * per_page
-        if source:
-            total_row = self.conn.execute(
-                "SELECT COUNT(*) AS cnt FROM knowledge_sections WHERE source = ?",
-                (source,),
-            ).fetchone()
-            total = total_row["cnt"] if total_row else 0
-            rows = self.conn.execute(
-                "SELECT id, title, source, updated_at FROM knowledge_sections "
-                "WHERE source = ? ORDER BY id LIMIT ? OFFSET ?",
-                (source, per_page, offset),
-            ).fetchall()
-        else:
-            total_row = self.conn.execute(
-                "SELECT COUNT(*) AS cnt FROM knowledge_sections",
-            ).fetchone()
-            total = total_row["cnt"] if total_row else 0
-            rows = self.conn.execute(
-                "SELECT id, title, source, updated_at FROM knowledge_sections "
-                "ORDER BY id LIMIT ? OFFSET ?",
-                (per_page, offset),
-            ).fetchall()
-        return ([dict(r) for r in rows], total)
+        count_sql = (
+            "SELECT COUNT(*) AS cnt FROM knowledge_sections WHERE source = %s"
+            if source
+            else "SELECT COUNT(*) AS cnt FROM knowledge_sections"
+        )
+        count_args: tuple = (source,) if source else ()
+        page_sql = (
+            "SELECT id, title, source, updated_at FROM knowledge_sections "
+            "WHERE source = %s ORDER BY id LIMIT %s OFFSET %s"
+            if source
+            else "SELECT id, title, source, updated_at FROM knowledge_sections "
+            "ORDER BY id LIMIT %s OFFSET %s"
+        )
+        page_args: tuple = (
+            (source, per_page, offset) if source else (per_page, offset)
+        )
+        count_rows = self._kb_mysql_query(count_sql, count_args, one=True)
+        if count_rows:
+            rows = self._kb_mysql_query(page_sql, page_args)
+            if rows is not None:
+                return (rows, int(count_rows[0]["cnt"]))
+            # 计数成功但取页失败 → 继续走 SQLite 全流程
+        where, args1 = ("WHERE source = ?", (source,)) if source else ("", ())
+        count_rows = self._kb_sqlite_fallback(
+            f"SELECT COUNT(*) AS cnt FROM knowledge_sections {where}", args1,
+        )
+        total = count_rows[0]["cnt"] if count_rows else 0
+        rows = self._kb_sqlite_fallback(
+            "SELECT id, title, source, updated_at FROM knowledge_sections "
+            f"{where} ORDER BY id LIMIT ? OFFSET ?",
+            (*args1, per_page, offset),
+        )
+        return (rows or [], total)
 
     def get_knowledge_section(self, section_id: int) -> dict | None:
         """获取单个知识库章节全文。"""
-        row = self.conn.execute(
+        rows = self._kb_mysql_query(
+            "SELECT * FROM knowledge_sections WHERE id = %s", (section_id,), one=True,
+        )
+        if rows:
+            return rows[0]
+        if rows is not None:
+            return None  # MySQL 正常返回但无此 id — 数据已全量迁移, 视为不存在
+        rows = self._kb_sqlite_fallback(
             "SELECT * FROM knowledge_sections WHERE id = ?", (section_id,),
-        ).fetchone()
-        return dict(row) if row else None
+        )
+        return rows[0] if rows else None
 
     def get_knowledge_sources(self) -> list[str]:
         """获取知识库来源文件列表。"""
-        rows = self.conn.execute(
-            "SELECT DISTINCT source FROM knowledge_sections ORDER BY source",
-        ).fetchall()
-        return [r["source"] for r in rows]
+        rows = self._kb_mysql_query(
+            "SELECT DISTINCT source FROM knowledge_sections ORDER BY source", (),
+        )
+        if rows is not None:
+            return [r["source"] for r in rows]
+        rows = self._kb_sqlite_fallback(
+            "SELECT DISTINCT source FROM knowledge_sections ORDER BY source", (),
+        )
+        return [r["source"] for r in rows or []]
 
     # ── LLM 配置 CRUD ─────────────────────────────────────
 
@@ -1124,6 +1081,7 @@ class BotDatabase:
             vlm_resize_max_dim=row["vlm_resize_max_dim"],
             token_budget_cap=row["token_budget_cap"],
             config_type=row["config_type"] or "",
+            context_window=row["context_window"] if "context_window" in row.keys() else None,
         )
 
     def list_llm_configs(self) -> list[LLMConfigRO]:
@@ -1243,18 +1201,20 @@ class BotDatabase:
         vlm_resize_max_dim: int | None = None,
         token_budget_cap: int | None = None,
         config_type: str = "",
+        context_window: int | None = None,
     ) -> int:
         """新增 LLM 配置。返回新 ID。会自动同步到 cmd_config.json。"""
         now = time.time()
         cur = self.conn.execute(
             "INSERT INTO llm_config "
             "(name, provider, provider_name, api_key, base_url, model_name, "
-            " is_active, vlm_resize_max_dim, token_budget_cap, config_type, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " is_active, vlm_resize_max_dim, token_budget_cap, config_type, "
+            " context_window, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name, provider, provider_name, api_key, base_url, model_name,
                 int(is_active), vlm_resize_max_dim, token_budget_cap, config_type,
-                now, now,
+                context_window, now, now,
             ),
         )
         self.conn.commit()
@@ -1269,7 +1229,7 @@ class BotDatabase:
         allowed = {
             "name", "provider", "provider_name", "api_key", "base_url",
             "model_name", "is_active", "vlm_resize_max_dim", "token_budget_cap",
-            "config_type",
+            "config_type", "context_window",
         }
         updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
         if not updates:
@@ -1692,10 +1652,10 @@ class BotDatabase:
                 if isinstance(old_data, dict) and not isinstance(
                     next(iter(old_data.values()), None), dict
                 ):
-                    # 旧格式 → per-bot (主 bot 名下)
+                    # 旧格式 → per-bot (默认 bot 名下)
                     old_data = {
-                        DEFAULT_BOT: {str(k): v for k, v in old_data.items()
-                                       if v in ("basic", "full")}
+                        _default_bot_id(): {str(k): v for k, v in old_data.items()
+                                        if v in ("basic", "full")}
                     }
                 self._WHITELIST_PATH.write_text(
                     json.dumps(old_data, ensure_ascii=False, indent=2),
@@ -1709,23 +1669,23 @@ class BotDatabase:
                 self._WHITELIST_PATH.read_text(encoding="utf-8")
             )
             if isinstance(data, list):
-                # 旧格式: [123, 456] → 全部迁移为 Loput basic
+                # 旧格式: [123, 456] → 全部迁移为默认 bot basic
                 migrated = {str(g): "basic" for g in data}
-                logger.info("白名单旧格式(list)→迁移到 Loput: %d 个群", len(data))
-                return {DEFAULT_BOT: migrated}
+                logger.info("白名单旧格式(list)→迁移到默认 bot: %d 个群", len(data))
+                return {_default_bot_id(): migrated}
             if not isinstance(data, dict):
                 return {}
             # 判断是否已为 per-bot 嵌套格式: 值是 dict → 新格式
             sample_val = next(iter(data.values()), None)
             if isinstance(sample_val, dict):
                 return data  # 已是 per-bot 格式
-            # 旧格式: {group_id: tier} → 包装为 Loput
+            # 旧格式: {group_id: tier} → 包装为默认 bot
             migrated = {
                 int(k): v for k, v in data.items()
                 if v in ("basic", "full")
             }
-            logger.info("白名单旧格式(dict)→迁移到 Loput: %d 个群", len(migrated))
-            return {DEFAULT_BOT: {str(k): v for k, v in migrated.items()}}
+            logger.info("白名单旧格式(dict)→迁移到默认 bot: %d 个群", len(migrated))
+            return {_default_bot_id(): {str(k): v for k, v in migrated.items()}}
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.warning("白名单文件损坏，返回空列表", exc_info=True)
             return {}
@@ -1777,11 +1737,11 @@ class BotDatabase:
     ) -> None:
         """添加/更新 per-bot 群聊白名单条目并持久化。
 
-        bot_id 为空时默认写入 DEFAULT_BOT (来自环境变量 BOT_QQ_MAIN)。
+        bot_id 为空时默认写入环境变量默认 bot (_default_bot_id)。
         """
         if tier not in ("basic", "full"):
             raise ValueError(f"无效的对话等级: {tier} (仅支持 basic/full)")
-        bot_id = str(bot_id) if bot_id else DEFAULT_BOT
+        bot_id = str(bot_id) if bot_id else _default_bot_id()
         raw = self._read_whitelist_raw()
         raw.setdefault(bot_id, {})[str(group_id)] = tier
         self._write_whitelist_raw(raw)
@@ -1790,9 +1750,9 @@ class BotDatabase:
     def remove_whitelist_entry(self, group_id: int, bot_id: str = "") -> bool:
         """从 per-bot 白名单移除一个群。返回是否成功删除。
 
-        bot_id 为空时默认从 DEFAULT_BOT (来自环境变量 BOT_QQ_MAIN) 移除。
+        bot_id 为空时默认从环境变量默认 bot (_default_bot_id) 移除。
         """
-        bot_id = str(bot_id) if bot_id else DEFAULT_BOT
+        bot_id = str(bot_id) if bot_id else _default_bot_id()
         raw = self._read_whitelist_raw()
         bot_entries = raw.get(bot_id, {})
         gid_key = str(group_id)
@@ -1924,40 +1884,62 @@ class BotDatabase:
 
     # ── 群聊总结 ──────────────────────────────────────────
 
-    def get_latest_group_summary(self, group_id: int) -> dict | None:
-        """获取某群最新一条总结。"""
+    def get_latest_group_summary(self, group_id: int, bot_id: str = "") -> dict | None:
+        """获取某群最新一条总结。bot_id 非空时只取该 bot 的（per-bot 隔离）。"""
         try:
-            row = self.conn.execute(
-                "SELECT * FROM group_summaries WHERE group_id = ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (group_id,),
-            ).fetchone()
+            if bot_id:
+                row = self.conn.execute(
+                    "SELECT * FROM group_summaries WHERE group_id = ? AND bot_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (group_id, str(bot_id)),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT * FROM group_summaries WHERE group_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (group_id,),
+                ).fetchone()
             return dict(row) if row else None
         except Exception:
             return None
 
     def get_group_summary_history(
-        self, group_id: int, limit: int = 20,
+        self, group_id: int, limit: int = 20, bot_id: str = "",
     ) -> list[dict]:
-        """获取某群历史总结列表 (最新在前)。"""
+        """获取某群历史总结列表 (最新在前)。bot_id 非空时只取该 bot 的。"""
         try:
-            rows = self.conn.execute(
-                "SELECT * FROM group_summaries WHERE group_id = ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (group_id, limit),
-            ).fetchall()
+            if bot_id:
+                rows = self.conn.execute(
+                    "SELECT * FROM group_summaries WHERE group_id = ? AND bot_id = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (group_id, str(bot_id), limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM group_summaries WHERE group_id = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (group_id, limit),
+                ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
             return []
 
-    def get_summary_groups(self) -> list[dict]:
-        """获取所有有总结的群 (去重)。"""
+    def get_summary_groups(self, bot_id: str = "") -> list[dict]:
+        """获取所有有总结的群 (去重)。bot_id 非空时只取该 bot 的。"""
         try:
-            rows = self.conn.execute(
-                "SELECT DISTINCT group_id, MAX(created_at) as latest_summary "
-                "FROM group_summaries GROUP BY group_id "
-                "ORDER BY latest_summary DESC",
-            ).fetchall()
+            if bot_id:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT group_id, MAX(created_at) as latest_summary "
+                    "FROM group_summaries WHERE bot_id = ? GROUP BY group_id "
+                    "ORDER BY latest_summary DESC",
+                    (str(bot_id),),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT group_id, MAX(created_at) as latest_summary "
+                    "FROM group_summaries GROUP BY group_id "
+                    "ORDER BY latest_summary DESC",
+                ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
             return []
@@ -1965,7 +1947,12 @@ class BotDatabase:
     # ── Bot 间协调 (ADR-001) ──
 
     def coordination_ensure_row(self, group_id: str) -> None:
-        """确保某群在协调表中存在一行 (幂等)。"""
+        """确保某群在协调表中存在一行 (幂等)。
+
+        注: 当前无调用点 —— 行由 `coordination_acquire_token` 懒创建 (它自带
+        INSERT OR IGNORE)。保留作为显式预建工具 (一次性脚本/迁移可用),
+        不要在业务代码里写死群号来"预建"。
+        """
         try:
             self.conn.execute(
                 "INSERT OR IGNORE INTO bot_coordination (group_id) VALUES (?)",

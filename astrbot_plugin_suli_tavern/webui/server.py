@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time as time_module
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import aiohttp
 from aiohttp import web
 
 if TYPE_CHECKING:
@@ -32,6 +34,84 @@ logger = logging.getLogger(__name__)
 
 _API_PREFIX = "/api/admin"
 _API_LEGACY_PREFIX = "/api/config"
+
+# ── Bot 身份 fallback (真相源: BOT_QQ_MAIN 等环境变量) ──
+# 缺省空串 fail-closed。本文件不含任何 QQ 号明文。
+def _env_default_bot_id() -> str:
+    for key in ("BOT_QQ_MAIN", "BOT_ID_MAIN", "BOT_QQ_ALT", "BOT_ID_ALT"):
+        val = (os.getenv(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _env_admin_qq() -> str:
+    for key in ("SUPER_ADMIN_QQ", "ADMIN_QQ"):
+        val = (os.getenv(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+# ── 模型元数据缓存 (models.dev, 24h TTL) ────────────────────
+_MODELSDEV_URL = "https://models.dev/api.json"
+_modelsdev_cache: dict | None = None
+_modelsdev_ts: float = 0.0
+_MODELSDEV_TTL = 86400
+
+# 静态回退: models.dev 不可达时的知名模型上下文窗口 (tokens)
+_STATIC_CONTEXT: dict[str, int] = {
+    "gpt-4o": 128000, "gpt-4o-mini": 128000, "gpt-5": 400000,
+    "claude-opus-4": 200000, "claude-sonnet-4": 200000,
+    "deepseek-chat": 128000, "deepseek-reasoner": 128000,
+    "mimo-v2.5": 1000000,
+    "qwen-max": 32768, "qwen-plus": 131072,
+    "kimi-k2": 131072, "glm-4.6": 200000,
+}
+
+# provider 名 → models.dev provider id 映射 (精确匹配优先用)
+_PROVIDER_TO_MODELSDEV = {
+    "deepseek": "deepseek", "openai": "openai", "anthropic": "anthropic",
+    "openrouter": "openrouter", "opencode": "opencode",
+    "siliconflow": "siliconflow", "groq": "groq", "moonshot": "moonshot",
+    "together": "together", "ollama": "ollama", "glm": "zhipuai",
+    "minimax": "minimax",
+}
+
+# ── 模型 effort 上限表 (项目静态维护) ─────────────────────────
+# provider /models 只返回 id，models.dev 没有 thinking 档位概念
+# (档位 minimal/low/medium/high/xhigh/max 是 opencode 网关概念)，
+# 所以"某模型支持到哪档"只能由本表回答。顺序敏感：首个子串命中获胜。
+# max_effort_source: "static"(本表实测/核定) 或 "default"(未知模型默认全档，
+# 运行时自动降档兜底，见 dispatcher 降档链)。
+_EFFORT_TIERS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
+_MODEL_MAX_EFFORT: tuple[tuple[str, str], ...] = (
+    ("muse-spark", "max"),        # opencode 原生全档
+    ("deepseek-reasoner", "xhigh"),  # 推理模型，tavern 专线真 xhigh
+    ("deepseek-r1", "xhigh"),
+    ("mimo", "high"),             # VLM 直调只到 high，高档自动降
+    ("deepseek-chat", "low"),     # 非推理模型，档位无意义
+    ("gpt-4o-mini", "low"),
+    ("gpt-4o", "low"),
+)
+
+
+def _model_max_effort(model_id: str) -> tuple[str, str]:
+    """返回 (max_effort, source)。大小写不敏感子串匹配，无命中 → ("max", "default")。"""
+    name = (model_id or "").strip().lower()
+    for substr, effort in _MODEL_MAX_EFFORT:
+        if substr in name:
+            return effort, "static"
+    return "max", "default"
+
+
+def _efforts_upto(max_effort: str) -> list[str]:
+    """max 档展开为支持档位列表 (minimal 起，含 max 本档)。未知档 → 全档。"""
+    try:
+        idx = _EFFORT_TIERS.index((max_effort or "").strip().lower())
+    except ValueError:
+        idx = len(_EFFORT_TIERS) - 1
+    return list(_EFFORT_TIERS[: idx + 1])
 
 # SPA 构建产物目录
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -71,47 +151,31 @@ def _json_error(message: str, status=400):
     return _json({"error": True, "message": message}, status=status)
 
 
-# ── 认证中间件 ───────────────────────────────────────────────
+# 思考档位实测阈值：探针极小，同 prompt 下 low 档思考约 123 token，
+# 不支持的档被网关静默忽略只剩个位数。低于此值判档位疑似未生效。
+_TIER_REASON_FLOOR = 20
 
 
-@web.middleware
-async def auth_middleware(request: web.Request, handler) -> web.Response:
-    """对所有 /api/ 路由进行 Bearer token 认证。
+def _tier_warning(effort: str, reasoning_min: int, reasoning_max: int = 0) -> str:
+    """档位生效校验：思考档应有实质思考量，否则警告模型可能不支持该档。
 
-    白名单:
-      - 非 API 路由: 直接放行
-      - /api/*/login: 登录端点无需认证
-      - 本地访问 (127.0.0.1 / localhost / ::1 / 192.168.x.x): 跳过认证
-    其余 /api/ 路由需 Authorization: Bearer <admin_token>。
+    只做警告不判失败——连通性本身是通的，档位是否被网关/模型接受另说。
+    两发思考量落差大时判不稳定（网关间歇忽略）。
     """
-    path = request.path
+    if effort not in ("low", "medium", "high", "xhigh", "max"):
+        return ""
+    if reasoning_min >= _TIER_REASON_FLOOR:
+        return ""
+    if reasoning_max >= _TIER_REASON_FLOOR:
+        return (f"档位不稳定（思考token{reasoning_min}~{reasoning_max}），"
+                f"网关疑似间歇忽略{effort}档")
+    return (f"档位疑似未生效（思考token≈{reasoning_min}，同条件low档约百级），"
+            f"该模型可能不支持{effort}档，生产调用会被静默忽略")
 
-    # 非 API 路由 — 不检查
-    if not path.startswith("/api/"):
-        return await handler(request)
 
-    # 登录端点白名单
-    if path in (_API_PREFIX + "/login", _API_LEGACY_PREFIX + "/login") and request.method == "POST":
-        return await handler(request)
-
-    # 本地/局域网访问 — 跳过认证 (开发 & 自托管场景)
-    peer = request.transport.get_extra_info("peername")
-    if peer:
-        host = peer[0]
-        if host in ("127.0.0.1", "::1", "localhost") or host.startswith("192.168."):
-            return await handler(request)
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return _json_error("未授权: 缺少 Bearer token", 401)
-
-    token = auth_header[7:]
-    config_service: BotConfigService = request.app["config_service"]
-
-    if not token or not config_service.verify_token(token):
-        return _json_error("未授权: token 无效", 401)
-
-    return await handler(request)
+# ── 认证 ────────────────────────────────────────────────────
+# 2026-08-25 用户裁定: 面板去掉 Bearer token 认证, 局域网直开。
+# admin_token 仍生成保留在 bot_config (其他模块可能读取), 但 WebUI 不再校验。
 
 
 # ── 服务器 ──────────────────────────────────────────────────
@@ -127,8 +191,9 @@ class ConfigWebUI:
     """
 
     # Bot 身份数据统一从 BotIdentityService 读取。
-    # 以下仅为向后兼容保留的 fallback 值。
-    _DEFAULT_BOT_FALLBACK = ""
+    # 以下仅为向后兼容保留的 fallback 值 (真相源见模块级 _env_default_bot_id，
+    # 缺省空串 fail-closed，本文件不含任何 QQ 号明文)。
+    _DEFAULT_BOT_FALLBACK = _env_default_bot_id()
 
     @property
     def DEFAULT_BOT(self) -> str:
@@ -162,6 +227,17 @@ class ConfigWebUI:
     def _get_bot_config(self, bot_id: str, key: str, default: str = "") -> str:
         return self.config_service.db.get_config(self._bot_key(bot_id, key), default)
 
+    def _owner_qq_default(self) -> str:
+        """owner_qq 缺省值：插件配置 super_admin_qq > 环境变量，缺省空串。"""
+        try:
+            cfg = getattr(self.config_service, "config", None)
+            qq = getattr(cfg, "super_admin_qq", 0) if cfg is not None else 0
+            if qq:
+                return str(qq)
+        except Exception:
+            pass
+        return _env_admin_qq()
+
     def _set_bot_config(self, bot_id: str, key: str, value: str) -> None:
         self.config_service.db.set_config(self._bot_key(bot_id, key), value)
 
@@ -189,7 +265,8 @@ class ConfigWebUI:
     # ── 启动 / 停止 ─────────────────────────────────────
 
     async def start(self) -> None:
-        self._app = web.Application(middlewares=[auth_middleware])
+        # 2026-08-25 用户裁定: 去掉 Bearer token 认证, 局域网直开
+        self._app = web.Application()
         self._app["config_service"] = self.config_service
         self._setup_routes()
         self._runner = web.AppRunner(self._app)
@@ -222,10 +299,6 @@ class ConfigWebUI:
         # 图标文件 (favicon 等)
         app.router.add_get("/icons.svg", self._serve_static_root)
 
-        # ── 认证 ─────────────────────────────────────
-        app.router.add_post(_API_PREFIX + "/login", self._login)
-        app.router.add_post(_API_LEGACY_PREFIX + "/login", self._login)
-
         # ── Bot 管理 ─────────────────────────────────
         app.router.add_get(_API_PREFIX + "/bots", self._list_bots)
         app.router.add_post(_API_PREFIX + "/bots", self._create_bot)
@@ -248,6 +321,9 @@ class ConfigWebUI:
         app.router.add_get(_API_PREFIX + "/llm/active", self._get_active_llm)
         app.router.add_post(_API_PREFIX + "/llm/activate", self._activate_llm)
         app.router.add_post(_API_PREFIX + "/llm", self._create_llm)
+        app.router.add_post(_API_PREFIX + "/llm/remote-models", self._remote_models)
+        app.router.add_get(_API_PREFIX + "/llm/model-meta", self._model_meta)
+        app.router.add_post(_API_PREFIX + "/llm/test", self._test_llm)
         app.router.add_put(_API_PREFIX + r"/llm/{config_id:\d+}", self._update_llm)
         app.router.add_delete(_API_PREFIX + r"/llm/{config_id:\d+}", self._delete_llm)
         # 向后兼容
@@ -347,6 +423,11 @@ class ConfigWebUI:
         # 表情图片服务 (需放在 SPA fallback 之前)
         app.router.add_get("/memes/img/{category}/{filename:.+}", self._serve_meme_image)
 
+        # ── 绘图 API (NovelAI + PixAI 双供应商) ──────
+        app.router.add_get(_API_PREFIX + "/draw/config", self._get_draw_config)
+        app.router.add_put(_API_PREFIX + "/draw/config", self._set_draw_config)
+        app.router.add_post(_API_PREFIX + "/draw/probe", self._probe_draw)
+
         # ── 通用配置 ─────────────────────────────────
         app.router.add_get(_API_PREFIX + "/config", self._get_all_config)
         app.router.add_put(_API_PREFIX + "/config", self._set_config)
@@ -382,7 +463,6 @@ class ConfigWebUI:
         allowed_dir = (_STATIC_DIR / "assets").resolve()
         file_path = (allowed_dir / filename).resolve()
         # 确保解析后的路径在 allowed_dir 内 (兼容 Windows \ vs /)
-        import os as _os
         _allowed = str(allowed_dir).replace("\\", "/").rstrip("/") + "/"
         _actual = str(file_path).replace("\\", "/")
         if not _actual.startswith(_allowed) and _actual != str(allowed_dir).replace("\\", "/"):
@@ -428,25 +508,6 @@ class ConfigWebUI:
     # 认证
     # ═══════════════════════════════════════════════════════
 
-    async def _login(self, request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-            token = (data.get("token") or "").strip()
-        except Exception:
-            return _json_error("请求格式错误", 400)
-        if not token:
-            return _json_error("缺少 token", 400)
-
-        # 本地访问 + token="local" → 免密登录
-        if token == "local":
-            peer = request.transport.get_extra_info("peername")
-            if peer and peer[0] in ("127.0.0.1", "::1", "localhost"):
-                return _json({"ok": True})
-
-        if self.config_service.verify_token(token):
-            return _json({"ok": True})
-        return _json_error("认证失败", 401)
-
     # ═══════════════════════════════════════════════════════
     # Bot 管理
     # ═══════════════════════════════════════════════════════
@@ -481,6 +542,7 @@ class ConfigWebUI:
 
     async def _get_bot_settings(self, request: web.Request) -> web.Response:
         try:
+            from ..service.bot_config import BotConfigService
             bot_id = self._resolve_bot_id(request)
             settings = {
                 "bot_id": bot_id,
@@ -488,22 +550,99 @@ class ConfigWebUI:
                 "group_chat_enabled": self._get_bot_config(bot_id, "group_chat_enabled", "true") == "true",
                 "private_chat_enabled": self._get_bot_config(bot_id, "private_chat_enabled", "true") == "true",
                 "reasoning_enabled": self._get_bot_config(bot_id, "reasoning_enabled", "true") == "true",
+                "thinking_effort": self._get_bot_config(bot_id, "thinking_effort", "auto"),
+                "slot_efforts": {
+                    s: self._get_bot_config(bot_id, f"slot_effort:{s}", "follow")
+                    for s in BotConfigService.SLOT_EFFORT_SLOTS
+                },
                 "shadow_agent_enabled": self._get_bot_config(bot_id, "shadow_agent_enabled", "true") == "true",
                 "shadow_agent_model": self._get_bot_config(bot_id, "shadow_agent_model", ""),
-                "owner_qq": self._get_bot_config(bot_id, "owner_qq", str(self.config_service.config.super_admin_qq if hasattr(self.config_service, 'config') else "")),
+                "owner_qq": self._get_bot_config(
+                    bot_id, "owner_qq", self._owner_qq_default(),
+                ),
+                "nsfw_enabled": self._get_bot_config(bot_id, "nsfw_enabled", "false") == "true",
+                "nsfw_groups": self._get_bot_config(bot_id, "nsfw_groups", ""),
+                "nsfw_users": self._get_bot_config(bot_id, "nsfw_users", ""),
+                # 私聊 NSFW — 独立开关 (私聊没有群, 群白名单不适用)
+                "nsfw_private": self._get_bot_config(bot_id, "nsfw_private", "false") == "true",
                 "llm_slots": {},
                 "vlm_slots": {},
+                # NSFW 专属 LLM 槽位 (2026-10-18; null = 跟随 SFW)
+                "nsfw_slots": {},
+                "nsfw_slot_efforts": {},
+                # NSFW 专属 VLM 槽位 (识图; 2026-10-18; null = 跟随 SFW)
+                "nsfw_vlm_slots": {},
             }
             for slot in self.config_service.get_display_llm_slots(bot_id):
                 raw = self._get_bot_config(bot_id, slot, "")
                 settings["llm_slots"][slot] = int(raw) if raw else None
+                nraw = self._get_bot_config(bot_id, f"nsfw:{slot}", "")
+                settings["nsfw_slots"][slot] = int(nraw) if nraw else None
             for slot in self.config_service.VLM_SLOTS:
                 raw = self._get_bot_config(bot_id, slot, "")
                 settings["vlm_slots"][slot] = int(raw) if raw else None
+                nraw = self._get_bot_config(bot_id, f"nsfw:{slot}", "")
+                settings["nsfw_vlm_slots"][slot] = int(nraw) if nraw else None
+            settings["nsfw_slot_efforts"] = self.config_service.get_all_slot_efforts(bot_id, nsfw=True)
             return _json(settings)
         except Exception:
             logger.error("获取 bot 设置失败", exc_info=True)
             return _json_error("Internal server error", 500)
+
+    def _apply_nsfw_settings(self, bot_id: str, data: dict) -> list[str]:
+        """处理 bot-settings 里的 NSFW 专属字段 (槽位/档位/温度)。返回更新的键。
+
+        2026-10-18 面板 NSFW 页用。nsfw_slots / nsfw_vlm_slots 的 null/0 =
+        清除覆盖跟随 SFW; nsfw_temperatures 的 null/"" = 清除覆盖恢复跟随 SFW。
+        """
+        from ..service.bot_config import BotConfigService
+
+        updated: list[str] = []
+        if isinstance(data.get("nsfw_slots"), dict):
+            for s, cid_raw in data["nsfw_slots"].items():
+                if s not in BotConfigService.LLM_SLOTS:
+                    continue
+                if cid_raw in (None, "", 0, "0", False):
+                    self.config_service.set_nsfw_llm_slot(bot_id, s, 0)
+                else:
+                    try:
+                        self.config_service.set_nsfw_llm_slot(bot_id, s, int(cid_raw))
+                    except (TypeError, ValueError):
+                        continue
+                updated.append(f"nsfw:{s}")
+        if isinstance(data.get("nsfw_vlm_slots"), dict):
+            for s, cid_raw in data["nsfw_vlm_slots"].items():
+                if s not in BotConfigService.VLM_SLOTS:
+                    continue
+                if cid_raw in (None, "", 0, "0", False):
+                    self.config_service.set_nsfw_vlm_slot(bot_id, s, 0)
+                else:
+                    try:
+                        self.config_service.set_nsfw_vlm_slot(bot_id, s, int(cid_raw))
+                    except (TypeError, ValueError):
+                        continue
+                updated.append(f"nsfw:vlm:{s}")
+        if isinstance(data.get("nsfw_slot_efforts"), dict):
+            for s, e_raw in data["nsfw_slot_efforts"].items():
+                self.config_service.set_slot_effort(bot_id, s, str(e_raw or "follow"), nsfw=True)
+                updated.append(f"nsfw:slot_effort:{s}")
+        if isinstance(data.get("nsfw_temperatures"), dict):
+            _valid_scenes = {
+                "tavern_group", "memory_extract",
+                "context_compress", "cross_validation",
+            }
+            for sc, v_raw in data["nsfw_temperatures"].items():
+                if sc not in _valid_scenes:
+                    continue
+                if v_raw in (None, ""):
+                    self.config_service.set_temperature(bot_id, sc, None, nsfw=True)
+                else:
+                    try:
+                        self.config_service.set_temperature(bot_id, sc, float(v_raw), nsfw=True)
+                    except (TypeError, ValueError):
+                        continue
+                updated.append(f"nsfw:temperature_{sc}")
+        return updated
 
     async def _set_bot_settings(self, request: web.Request) -> web.Response:
         try:
@@ -518,9 +657,45 @@ class ConfigWebUI:
             if "shadow_agent_model" in data:
                 self._set_bot_config(bot_id, "shadow_agent_model", str(data["shadow_agent_model"] or ""))
                 updated.append("shadow_agent_model")
+            if "thinking_effort" in data:
+                effort = str(data["thinking_effort"] or "auto").strip().lower()
+                from ..service.bot_config import BotConfigService
+                if effort not in BotConfigService.THINKING_EFFORTS:
+                    effort = "auto"
+                self._set_bot_config(bot_id, "thinking_effort", effort)
+                updated.append("thinking_effort")
+            if "slot_efforts" in data and isinstance(data["slot_efforts"], dict):
+                from ..service.bot_config import BotConfigService
+                for s, e_raw in data["slot_efforts"].items():
+                    if s in BotConfigService.SLOT_EFFORT_SLOTS:
+                        e_norm = str(e_raw or "follow").strip().lower()
+                        if e_norm not in BotConfigService.SLOT_EFFORT_VALUES:
+                            e_norm = "follow"
+                        self._set_bot_config(bot_id, f"slot_effort:{s}", e_norm)
+                        updated.append(f"slot_effort:{s}")
             if "owner_qq" in data:
                 self._set_bot_config(bot_id, "owner_qq", str(data["owner_qq"] or ""))
                 updated.append("owner_qq")
+            # ── NSFW 隔离区 (默认关闭; 名单仅允许数字/逗号/空白, 防注入) ──
+            if "nsfw_enabled" in data:
+                self._set_bot_config(bot_id, "nsfw_enabled", "true" if data["nsfw_enabled"] else "false")
+                updated.append("nsfw_enabled")
+                logger.info("面板 NSFW 开关: bot=%s enabled=%s", bot_id, bool(data["nsfw_enabled"]))
+            if "nsfw_private" in data:
+                # 私聊 NSFW 独立开关 — 与群内 NSFW 互不影响
+                self._set_bot_config(bot_id, "nsfw_private", "true" if data["nsfw_private"] else "false")
+                updated.append("nsfw_private")
+                logger.info("面板 NSFW 私聊开关: bot=%s private=%s", bot_id, bool(data["nsfw_private"]))
+            for _nsfw_key in ("nsfw_groups", "nsfw_users"):
+                if _nsfw_key in data:
+                    _raw = str(data[_nsfw_key] or "")
+                    _clean = "".join(c for c in _raw.replace("，", ",").replace(";", ",") if c.isdigit() or c == ",")
+                    _ids = [p.strip() for p in _clean.split(",") if p.strip()][:20]
+                    _norm = ",".join(_ids)
+                    self._set_bot_config(bot_id, _nsfw_key, _norm)
+                    updated.append(_nsfw_key)
+            # ── NSFW 专属配置 (槽位/档位/温度; 2026-10-18) ──
+            updated.extend(self._apply_nsfw_settings(bot_id, data))
             return _json({"ok": True, "updated": updated, "bot_id": bot_id})
         except Exception:
             logger.error("设置 bot 设置失败", exc_info=True)
@@ -821,6 +996,7 @@ class ConfigWebUI:
             "is_vlm": c.is_vlm,
             "is_llm": c.is_llm,
             "config_type": c.config_type,
+            "context_window": c.context_window,
             "api_key_preview": masked,
             "api_key_masked": masked,   # 前端字段名
         }
@@ -828,18 +1004,32 @@ class ConfigWebUI:
     async def _list_llm(self, request: web.Request) -> web.Response:
         try:
             bot_id = self._resolve_bot_id(request)
+            scope = str(request.query.get("scope", "") or "").strip().lower()
+            nsfw = scope == "nsfw"
             configs = self.config_service.db.list_llm_configs()
             slots = {}
+            fallback_slots: dict[str, int | None] = {}
             for slot in self.config_service.get_display_llm_slots(bot_id):
-                raw = self._get_bot_config(bot_id, slot, "")
-                slots[slot] = int(raw) if raw else None
+                if nsfw:
+                    # NSFW 页: slots = 专属覆盖 (null=跟随); fallback_slots = SFW 槽位
+                    nraw = self._get_bot_config(bot_id, f"nsfw:{slot}", "")
+                    slots[slot] = int(nraw) if nraw else None
+                    fraw = self._get_bot_config(bot_id, slot, "")
+                    fallback_slots[slot] = int(fraw) if fraw else None
+                else:
+                    raw = self._get_bot_config(bot_id, slot, "")
+                    slots[slot] = int(raw) if raw else None
             result = [self._llm_config_to_dict(c) for c in configs if c.is_llm]
-            return _json({
+            payload: dict[str, object] = {
                 "configs": result,
                 "slots": slots,
                 "bot_id": bot_id,
                 "bot_name": self._get_bot_meta(bot_id).get("name", bot_id),
-            })
+                "scope": "nsfw" if nsfw else "sfw",
+            }
+            if nsfw:
+                payload["fallback_slots"] = fallback_slots
+            return _json(payload)
         except Exception:
             logger.error("列出 LLM 配置失败", exc_info=True)
             return _json_error("Internal server error", 500)
@@ -864,6 +1054,143 @@ class ConfigWebUI:
             logger.error("获取活跃 LLM 失败", exc_info=True)
             return _json_error("Internal server error", 500)
 
+    async def _test_llm(self, request: web.Request) -> web.Response:
+        """连接测试：用指定槽位配置 + 指定 effort 打一次最小探针。
+
+        key 不出后端（只回掩码/不回 key）。探针极小（ping 级文本 + 128 token），
+        只验证“通不通 + 档位收不收”，不烧钱。
+        """
+        try:
+            data = await request.json()
+            bot_id = self._resolve_bot_id(request, data)
+            slot = str(data.get("slot") or "llm_lite").strip() or "llm_lite"
+            scope = str(data.get("scope", "") or "").strip().lower()
+            nsfw = scope == "nsfw"
+            effort = str(data.get("effort") or "minimal").strip().lower()
+            if effort not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+                effort = "minimal"
+            prompt = str(data.get("prompt") or "请只回复：连通正常").strip()[:200] or "请只回复：连通正常"
+            cfg = self.config_service.resolve_llm_slot(bot_id, slot, nsfw=nsfw)
+            if cfg is None:
+                return _json({"ok": False, "error": f"槽位未配置或不可用：{slot}"})
+            base = (cfg.normalized_base_url or "").rstrip("/")
+            if not base:
+                return _json({"ok": False, "error": "该配置无 base_url"})
+            is_resp = "/responses" in base
+            url = base if is_resp else base.rstrip("/") + "/chat/completions"
+            # 探针预算随档位走（生产同理：高档 CoT 吃预算）：思考档的推理
+            # token 计入 max_tokens，预算不足会被思考吃光导致空 output。
+            # 生产侧 DECISION_MAX_TOKENS 同理随档抬预算，探针这里对齐：
+            # 非思考档 128，low/medium 给 1024，high 及以上 2048。
+            _probe_budget = {"minimal": 128, "low": 1024, "off": 128, "medium": 1024,
+                             "high": 2048, "xhigh": 2048, "max": 2048}.get(effort, 128)
+            headers = {
+                "Authorization": f"Bearer {cfg.api_key or ''}",
+                "Content-Type": "application/json",
+                "User-Agent": "suli-panel/llm-test",
+                # 与生产直连一致：OpenCode Go 网关要 x-opencode-session；
+                # 走容器代理（与 astrbot 同出口），否则 geo 封锁的模型必 403。
+                "x-opencode-session": f"suli-panel-test-{bot_id}",
+            }
+            if is_resp:
+                payload: dict = {
+                    "model": cfg.model_name, "input": prompt,
+                    "max_output_tokens": _probe_budget, "stream": False,
+                    "reasoning": {"effort": effort if effort != "off" else "minimal"},
+                }
+            else:
+                payload = {
+                    "model": cfg.model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": _probe_budget, "temperature": 0, "stream": False,
+                }
+                if effort == "off":
+                    payload["thinking"] = {"type": "disabled"}
+                else:
+                    payload["reasoning_effort"] = effort
+            # 思考档连打两发：网关可能间歇静默忽略档位（同条件 max 一次思考
+            # 7 token、一次 184+），单发抓不住这种抖动。非思考档只打一发。
+            _attempts = 2 if effort in ("low", "medium", "high", "xhigh", "max") else 1
+            _t0 = time_module.monotonic()
+            _samples: list[int] = []
+            out_text, usage, _finish = "", {"prompt_tokens": 0, "completion_tokens": 0}, ""
+            _last_err: dict | None = None
+            for _try in range(_attempts):
+                try:
+                    async with aiohttp.ClientSession(trust_env=True) as session:
+                        async with session.post(
+                            url, json=payload, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60),
+                        ) as resp:
+                            _body = await resp.text()
+                            if resp.status != 200:
+                                return _json({
+                                    "ok": False, "slot": slot, "model": cfg.model_name,
+                                    "effort_sent": effort,
+                                    "latency_ms": int((time_module.monotonic() - _t0) * 1000),
+                                    "error": f"HTTP {resp.status}: {_body[:200]}",
+                                })
+                            try:
+                                import json as _js
+                                data_r = _js.loads(_body)
+                            except Exception:
+                                return _json({"ok": False, "slot": slot, "model": cfg.model_name,
+                                              "effort_sent": effort, "error": "返回非 JSON"})
+                except Exception as e:
+                    _last_err = {
+                        "ok": False, "slot": slot, "model": cfg.model_name,
+                        "effort_sent": effort,
+                        "latency_ms": int((time_module.monotonic() - _t0) * 1000),
+                        "error": f"连接失败：{e!r}"[:200],
+                    }
+                    continue
+                _one_text, _one_finish, _one_reason = "", "", 0
+                _one_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+                try:
+                    if is_resp:
+                        for item in (data_r.get("output") or []):
+                            if not isinstance(item, dict):
+                                continue
+                            for c in (item.get("content") or []):
+                                if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                                    _one_text += str(c.get("text") or "")
+                    else:
+                        ch = (data_r.get("choices") or [{}])[0]
+                        _one_text = str((ch.get("message") or {}).get("content") or "")
+                        _one_finish = str(ch.get("finish_reason") or "")
+                    u = data_r.get("usage") or {}
+                    _det = u.get("output_tokens_details") or u.get("completion_tokens_details") or {}
+                    _one_reason = int(_det.get("reasoning_tokens") or 0)
+                    _one_usage = {"prompt_tokens": int(u.get("prompt_tokens") or u.get("input_tokens") or 0),
+                                  "completion_tokens": int(u.get("completion_tokens") or u.get("output_tokens") or 0),
+                                  "reasoning_tokens": _one_reason}
+                except Exception:
+                    continue
+                if not _one_text.strip():
+                    _finish = _one_finish
+                    continue
+                _samples.append(_one_reason)
+                if not out_text.strip():
+                    out_text, usage, _finish = _one_text, _one_usage, _one_finish
+            latency_ms = int((time_module.monotonic() - _t0) * 1000)
+            if not out_text.strip():
+                if _last_err is not None and not _samples:
+                    return _json(_last_err)
+                _hint = "（思考吃光预算，finish=length）" if _finish == "length" else ""
+                return _json({"ok": False, "slot": slot, "model": cfg.model_name,
+                              "effort_sent": effort, "latency_ms": latency_ms,
+                              "error": f"空 output{_hint}（预算可能不够，换大档位或默认档重试）"})
+            _reason_min = min(_samples) if _samples else 0
+            _reason_max = max(_samples) if _samples else 0
+            usage["reasoning_tokens"] = _reason_min
+            return _json({"ok": True, "slot": slot, "model": cfg.model_name,
+                          "effort_sent": effort, "latency_ms": latency_ms,
+                          "output_preview": out_text.strip()[:200], "usage": usage, "error": "",
+                          "tier_warning": _tier_warning(effort, _reason_min, _reason_max)})
+        except Exception:
+            logger.error("LLM 连接测试失败", exc_info=True)
+            return _json_error("Internal server error", 500)
+
     async def _activate_llm(self, request: web.Request) -> web.Response:
         try:
             data = await request.json()
@@ -871,11 +1198,21 @@ class ConfigWebUI:
             config_id = data.get("config_id")
             slot = data.get("slot", "llm_primary")
             llm_type = data.get("llm_type", "llm")  # SPA sends llm_type
+            scope = str(data.get("scope", "") or "").strip().lower()
+            nsfw = scope == "nsfw"
 
             if config_id is None:
                 return _json_error("缺少 config_id")
             cid = int(config_id)
             if cid == 0:
+                if nsfw and slot in self.config_service.LLM_SLOTS:
+                    # NSFW 覆盖清除 → 跟随 SFW (is_active 在 setter 内重扫)
+                    self.config_service.set_nsfw_llm_slot(bot_id, slot, 0)
+                    return _json({"ok": True, "slot": slot, "scope": "nsfw", "cleared": True, "bot_id": bot_id})
+                if nsfw and slot in self.config_service.VLM_SLOTS:
+                    # NSFW VLM 覆盖清除 (SPA 走 /vlm/activate, 此处兜底防误清 SFW 槽)
+                    self.config_service.set_nsfw_vlm_slot(bot_id, slot, 0)
+                    return _json({"ok": True, "slot": slot, "scope": "nsfw", "cleared": True, "bot_id": bot_id})
                 if slot in self.config_service.LLM_SLOTS or slot in self.config_service.VLM_SLOTS:
                     # 先取旧 config_id 用于同步 is_active
                     old_cid = self.config_service.get_llm_slot(bot_id, slot) if slot in self.config_service.LLM_SLOTS else self.config_service.get_vlm_slot(bot_id, slot)
@@ -893,7 +1230,15 @@ class ConfigWebUI:
                 return _json_error("配置不存在")
 
             # 判断是 LLM 还是 VLM 槽位
-            if slot in self.config_service.LLM_SLOTS:
+            if nsfw and slot in self.config_service.LLM_SLOTS:
+                if not cfg.is_llm:
+                    return _json_error("该配置不是 LLM")
+                self.config_service.set_nsfw_llm_slot(bot_id, slot, cid)
+            elif nsfw and slot in self.config_service.VLM_SLOTS:
+                if not cfg.is_vlm:
+                    return _json_error("该配置不是 VLM")
+                self.config_service.set_nsfw_vlm_slot(bot_id, slot, cid)
+            elif slot in self.config_service.LLM_SLOTS:
                 if not cfg.is_llm:
                     return _json_error("该配置不是 LLM")
                 self.config_service.set_llm_slot(bot_id, slot, cid)
@@ -924,6 +1269,7 @@ class ConfigWebUI:
                 base_url=data.get("base_url", ""),
                 model_name=data.get("model_name", ""),
                 config_type=data.get("config_type", ""),
+                context_window=data.get("context_window"),
                 is_active=True,  # 面板创建的配置默认启用
             )
             return _json({"ok": True, "id": config_id})
@@ -936,7 +1282,11 @@ class ConfigWebUI:
             config_id = int(request.match_info["config_id"])
             data = await request.json()
             fields = {}
-            for k in ("name", "provider", "provider_name", "api_key", "base_url", "model_name", "config_type"):
+            llm_fields = (
+                "name", "provider", "provider_name", "api_key", "base_url",
+                "model_name", "config_type", "context_window",
+            )
+            for k in llm_fields:
                 if k in data and data[k] is not None:
                     fields[k] = data[k]
             ok = self.config_service.db.update_llm_config(config_id, **fields)
@@ -954,6 +1304,122 @@ class ConfigWebUI:
             logger.error("删除 LLM 配置失败", exc_info=True)
             return _json_error("Internal server error", 500)
 
+    async def _remote_models(self, request: web.Request) -> web.Response:
+        """代理拉取 Provider 的 OpenAI-compatible 模型列表。
+
+        POST {base_url, api_key?, config_id?} → GET {base_url}/models → {models: [id,...]}
+        api_key 为空且给 config_id 时用已存配置的 key (编辑模式, key 不出库)。
+        """
+        try:
+            data = await request.json()
+            base_url = (data.get("base_url") or "").strip().rstrip("/")
+            api_key = (data.get("api_key") or "").strip()
+            config_id = data.get("config_id")
+            if not base_url:
+                return _json_error("base_url 为必填项")
+            if not api_key and config_id:
+                cfg = self.config_service.db.get_llm_config(int(config_id))
+                api_key = cfg.api_key if cfg else ""
+            # 模型列表挂在对话基址下: 去掉 /responses 或 /chat/completions 后缀
+            # (Muse Spark 的 base 存 …/go/v1/responses 全路径, /models 仍在 …/go/v1 下)
+            list_base = base_url
+            for _suffix in ("/responses", "/chat/completions"):
+                if list_base.endswith(_suffix):
+                    list_base = list_base[: -len(_suffix)].rstrip("/")
+            # 显式 UA + Accept: 部分 WAF 会拦截默认 Python/aiohttp UA (403)
+            # api_key 绝不进日志
+            headers = {
+                "User-Agent": "suli-qbot-panel/1.0",
+                "Accept": "application/json",
+            }
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as sess, sess.get(
+                f"{list_base}/models", headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("拉取远程模型列表失败: %s → %d", base_url, resp.status)
+                    return _json_error(f"Provider 返回 {resp.status}: {body[:200]}", 502)
+                payload = await resp.json()
+            models = sorted({
+                m.get("id") for m in payload.get("data", [])
+                if isinstance(m, dict) and m.get("id")
+            })
+            logger.info("拉取远程模型列表成功: %s → %d 个", base_url, len(models))
+            return _json({"ok": True, "models": models, "count": len(models)})
+        except TimeoutError:
+            return _json_error("Provider 请求超时", 504)
+        except Exception:
+            logger.error("拉取远程模型列表失败", exc_info=True)
+            return _json_error("拉取模型列表失败", 502)
+
+    async def _model_meta(self, request: web.Request) -> web.Response:
+        """查询模型元数据: 上下文窗口 (models.dev 24h 缓存 → 静态表) +
+        能力位 (reasoning/tool_call) + effort 上限 (项目静态表 _MODEL_MAX_EFFORT)。
+        旧字段保持不变，向后兼容。"""
+        global _modelsdev_cache, _modelsdev_ts
+        try:
+            model_id = request.query.get("model", "").strip()
+            provider = request.query.get("provider", "").strip().lower()
+            if not model_id:
+                return _json_error("model 参数为必填项")
+
+            max_effort, effort_source = _model_max_effort(model_id)
+
+            now = time_module.time()
+            if _modelsdev_cache is None or now - _modelsdev_ts > _MODELSDEV_TTL:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as sess, sess.get(
+                    _MODELSDEV_URL,
+                ) as resp:
+                    resp.raise_for_status()
+                    _modelsdev_cache = await resp.json()
+                _modelsdev_ts = now
+
+            # 匹配: provider 精确 → 全库精确
+            hit_ctx = None
+            hit_provider = ""
+            hit_reasoning = None
+            hit_tool_call = None
+            prov_id = _PROVIDER_TO_MODELSDEV.get(provider, "")
+            candidates = []
+            if prov_id and prov_id in _modelsdev_cache:
+                candidates.append(prov_id)
+            candidates.extend(k for k in _modelsdev_cache if k != prov_id)
+            for pid in candidates:
+                models = (_modelsdev_cache.get(pid) or {}).get("models") or {}
+                meta = models.get(model_id)
+                if meta:
+                    hit_ctx = ((meta.get("limit") or {}).get("context"))
+                    hit_provider = pid
+                    if isinstance(meta.get("reasoning"), bool):
+                        hit_reasoning = meta["reasoning"]
+                    if isinstance(meta.get("tool_call"), bool):
+                        hit_tool_call = meta["tool_call"]
+                    break
+            if hit_ctx is None:
+                hit_ctx = _STATIC_CONTEXT.get(model_id)
+            return _json({
+                "ok": True, "model": model_id,
+                "context_window": int(hit_ctx) if hit_ctx else None,
+                "source_provider": hit_provider,
+                "reasoning": hit_reasoning,
+                "tool_call": hit_tool_call,
+                "max_effort": max_effort,
+                "max_effort_source": effort_source,
+                "supported_efforts": _efforts_upto(max_effort),
+            })
+        except Exception:
+            logger.warning("模型元数据查询失败", exc_info=True)
+            _fb_effort, _fb_source = _model_max_effort(request.query.get("model", ""))
+            return _json({"ok": True, "model": request.query.get("model", ""),
+                          "context_window": None, "source_provider": "",
+                          "reasoning": None, "tool_call": None,
+                          "max_effort": _fb_effort, "max_effort_source": _fb_source,
+                          "supported_efforts": _efforts_upto(_fb_effort)})
+
     # ═══════════════════════════════════════════════════════
     # VLM 配置
     # ═══════════════════════════════════════════════════════
@@ -961,19 +1427,33 @@ class ConfigWebUI:
     async def _list_vlm(self, request: web.Request) -> web.Response:
         try:
             bot_id = self._resolve_bot_id(request)
+            scope = str(request.query.get("scope", "") or "").strip().lower()
+            nsfw = scope == "nsfw"
             configs = self.config_service.db.list_llm_configs()
             vlm_configs = [c for c in configs if c.is_vlm]
             slots = {}
+            fallback_slots: dict[str, int | None] = {}
             for slot in self.config_service.VLM_SLOTS:
-                raw = self._get_bot_config(bot_id, slot, "")
-                slots[slot] = int(raw) if raw else None
+                if nsfw:
+                    # NSFW 页: slots = 专属覆盖 (null=跟随); fallback_slots = SFW 槽位
+                    nraw = self._get_bot_config(bot_id, f"nsfw:{slot}", "")
+                    slots[slot] = int(nraw) if nraw else None
+                    fraw = self._get_bot_config(bot_id, slot, "")
+                    fallback_slots[slot] = int(fraw) if fraw else None
+                else:
+                    raw = self._get_bot_config(bot_id, slot, "")
+                    slots[slot] = int(raw) if raw else None
             result = [self._llm_config_to_dict(c) for c in vlm_configs]
-            return _json({
+            payload: dict[str, object] = {
                 "configs": result,
                 "slots": slots,
                 "bot_id": bot_id,
                 "bot_name": self._get_bot_meta(bot_id).get("name", bot_id),
-            })
+                "scope": "nsfw" if nsfw else "sfw",
+            }
+            if nsfw:
+                payload["fallback_slots"] = fallback_slots
+            return _json(payload)
         except Exception:
             logger.error("列出 VLM 配置失败", exc_info=True)
             return _json_error("Internal server error", 500)
@@ -984,10 +1464,16 @@ class ConfigWebUI:
             bot_id = self._resolve_bot_id(request, data)
             config_id = data.get("config_id")
             slot = data.get("slot", "vlm_primary")
+            scope = str(data.get("scope", "") or "").strip().lower()
+            nsfw = scope == "nsfw"
             if config_id is None:
                 return _json_error("缺少 config_id")
             cid = int(config_id)
             if cid == 0:
+                if nsfw and slot in self.config_service.VLM_SLOTS:
+                    # NSFW 覆盖清除 → 跟随 SFW (is_active 在 setter 内重扫)
+                    self.config_service.set_nsfw_vlm_slot(bot_id, slot, 0)
+                    return _json({"ok": True, "slot": slot, "scope": "nsfw", "cleared": True, "bot_id": bot_id})
                 old_cid = self.config_service.get_vlm_slot(bot_id, slot)
                 self._set_bot_config(bot_id, slot, "")
                 if old_cid and old_cid > 0:
@@ -996,8 +1482,12 @@ class ConfigWebUI:
             cfg = self.config_service.db.get_llm_config(cid)
             if not cfg or not cfg.is_vlm:
                 return _json_error("该配置不是 VLM")
-            self.config_service.set_vlm_slot(bot_id, slot, cid)
-            return _json({"ok": True, "slot": slot, "config_id": cid, "bot_id": bot_id})
+            if nsfw and slot in self.config_service.VLM_SLOTS:
+                self.config_service.set_nsfw_vlm_slot(bot_id, slot, cid)
+            else:
+                self.config_service.set_vlm_slot(bot_id, slot, cid)
+            return _json({"ok": True, "slot": slot, "config_id": cid, "bot_id": bot_id,
+                          "scope": "nsfw" if nsfw else "sfw"})
         except Exception:
             logger.error("设置 VLM 槽位失败", exc_info=True)
             return _json_error("Internal server error", 500)
@@ -1009,6 +1499,15 @@ class ConfigWebUI:
     async def _get_temperatures(self, request: web.Request) -> web.Response:
         try:
             bot_id = self._resolve_bot_id(request)
+            scope = str(request.query.get("scope", "") or "").strip().lower()
+            if scope == "nsfw":
+                return _json({
+                    "scope": "nsfw",
+                    "temperatures": self.config_service.get_all_temperatures(bot_id, nsfw=True),
+                    "overrides": self.config_service.get_nsfw_temperature_overrides(bot_id),
+                    "sfw": self.config_service.get_all_temperatures(bot_id),
+                    "bot_id": bot_id,
+                })
             temps = self.config_service.get_all_temperatures(bot_id)
             return _json({"temperatures": temps, "bot_id": bot_id})
         except Exception:
@@ -1018,6 +1517,7 @@ class ConfigWebUI:
     async def _set_temperatures(self, request: web.Request) -> web.Response:
         try:
             bot_id = self._resolve_bot_id(request)
+            scope = str(request.query.get("scope", "") or "").strip().lower()
             data = await request.json()
             # 支持两种格式: 直接的 dict 或 {"temperatures": {...}}
             if "temperatures" in data:
@@ -1028,11 +1528,38 @@ class ConfigWebUI:
                 "tavern_group", "memory_extract",
                 "context_compress", "cross_validation",
             }
+            if scope == "nsfw":
+                # NSFW 专属温度: 数字=覆盖, null/""=清除覆盖 (跟随 SFW)
+                applied = 0
+                for k, v in data.items():
+                    if k not in valid_keys:
+                        continue
+                    if v in (None, ""):
+                        self.config_service.set_temperature(bot_id, k, None, nsfw=True)
+                    else:
+                        try:
+                            self.config_service.set_temperature(bot_id, k, float(v), nsfw=True)
+                        except (TypeError, ValueError):
+                            continue
+                    applied += 1
+                return _json({
+                    "ok": True,
+                    "scope": "nsfw",
+                    "updated": applied,
+                    "temperatures": self.config_service.get_all_temperatures(bot_id, nsfw=True),
+                    "overrides": self.config_service.get_nsfw_temperature_overrides(bot_id),
+                    "sfw": self.config_service.get_all_temperatures(bot_id),
+                    "bot_id": bot_id,
+                })
             temps = {k: float(v) for k, v in data.items() if k in valid_keys}
             if not temps:
                 return _json_error("没有合法的温度参数")
             self.config_service.set_all_temperatures(bot_id, temps)
-            return _json({"ok": True, "temperatures": self.config_service.get_all_temperatures(bot_id), "bot_id": bot_id})
+            return _json({
+                "ok": True,
+                "temperatures": self.config_service.get_all_temperatures(bot_id),
+                "bot_id": bot_id,
+            })
         except Exception:
             logger.error("设置温度失败", exc_info=True)
             return _json_error("Internal server error", 500)
@@ -1352,7 +1879,7 @@ class ConfigWebUI:
     async def _get_whitelist(self, request: web.Request) -> web.Response:
         """GET /api/admin/whitelist?bot_id=... → {whitelist: [...], all_bots: {...}}
 
-        支持 per-bot 过滤: bot_id=<main_bot_qq> 只返回该 bot 的。
+        支持 per-bot 过滤: bot_id=<bot QQ> 只返回该 bot 的。
         不传 bot_id 返回 all_bots 合并视图 (每群一行, 标记哪些 bot 启用了它)。
         """
         try:
@@ -1576,6 +2103,289 @@ class ConfigWebUI:
             return _json_error("Internal server error", 500)
 
     # ═══════════════════════════════════════════════════════
+    # 绘图 API — NovelAI / PixAI 各自独立配置 + 按 Bot 分配
+    # (面板为单一配置来源；两家互不混用，各自 Key/参数/分配独立存放)
+    # ═══════════════════════════════════════════════════════
+
+    _DRAW_DEFAULTS: dict = {
+        "novelai_model": "nai-diffusion-5-full",
+        "novelai_model_public": "nai-diffusion-4-5-full",
+        "novelai_size": "832x1216",
+        "novelai_steps": "23",
+        "pixai_model": "1983308862240288769",
+        "pixai_aspect": "9:16",
+        "pixai_size": "1k",
+    }
+
+    _DRAW_PROVIDERS = ("novelai", "pixai", "none")
+
+    # Vibe (参考图) 只在这些模型上可用 — 面板模型下拉的提示用, 不做硬校验
+    _NOVELAI_VIBE_MODELS = ("nai-diffusion-4", "nai-diffusion-3")
+
+    @staticmethod
+    def _mask_secret(v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if len(v) <= 8:
+            return "****"
+        return f"****{v[-4:]}"
+
+    # ── 绘图访问策略辅助 (真相源: service/draw_access.py, 面板只做只读镜像) ──
+
+    @staticmethod
+    def _truthy(raw: object) -> bool:
+        return str(raw).strip().lower() in ("1", "true", "yes", "on", "y")
+
+    @staticmethod
+    def _metered_providers() -> frozenset:
+        try:
+            from ..service.draw_access import METERED_PROVIDERS
+
+            return frozenset(METERED_PROVIDERS)
+        except Exception:
+            return frozenset({"pixai"})
+
+    @staticmethod
+    def _model_supports_vibes(model: str) -> bool:
+        """该模型是否支持参考图 (Vibe) —— 面板只用来提示, 不做校验。"""
+        try:
+            from ..service.draw_access import supports_vibes
+
+            return bool(supports_vibes(model))
+        except Exception:
+            return "diffusion-4" in str(model or "").lower()
+
+    _DRAW_FALLBACK_BOTS = tuple(
+        {"id": q, "name": n}
+        for q, n in (
+            ((os.getenv("BOT_QQ_MAIN", "") or os.getenv("BOT_ID_MAIN", "") or "").strip(), "暮恩"),
+        )
+        if q
+    )
+
+    def _draw_bot_list(self) -> list:
+        """可分配的 Bot 列表 [{id, name}]，失败或为空时回退两 Bot。"""
+        try:
+            from ..service.bot_identity import get_bot_identity_service
+            svc = get_bot_identity_service()
+            bots = [{"id": b.bot_id, "name": b.name} for b in svc.list_bots(active_only=False)]
+            if bots:
+                return bots
+        except Exception:
+            logger.debug("绘图分配读 Bot 列表失败，用内置回退", exc_info=True)
+        return [dict(b) for b in self._DRAW_FALLBACK_BOTS]
+
+    def _draw_assign(self, bot_id: str) -> str:
+        v = self.config_service.get(f"draw_assign_{bot_id}", "novelai").strip()
+        return v if v in self._DRAW_PROVIDERS else "novelai"
+
+    async def _get_draw_config(self, request: web.Request) -> web.Response:
+        try:
+            g = self.config_service.get
+            nt = g("draw_novelai_token", "")
+            pk = g("draw_pixai_key", "")
+            bots = self._draw_bot_list()
+            return _json({
+                "novelai": {
+                    "token_set": bool(nt.strip()),
+                    "token_masked": self._mask_secret(nt),
+                    "model": g("draw_novelai_model", self._DRAW_DEFAULTS["novelai_model"]),
+                    "model_public": g(
+                        "draw_novelai_model_public", self._DRAW_DEFAULTS["novelai_model_public"]
+                    ),
+                    "model_vibe_ok": self._model_supports_vibes(
+                        g("draw_novelai_model", self._DRAW_DEFAULTS["novelai_model"])
+                    ),
+                    "model_public_vibe_ok": self._model_supports_vibes(
+                        g("draw_novelai_model_public", self._DRAW_DEFAULTS["novelai_model_public"])
+                    ),
+                    "size": g("draw_novelai_size", self._DRAW_DEFAULTS["novelai_size"]),
+                    "steps": g("draw_novelai_steps", self._DRAW_DEFAULTS["novelai_steps"]),
+                },
+                "pixai": {
+                    "key_set": bool(pk.strip()),
+                    "key_masked": self._mask_secret(pk),
+                    "model": g("draw_pixai_model", self._DRAW_DEFAULTS["pixai_model"]),
+                    "aspect": g("draw_pixai_aspect", self._DRAW_DEFAULTS["pixai_aspect"]),
+                    "size": g("draw_pixai_size", self._DRAW_DEFAULTS["pixai_size"]),
+                },
+                # ── 访问策略 (2026-10-12 用户裁定) ──
+                # 计费后端仅主人 / 主人 NSFW 通路；模型按身份分档 (主人 V5 / 普通 V4.5)
+                "policy": {
+                    "metered_providers": sorted(
+                        self._metered_providers()
+                    ),
+                    "metered_master_only": self._truthy(
+                        g("draw_metered_master_only", "true")
+                    ),
+                    "metered_nsfw_allow": self._truthy(
+                        g("draw_metered_nsfw_allow", "true")
+                    ),
+                },
+                "assignments": {b["id"]: self._draw_assign(b["id"]) for b in bots},
+                "bots": bots,
+            })
+        except Exception:
+            logger.error("获取绘图配置失败", exc_info=True)
+            return _json_error("Internal server error", 500)
+
+    async def _set_draw_config(self, request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return _json_error("请求格式错误")
+        if not isinstance(data, dict):
+            return _json_error("请求格式错误")
+        try:
+            s = self.config_service.set
+            bots = self._draw_bot_list()
+            bot_ids = {b["id"] for b in bots}
+            # ── NovelAI 独立配置 ──
+            if data.get("clear_novelai") is True:
+                s("draw_novelai_token", "")
+            elif "novelai_token" in data and str(data["novelai_token"] or "").strip():
+                s("draw_novelai_token", str(data["novelai_token"]).strip())
+            if "novelai_model" in data:
+                s("draw_novelai_model", str(data["novelai_model"] or self._DRAW_DEFAULTS["novelai_model"]).strip())
+            if "novelai_model_public" in data:
+                s(
+                    "draw_novelai_model_public",
+                    str(
+                        data["novelai_model_public"]
+                        or self._DRAW_DEFAULTS["novelai_model_public"]
+                    ).strip(),
+                )
+            if "novelai_size" in data:
+                sz = str(data["novelai_size"] or "").strip()
+                if sz not in ("832x1216", "1216x832", "1024x1024", "512x768", "768x512"):
+                    return _json_error("novelai_size 非法")
+                s("draw_novelai_size", sz)
+            if "novelai_steps" in data:
+                try:
+                    st = int(data["novelai_steps"])
+                except (TypeError, ValueError):
+                    return _json_error("novelai_steps 非法 (1-28)")
+                if not 1 <= st <= 28:
+                    return _json_error("novelai_steps 非法 (1-28)")
+                s("draw_novelai_steps", str(st))
+            # ── PixAI 独立配置 ──
+            if data.get("clear_pixai") is True:
+                s("draw_pixai_key", "")
+            elif "pixai_key" in data and str(data["pixai_key"] or "").strip():
+                s("draw_pixai_key", str(data["pixai_key"]).strip())
+            if "pixai_model" in data:
+                s("draw_pixai_model", str(data["pixai_model"] or self._DRAW_DEFAULTS["pixai_model"]).strip())
+            if "pixai_aspect" in data:
+                asp = str(data["pixai_aspect"] or "").strip()
+                if asp not in ("1:1", "2:3", "3:2", "3:4", "4:3", "3:5", "5:3", "9:16", "16:9", "1:3", "3:1"):
+                    return _json_error("pixai_aspect 非法")
+                s("draw_pixai_aspect", asp)
+            if "pixai_size" in data:
+                sz = str(data["pixai_size"] or "").strip()
+                if sz not in ("1k", "1.5k"):
+                    return _json_error("pixai_size 非法")
+                s("draw_pixai_size", sz)
+            # ── 访问策略开关 (计费后端仅主人 / 主人 NSFW 通路) ──
+            if "metered_master_only" in data:
+                s("draw_metered_master_only", "true" if data["metered_master_only"] else "false")
+                logger.info("面板绘图策略: 计费后端仅主人=%s", bool(data["metered_master_only"]))
+            if "metered_nsfw_allow" in data:
+                s("draw_metered_nsfw_allow", "true" if data["metered_nsfw_allow"] else "false")
+                logger.info("面板绘图策略: 主人 NSFW 通路放行计费后端=%s", bool(data["metered_nsfw_allow"]))
+            # ── 旧 spec 参数已退役 (2026-10-12 走 llm_pro 推理位)，静默忽略 ──
+            # ── 按 Bot 分配 (各自独立) ──
+            if isinstance(data.get("assignments"), dict):
+                for bot_id, provider in data["assignments"].items():
+                    if bot_id not in bot_ids:
+                        return _json_error(f"未知 Bot: {bot_id}")
+                    p = str(provider or "").strip()
+                    if p not in self._DRAW_PROVIDERS:
+                        return _json_error("分配值非法 (novelai/pixai/none)")
+                    s(f"draw_assign_{bot_id}", p)
+            return await self._get_draw_config(request)
+        except Exception:
+            logger.error("保存绘图配置失败", exc_info=True)
+            return _json_error("Internal server error", 500)
+
+    async def _probe_draw(self, request: web.Request) -> web.Response:
+        """绘图连通探测 (零扣费，只读接口)。必须显式传 provider，两家互不混用。"""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        provider = str(data.get("provider", "") or "").strip()
+        if provider not in ("novelai", "pixai"):
+            return _json_error("provider 非法 (novelai/pixai)")
+        if provider == "novelai":
+            token = str(data.get("novelai_token", "") or "").strip() or \
+                self.config_service.get("draw_novelai_token", "")
+            if not token:
+                return _json({"ok": False, "reason": "empty_key"})
+            ok, reason = await self._probe_novelai(token)
+            return _json({"ok": ok, "reason": reason})
+        if provider == "pixai":
+            key = str(data.get("pixai_key", "") or "").strip() or \
+                self.config_service.get("draw_pixai_key", "")
+            if not key:
+                return _json({"ok": False, "reason": "empty_key"})
+            ok, reason = await self._probe_pixai(key)
+            return _json({"ok": ok, "reason": reason})
+        return _json_error("provider 非法 (novelai/pixai)")
+
+    @staticmethod
+    async def _probe_novelai(token: str, timeout_sec: float = 12.0) -> tuple:
+        import aiohttp
+
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout_sec)
+            # 注意: /user/subscription 已搬到 image 域名，
+            # 调 api 域名会回 400 "update to the image URL" (2026-10 实测)
+            async with (
+                aiohttp.ClientSession(timeout=timeout_obj, trust_env=False) as sess,
+                sess.get("https://image.novelai.net/user/subscription",
+                         headers={"Authorization": f"Bearer {token}"}) as resp,
+            ):
+                if resp.status == 200:
+                    return True, "ok"
+                if resp.status in (401, 403):
+                    return False, "auth"
+                if resp.status == 429:
+                    return False, "rate"
+                try:
+                    body = (await resp.text())[:200]
+                except Exception:
+                    body = ""
+                return False, f"http_{resp.status} {body}".strip()
+        except Exception:
+            logger.debug("NovelAI probe 异常", exc_info=True)
+            return False, "network"
+
+    @staticmethod
+    async def _probe_pixai(key: str, timeout_sec: float = 12.0) -> tuple:
+        import aiohttp
+
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout_sec)
+            async with (
+                aiohttp.ClientSession(timeout=timeout_obj, trust_env=False) as sess,
+                sess.get("https://api.pixai.art/v1/task/probe-invalid-id",
+                         headers={"Authorization": f"Bearer {key}"}) as resp,
+            ):
+                if resp.status in (200, 404):
+                    return True, "ok"
+                if resp.status in (401, 403):
+                    return False, "auth"
+                if resp.status == 429:
+                    return False, "rate"
+                return False, f"http_{resp.status}"
+        except Exception:
+            logger.debug("PixAI probe 异常", exc_info=True)
+            return False, "network"
+
+    # ═══════════════════════════════════════════════════════
     # 插件发现 — 动态探测已安装增强插件及其管理页面
     # ═══════════════════════════════════════════════════════
 
@@ -1591,7 +2401,7 @@ class ConfigWebUI:
         """
         try:
             from pathlib import Path
-            # 面板容器无 AstrBot 框架，用相对路径 (CWD=/AstrBot)
+            # 面板容器无 AstrBot 框架，用相对路径 (CWD=仓库根)
             try:
                 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
                 data_plugins = Path(get_astrbot_data_path()) / "plugins"

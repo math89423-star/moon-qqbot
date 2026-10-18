@@ -14,7 +14,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: resolve(__dirname, '../plugins/astrbot_plugin_suli_tavern/static'),
+    outDir: resolve(__dirname, '../astrbot_plugin_suli_tavern/static'),
     emptyOutDir: true,
   },
   resolve: {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 用户记忆管理 — 浏览 + 搜索 + 删除 (per-bot 隔离) */
-import { ref, inject, onMounted, watch, type Ref } from 'vue'
+import { ref, computed, inject, onMounted, watch, type Ref } from 'vue'
 import {
   listMemoryUsers, searchMemories, getUserMemories, deleteUserFact,
 } from '@/api/admin'
@@ -114,6 +114,11 @@ function goPage(delta: number) {
 function fmtTime(ts: number) {
   return new Date(ts * 1000).toLocaleString('zh-CN')
 }
+
+/** 时间线：按创建时间升序，旧账在前现状在后 */
+const sortedFacts = computed(() =>
+  [...userFacts.value].sort((a, b) => (a.created_at || 0) - (b.created_at || 0)),
+)
 
 onMounted(loadUsers)
 </script>
@@ -279,49 +284,44 @@ onMounted(loadUsers)
           <span>该用户暂无记忆</span>
         </div>
 
-        <div v-else class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>分类</th>
-                <th>内容</th>
-                <th>重要性</th>
-                <th>创建时间</th>
-                <th style="width:60px">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="f in userFacts" :key="f.fact_key">
-                <td><span class="tag tag-blue">{{ f.category }}</span></td>
-                <td class="fact-value">{{ f.fact_value }}</td>
-                <td>
-                  <div class="importance-cell">
-                    <div
-                      class="importance-bar"
-                      :class="f.importance >= 0.8 ? 'bar-high' : f.importance >= 0.5 ? 'bar-mid' : 'bar-low'"
-                      :style="{ width: (f.importance * 100) + '%' }"
-                    ></div>
-                    <span
-                      class="tag importance-tag"
-                      :class="f.importance >= 0.8 ? 'tag-orange' : f.importance >= 0.5 ? 'tag-blue' : 'tag-gray'"
-                    >{{ f.importance?.toFixed(2) }}</span>
-                  </div>
-                </td>
-                <td class="time-cell">{{ fmtTime(f.created_at) }}</td>
-                <td>
-                  <button
-                    class="btn btn-sm btn-ghost delete-btn"
-                    :disabled="deleting === f.fact_key"
-                    @click="deleteFact(selectedUser!, f.fact_key)"
-                    title="删除这条记忆"
-                  >
-                    <Trash2 :size="14" />
-                    {{ deleting === f.fact_key ? '...' : '' }}
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <div v-else class="timeline">
+          <div
+            v-for="f in sortedFacts"
+            :key="f.fact_key"
+            class="timeline-item"
+          >
+            <div
+              class="timeline-dot"
+              :class="f.importance >= 0.8 ? 'dot-high' : f.importance >= 0.5 ? 'dot-mid' : 'dot-low'"
+            ></div>
+            <div class="timeline-body">
+              <div class="timeline-meta">
+                <span class="tag tag-blue">{{ f.category }}</span>
+                <span class="time-cell">{{ fmtTime(f.created_at) }}</span>
+                <span
+                  class="tag importance-tag"
+                  :class="f.importance >= 0.8 ? 'tag-orange' : f.importance >= 0.5 ? 'tag-blue' : 'tag-gray'"
+                >{{ f.importance?.toFixed(2) }}</span>
+                <button
+                  class="btn btn-sm btn-ghost delete-btn"
+                  :disabled="deleting === f.fact_key"
+                  @click="deleteFact(selectedUser!, f.fact_key)"
+                  title="删除这条记忆"
+                >
+                  <Trash2 :size="14" />
+                  {{ deleting === f.fact_key ? '...' : '' }}
+                </button>
+              </div>
+              <div class="timeline-text">{{ f.fact_value }}</div>
+              <div class="importance-cell">
+                <div
+                  class="importance-bar"
+                  :class="f.importance >= 0.8 ? 'bar-high' : f.importance >= 0.5 ? 'bar-mid' : 'bar-low'"
+                  :style="{ width: (f.importance * 100) + '%' }"
+                ></div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -471,6 +471,71 @@ onMounted(loadUsers)
   font-size: 13px;
   font-weight: 600;
   color: #6366f1;
+}
+
+/* ── Timeline ── */
+.timeline {
+  position: relative;
+  padding: 8px 0 8px 10px;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 15px;
+  top: 14px;
+  bottom: 14px;
+  width: 2px;
+  background: linear-gradient(180deg, #818cf8, #e0e7ff);
+  border-radius: 1px;
+}
+.timeline-item {
+  position: relative;
+  display: flex;
+  gap: 14px;
+  padding: 10px 0;
+}
+.timeline-dot {
+  position: relative;
+  z-index: 1;
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 2px #e0e7ff;
+  flex-shrink: 0;
+}
+.dot-high {
+  background: #ef4444;
+}
+.dot-mid {
+  background: #6366f1;
+}
+.dot-low {
+  background: #cbd5e1;
+}
+.timeline-body {
+  flex: 1;
+  min-width: 0;
+  background: #f8fafc;
+  border: 1px solid #eef2ff;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.timeline-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.timeline-meta .delete-btn {
+  margin-left: auto;
+}
+.timeline-text {
+  font-size: 13px;
+  color: #1e293b;
+  line-height: 1.6;
+  word-break: break-word;
 }
 
 /* ── Delete Button ── */

@@ -50,12 +50,20 @@ def _resolve_knowledge_dir() -> Path:
         return _DEFAULT_KNOWLEDGE_DIR
     return Path(__file__).resolve().parent / "knowledge"
 
-# BGE-M3 本地模型路径
-_BGE_M3_PATH = (
-    "/mnt/d/BaiduNetdiskDownload/model/hub/"
-    "models--BAAI--bge-m3/snapshots/"
-    "5617a9f61b028005a4858fdac845db406aefb181"
-)
+# BGE-M3 本地模型路径: 项目内 models/bge-m3 为准 (git 忽略)。
+# 候选顺序: 环境变量 > 仓库 models/ (部署位置无关, 不含绝对路径)。
+def _resolve_bge_path() -> str:
+    import os as _os
+    _cands = [
+        _os.environ.get("EMBEDDING_MODEL_PATH", ""),
+        str(Path(__file__).resolve().parents[1] / "models" / "bge-m3"),
+    ]
+    for _p in _cands:
+        if _p and Path(_p).exists():
+            return _p
+    return _cands[1]
+
+_BGE_M3_PATH = _resolve_bge_path()
 
 # BGE 查询前缀 — 必须加在 query 侧，不加以检索质量显著下降
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -259,24 +267,31 @@ class KnowledgeBase:
     def _encode_via_http(
         self, texts: list[str], normalize_embeddings: bool,
     ) -> np.ndarray | None:
-        """通过 HTTP embedding 服务编码。失败返回 None。"""
+        """通过 HTTP embedding 服务编码。失败返回 None。
+
+        服务端限制单请求 ≤512 条 (EncodeRequest.max_length), 分批 ≤400 发送。
+        """
         try:
             url = f"{self._embedding_service_url}/encode"
-            payload = json.dumps({
-                "texts": texts,
-                "normalize_embeddings": normalize_embeddings,
-            }).encode()
             proxy_handler = urllib.request.ProxyHandler({})
             opener = urllib.request.build_opener(proxy_handler)
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with opener.open(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode())
-            embeddings = np.array(data["embeddings"], dtype=np.float32)
-            return embeddings
+            embeddings: list[np.ndarray] = []
+            chunk_size = 400
+            for i in range(0, len(texts), chunk_size):
+                chunk = texts[i:i + chunk_size]
+                payload = json.dumps({
+                    "texts": chunk,
+                    "normalize_embeddings": normalize_embeddings,
+                }).encode()
+                req = urllib.request.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with opener.open(req, timeout=300) as resp:
+                    data = json.loads(resp.read().decode())
+                embeddings.append(np.array(data["embeddings"], dtype=np.float32))
+            return np.concatenate(embeddings, axis=0)
         except Exception:
             logger.warning("HTTP embedding 编码失败", exc_info=True)
             self._http_embedding_ok = False
@@ -357,7 +372,7 @@ class KnowledgeBase:
             return 0
 
         count = 0
-        for path in sorted(self._dir.glob("*.md")):
+        for path in sorted(self._dir.rglob("*.md")):
             try:
                 text = path.read_text(encoding="utf-8")
                 sections = self._parse(text, path.name)
@@ -417,15 +432,32 @@ class KnowledgeBase:
                 )
                 return
             if existing_count > 0:
+                # 小偏差（≤10）视为已持久化，避免 655 条全量重嵌（~30s 阻塞 tool_loop）
+                # 成因：_web_cache 增量写入直接进 Chroma，未计入 sections（旧 glob 非递归）
+                if abs(existing_count - len(self._sections)) <= 10:
+                    self._embedding_ok = True
+                    logger.info(
+                        "向量索引轻微不匹配 (chroma=%d vs sections=%d), 视为已持久化跳过重建",
+                        existing_count, len(self._sections),
+                    )
+                    return
                 logger.info(
-                    "向量索引条目数不匹配 (chroma=%d vs sections=%d), 重建",
+                    "向量索引条目数不匹配 (chroma=%d vs sections=%d), 跳过重建走关键词（避免 30s 阻塞）",
                     existing_count, len(self._sections),
                 )
+                self._embedding_ok = False
+                # 后台增量重建，避免下次仍 mismatch（不阻塞当前 tool_loop）
+                try:
+                    import threading
+                    threading.Thread(target=self._background_rebuild, daemon=True).start()
+                except Exception:
+                    pass
+                return
         except Exception:
             # count() 可能失败 (旧版 chromadb), 回退到全量重建
             logger.debug("ChromaDB count() 失败, 回退到全量重建", exc_info=True)
 
-        # 索引缺失或不匹配 → 需要 embedding → 此时才加载模型
+        # 索引缺失（0 条）→ 需要 embedding → 此时才加载模型（首次启动，允许阻塞）
         if not self._init_model():
             return
 
@@ -469,6 +501,40 @@ class KnowledgeBase:
             logger.warning("向量索引构建失败，回退关键词检索", exc_info=True)
             self._use_embedding = False
             self._embedding_ok = False
+
+    def _background_rebuild(self) -> None:
+        """后台全量重建（mismatch>10 时触发，不阻塞 tool_loop）。"""
+        try:
+            logger.info("后台重建触发: %d 章节", len(self._sections))
+            if not self._init_model():
+                return
+            texts = [sec.full_text for sec in self._sections]
+            ids = [f"{sec.source}:{i}" for i, sec in enumerate(self._sections)]
+            metadatas = [
+                {
+                    "title": sec.title,
+                    "source": sec.source,
+                    "tokens_json": json.dumps(list(sec.tokens), ensure_ascii=False),
+                }
+                for sec in self._sections
+            ]
+            embeddings = self._encode(texts, normalize_embeddings=True)
+            try:
+                old_ids = self._collection.get()["ids"]
+                if old_ids:
+                    self._collection.delete(ids=old_ids)
+            except Exception:
+                pass
+            self._collection.add(
+                ids=ids,
+                documents=[sec.truncated() for sec in self._sections],
+                embeddings=embeddings.tolist(),
+                metadatas=metadatas,
+            )
+            self._embedding_ok = True
+            logger.info("后台重建完成: %d 条", len(ids))
+        except Exception:
+            logger.warning("后台重建失败", exc_info=True)
 
     # ── 解析 ─────────────────────────────────────────────
 
@@ -604,6 +670,19 @@ class KnowledgeBase:
                 "知识库向量检索: query=%r → %d 结果 sims=%s",
                 query, len(documents), sims,
             )
+            # 阈值过滤: sim <0.15 视为不相关，直接丢弃（避免 0.05 垃圾注入）
+            # 对应距离 >0.85，若全部低于阈值则回退关键词或返回空
+            if sims and max(sims) < 0.15:
+                logger.info("知识库向量检索: 最高 sim %.3f <0.15 阈值，视为无结果", max(sims))
+                return []
+            # 单条过滤
+            filtered: list[str] = []
+            for doc, sim in zip(documents, sims or [1.0] * len(documents)):
+                if sim >= 0.15:
+                    filtered.append(doc)
+            if len(filtered) != len(documents):
+                logger.info("知识库阈值过滤: %d→%d 条 (阈值0.15)", len(documents), len(filtered))
+            return filtered
 
         return documents
 
@@ -640,6 +719,10 @@ class KnowledgeBase:
                 query, len(results), len(scored),
                 scored[0][0] if scored else 0,
             )
+            # 阈值过滤: 最高分 <3.0 视为不相关（标题命中5分，至少需1个标题词或3个正文词）
+            if scored and scored[0][0] < 3.0:
+                logger.info("知识库关键词检索: top_score %.1f <3.0 阈值，视为无结果", scored[0][0])
+                return []
 
         return results
 

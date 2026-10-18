@@ -355,8 +355,23 @@ _BOT_ACCUSATION_WEAK: list[str] = [
     "语言模型", "llm",
 ]
 
-# QQ @提及提取: [CQ:at,qq=XXXXX] — 支持数字QQ号和字母数字user_id
-_CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^\]]+)\]")
+# @提及提取: 从平台特定格式提取被 @ 的 user_id
+# 正则从平台适配器懒加载 (QQ: [CQ:at,qq=XXXXX], 微信: 不同格式)
+_CQ_AT_RE: "re.Pattern | None" = None  # 懒加载
+
+
+def _get_cq_at_re() -> "re.Pattern":
+    """获取 @提及提取正则 (优先从平台适配器，fallback QQ 内置)。"""
+    global _CQ_AT_RE
+    if _CQ_AT_RE is not None:
+        return _CQ_AT_RE
+    try:
+        from astrbot_plugin_suli_tavern.adapters.qq_adapter import QQPlatformAdapter
+        _CQ_AT_RE = QQPlatformAdapter.CQ_AT_RE
+    except Exception:
+        import re as _re
+        _CQ_AT_RE = _re.compile(r"\[CQ:at,qq=([^\]]+)\]")
+    return _CQ_AT_RE
 
 # 社交信号衰减半衰期 — 1h (比行为信号 24h 快得多)
 # 原因: 群友说完就忘了, 口述信号时效性短
@@ -414,7 +429,7 @@ def _detect_social_bot_mention(content: str, ctx) -> list[tuple[str, float]]:
     # ── Phase 2: 提取目标用户 ──
 
     # 2a. 提取 @提及 的目标
-    at_targets = _CQ_AT_RE.findall(content)
+    at_targets = _get_cq_at_re().findall(content)
     at_self = False  # 是否 @了 bot 自己
     for target_uid in at_targets:
         if target_uid.startswith("bot_"):
@@ -530,7 +545,7 @@ def _detect_identity_challenge(content: str, user_id: str, user_name: str) -> bo
     lower = content.lower().strip()
 
     # 1. 直接对 bot 的 @提及 + bot 指控
-    at_targets = _CQ_AT_RE.findall(content)
+    at_targets = _get_cq_at_re().findall(content)
     has_at_bot = any(t.startswith("bot_") for t in at_targets) if at_targets else False
 
     # 2. 关键词匹配

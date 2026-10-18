@@ -56,7 +56,7 @@ _CMD_FETCH_PATTERN = re.compile(
 _DECODED_TRIGGERS: tuple[str, ...] = (
     "ignore previous instructions",
     "system prompt",
-    "猫娘", "越狱", "jailbreak",
+    "越狱", "jailbreak",
     "developer mode override",
     "role: system",
     "begin prompt",
@@ -107,8 +107,8 @@ _KEYWORD_WEIGHTS: dict[str, int] = {
     "忽略安全": 4,
     "跳过安全": 4,
     "我是你的上级": 3,
-    "猫娘": 2,
-    "galgame": 2,
+    # 2026-10-12 审计: 「猫娘/galg…」是本群日常语料（自家 bot 就是猫娘/蛇娘人设），
+    # 计分只会误伤正常角色扮演，已移除。真越狱靠其他信号叠加。
     "system override": 4,
     "strip rules": 3,
     "embrace jailbreak": 4,

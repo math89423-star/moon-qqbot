@@ -3,9 +3,13 @@
 替代所有散落在各文件中的硬编码 QQ 号、bot 名称、昵称映射。
 所有运行时 bot 身份查询统一走此类，数据持久化在 bot_identity 表中。
 
+身份配置真相源: 环境变量 (.env) (BOT_QQ_MAIN/BOT_QQ_ALT/SUPER_ADMIN_QQ/OWNER_QQ_WHITELIST)，
+经部署脚本以环境变量注入进程。本模块只读环境变量，
+不含任何 QQ 号/密码明文。
+
 用法:
     svc = get_bot_identity_service()
-    bot = svc.get_bot("000000000")
+    bot = svc.get_bot(get_default_bot_id())
     bots = svc.list_bots(active_only=True)
 """
 
@@ -20,18 +24,66 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+# ── 环境变量身份解析 (.env 为身份真相源) ──────────────────
+# 业务代码的 QQ 号兜底统一走这三个函数，禁止在各文件散落明文。
+
+def _first_env(*keys: str) -> str:
+    """按序取第一个非空环境变量，剥空白。"""
+    for key in keys:
+        val = (_os.getenv(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def get_default_bot_id() -> str:
+    """默认 bot QQ：BOT_QQ_MAIN > BOT_ID_MAIN > BOT_QQ_ALT > BOT_ID_ALT。
+
+    缺省返回空串 (fail-closed：调用方不得伪造归属)。
+    """
+    return _first_env("BOT_QQ_MAIN", "BOT_ID_MAIN", "BOT_QQ_ALT", "BOT_ID_ALT")
+
+
+def get_admin_qq() -> str:
+    """超级管理员 QQ：SUPER_ADMIN_QQ > ADMIN_QQ。缺省返回空串。"""
+    return _first_env("SUPER_ADMIN_QQ", "ADMIN_QQ")
+
+
+def get_owner_qq_set() -> set[str]:
+    """主人 QQ 白名单：OWNER_QQ_WHITELIST (逗号分隔) > SUPER_ADMIN_QQ。
+
+    缺省返回空集 (fail-closed：无人豁免)。
+    """
+    raw = _first_env("OWNER_QQ_WHITELIST", "SUPER_ADMIN_QQ", "ADMIN_QQ")
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip().isdigit()}
+
+
+def get_qq_char_map() -> dict[str, str]:
+    """QQ 号 → 角色卡 key 映射 (BOT_QQ_MAIN→BOT_CHAR_MAIN 等，缺失项跳过)。"""
+    mapping: dict[str, str] = {}
+    main_qq = _first_env("BOT_QQ_MAIN", "BOT_ID_MAIN")
+    alt_qq = _first_env("BOT_QQ_ALT", "BOT_ID_ALT")
+    main_char = (_os.getenv("BOT_CHAR_MAIN", "") or "").strip() or "moon"
+    alt_char = (_os.getenv("BOT_CHAR_ALT", "") or "").strip() or "moon"
+    if main_qq:
+        mapping[main_qq] = main_char
+    if alt_qq:
+        mapping[alt_qq] = alt_char
+    return mapping
+
+
 @dataclass
 class BotIdentity:
     """单个 bot 的完整身份信息。"""
     bot_id: str                      # QQ 号
     name: str                        # 显示名 (如 "暮恩")
-    character_card: str = ""         # 角色卡文件名 ("loput")
+    character_card: str = ""         # 角色卡文件名 ("moon")
     nicknames: list[str] = field(default_factory=list)   # ["小洛", "洛洛"]
     is_active: bool = True
-    peer_bot_ids: list[str] = field(default_factory=list)  # 例如 ["123456789"]
+    peer_bot_ids: list[str] = field(default_factory=list)  # 对照 bot 的 QQ 号列表
     icon: str = "🤖"
     color: str = "#666666"
-    role_description: str = ""       # "蛇娘" / "猫娘"
+    role_description: str = ""       # 角色身份短标签
     rejection_style: dict = field(default_factory=dict)  # {"style_label","pronoun","tone_hint"} 工具拒绝文案风格
     llm_slots: tuple[str, ...] = ()  # per-bot LLM 槽位覆盖，空=默认
     metadata: dict = field(default_factory=dict)  # 原始 JSON blob
@@ -132,12 +184,12 @@ class BotIdentityService:
           3. 无环境变量也无角色卡 → 跳过（bot 列表为空，管理面板手动创建）
         """
         char_dir = Path(__file__).resolve().parent.parent / "characters"
-        main_qq = _os.getenv("BOT_QQ_MAIN", "")
-        alt_qq = _os.getenv("BOT_QQ_ALT", "")
+        main_qq = _first_env("BOT_QQ_MAIN", "BOT_ID_MAIN")
+        alt_qq = _first_env("BOT_QQ_ALT", "BOT_ID_ALT")
         main_char = _os.getenv("BOT_CHAR_MAIN", "")
         alt_char = _os.getenv("BOT_CHAR_ALT", "")
 
-        # 构建 QQ → card_name 映射
+        # 构建 bot_id → card_name 映射
         mapping: dict[str, str] = {}
         if main_qq and main_char:
             mapping[main_qq] = main_char
@@ -305,7 +357,7 @@ class BotIdentityService:
         """获取 bot 对应的角色卡文件名。
 
         Returns:
-            角色卡文件名 (如 "loput")，未知 bot 返回空字符串。
+            角色卡文件名 (如 "moon")，未知 bot 返回空字符串。
         """
         bot = self.get_bot(str(bot_id))
         return bot.character_card if bot else ""

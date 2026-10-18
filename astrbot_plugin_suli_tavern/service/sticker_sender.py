@@ -249,32 +249,45 @@ _sticker_event: contextvars.ContextVar[Event | None] = contextvars.ContextVar(
 )
 
 
-def set_sticker_context(bot: Bot, event: Event) -> None:
-    """设置表情包发送上下文 (在 LLM 调用前调用)。"""
-    _sticker_bot.set(bot)
-    _sticker_event.set(event)
-
-
 def clear_sticker_context() -> None:
     """清除上下文 (LLM 调用后)。"""
     _sticker_bot.set(None)
     _sticker_event.set(None)
+    _shared_context.clear()
+
+
+# ── 模块级共享上下文 (执行器路径无法访问 contextvars, 用模块级 dict 兜底) ──
+_shared_context: dict[str, Bot | Event | None] = {"bot": None, "event": None}
+
+
+def set_sticker_context(bot: Bot, event: Event) -> None:
+    """设置表情包发送上下文 (在 LLM 调用前调用)。"""
+    _sticker_bot.set(bot)
+    _sticker_event.set(event)
+    _shared_context["bot"] = bot
+    _shared_context["event"] = event
 
 
 # ═════════════════════════════════════════════════════════════════
 # Catalog 加载
 # ═════════════════════════════════════════════════════════════════
 
-_catalog: dict = _build_catalog()
+_catalog: dict | None = None
+_catalog_last_build: float = 0.0
+_CATALOG_CACHE_TTL: float = 30.0  # 最多 30 秒重建一次
 
 
 def _get_catalog() -> dict:
-    """获取 sticker catalog，每次调用重新扫描目录。
+    """获取 sticker catalog，带 TTL 缓存。
 
-    运行中通过 webui 新增/删除图片后无需重启即可生效。
+    运行中通过 webui 新增/删除图片后，最多 30 秒后生效 (而非每次消息都重建)。
     """
-    global _catalog
-    _catalog = _build_catalog()
+    global _catalog, _catalog_last_build
+    import time
+    now = time.monotonic()
+    if _catalog is None or (now - _catalog_last_build) > _CATALOG_CACHE_TTL:
+        _catalog = _build_catalog()
+        _catalog_last_build = now
     return _catalog
 
 

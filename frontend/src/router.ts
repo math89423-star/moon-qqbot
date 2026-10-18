@@ -16,6 +16,12 @@ const router = createRouter({
       meta: { title: '机器人配置' },
     },
     {
+      path: '/nsfw-config',
+      name: 'nsfwConfig',
+      component: () => import('@/views/NsfwConfig.vue'),
+      meta: { title: 'NSFW 配置' },
+    },
+    {
       path: '/bot-manage',
       name: 'botManage',
       component: () => import('@/views/BotManage.vue'),
@@ -56,6 +62,18 @@ const router = createRouter({
       name: 'memes',
       component: () => import('@/views/MemeManager.vue'),
       meta: { title: '表情包管理' },
+    },
+    {
+      path: '/draw-novelai',
+      name: 'drawNovelai',
+      component: () => import('@/views/DrawNovelai.vue'),
+      meta: { title: '绘图 · NovelAI' },
+    },
+    {
+      path: '/draw-pixai',
+      name: 'drawPixai',
+      component: () => import('@/views/DrawPixai.vue'),
+      meta: { title: '绘图 · PixAI' },
     },
   ],
 })

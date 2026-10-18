@@ -19,6 +19,8 @@ import time
 
 from astrbot_plugin_suli_pipeline import PIPELINE_SILENCE, Pipeline, PipelineContext, PipelineStep
 
+from ..platform_adapter import build_at_mention as _platform_build_at
+
 logger = logging.getLogger(__name__)
 
 
@@ -389,7 +391,12 @@ class PostProcessStep(PipelineStep):
                 from emotion import get_user_relation
             try:
                 _sched = ctx.get("scheduler")
-                _bot_id = getattr(_sched, "_current_bot_id", "") or ""
+                try:
+                    from ..service.bot_identity import get_default_bot_id
+                    _bot_fallback = get_default_bot_id()
+                except Exception:
+                    _bot_fallback = ""
+                _bot_id = getattr(_sched, "_current_bot_id", "") or _bot_fallback
                 rel = get_user_relation(trigger_uid, self_id=_bot_id, peer_bot_qq=cfg.peer_bot_qq)
                 from astrbot_plugin_suli_emotion import get_global_mood
                 global_mood = get_global_mood(_bot_id)
@@ -454,7 +461,12 @@ class SendReplyStep(PipelineStep):
                 try:
                     from astrbot_plugin_suli_emotion import get_global_mood
                     _sched = ctx.get("scheduler")
-                    _bot_id = getattr(_sched, "_current_bot_id", "") or ""
+                    try:
+                        from ..service.bot_identity import get_default_bot_id
+                        _bot_fallback2 = get_default_bot_id()
+                    except Exception:
+                        _bot_fallback2 = ""
+                    _bot_id = getattr(_sched, "_current_bot_id", "") or _bot_fallback2
                     global_mood = get_global_mood(_bot_id)
                     if global_mood.arousal > 0.5:
                         delay *= 0.5
@@ -462,7 +474,8 @@ class SendReplyStep(PipelineStep):
                         delay *= 1.5
                 except Exception:
                     pass
-            await asyncio.sleep(delay)
+            # P0-2 对齐: 单发路径无分段可摊, 预延迟封顶 1.0s (多余直接丢掉)
+            await asyncio.sleep(min(delay, 1.0))
         except Exception:
             pass
 
@@ -475,7 +488,12 @@ class SendReplyStep(PipelineStep):
         if get_reverse_prompt_cache:
             try:
                 _sched = ctx.get("scheduler")
-                _bid = getattr(_sched, "_current_bot_id", "") or ""
+                try:
+                    from ..service.bot_identity import get_default_bot_id
+                    _bot_fallback3 = get_default_bot_id()
+                except Exception:
+                    _bot_fallback3 = ""
+                _bid = getattr(_sched, "_current_bot_id", "") or _bot_fallback3
                 _vlm_cached = get_reverse_prompt_cache(f"{_bid}:g{gctx.group_id}")
                 if _vlm_cached:
                     reply = _vlm_cached + "\n\n---\n\n" + reply
@@ -494,6 +512,14 @@ class SendReplyStep(PipelineStep):
                 ) or "")
             except Exception:
                 pass
+            # 主人 QQ 集合: 供 "@主人"/"@好孩子" 这类关系称呼指回真人 (2026-10-18)
+            _master_uids: tuple[str, ...] = ()
+            try:
+                from ..service.draw_access import get_master_ids as _gmi
+                _master_uids = tuple(
+                    _gmi(getattr(ctx.get("scheduler"), "_current_bot_id", "") or ""))
+            except Exception:
+                _master_uids = ()
             reply = resolve_at_mentions(
                 reply,
                 gctx.messages,
@@ -501,6 +527,7 @@ class SendReplyStep(PipelineStep):
                 peer_bot_qq=_peer_qq,
                 trigger_uid=trigger_uid,
                 trigger_name=trigger_user_name,
+                master_uids=_master_uids,
             )
         except Exception:
             pass
@@ -520,12 +547,12 @@ class SendReplyStep(PipelineStep):
         if (
             trigger_uid
             and trigger_reason in ("mention", "nickname", "reply", "thread_continuation")
-            and f"[CQ:at,qq={trigger_uid}]" not in reply
+            and _platform_build_at(trigger_uid) not in reply
         ):
             _bot_qqs = set()
             try:
-                from astrbot_plugin_suli_guards.dual_bot import get_bot_qq_set
-                _bot_qqs = set(get_bot_qq_set())
+                from astrbot_plugin_suli_guards.dual_bot import get_known_bot_ids
+                _bot_qqs = set(get_known_bot_ids())
             except Exception:
                 pass
             _peer_qq2 = ""
@@ -546,7 +573,7 @@ class SendReplyStep(PipelineStep):
                     except Exception:
                         pass
                 else:
-                    reply = f"[CQ:at,qq={trigger_uid}] {reply}"
+                    reply = f"{_platform_build_at(trigger_uid)} {reply}"
 
         # ── QQ 引用: 直接触发时 reply_message=True 锚定原消息 ──
         _reply_message = trigger_reason in ("mention", "nickname", "reply",

@@ -12,7 +12,7 @@
 用法:
   from .identity_tracker import IdentityTracker, ChangeDetector
 
-  tracker = IdentityTracker(owner_qq_whitelist={"000000000"})
+  tracker = IdentityTracker(owner_qq_whitelist={"OWNER_QQ"})
   detector = ChangeDetector()
 
   for msg in messages:

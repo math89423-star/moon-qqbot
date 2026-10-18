@@ -335,21 +335,6 @@ class ContextGatherer:
                         "reason": "话题涉及时效性内容",
                     }
 
-        # 8e. 询问 bot 能力/状态
-        if trigger_msg:
-            _status_kw = ["你能做什么", "你能干嘛", "你有什么能力", "你有哪些功能",
-                          "你在线吗", "你还在吗", "你活着吗", "你正常吗",
-                          "状态", "系统状态"]
-            if any(kw in trigger_msg for kw in _status_kw):
-                preflight.recommended_tools.append("check_lport_status")
-
-        # 8f. 询问可用模型
-        if trigger_msg:
-            _model_kw = ["有哪些模型", "什么模型", "模型列表", "支持哪些",
-                         "checkpoint", "lora.*有哪些", "模型.*推荐"]
-            if any(re.search(kw, trigger_msg) for kw in _model_kw):
-                preflight.recommended_tools.append("list_available_models")
-
         # ── 9. 决定是否收集 ──
         threshold = (
             getattr(config, "preflight_collect_threshold", DEFAULT_COLLECT_THRESHOLD)
@@ -384,7 +369,7 @@ class ContextGatherer:
     async def collect(
         preflight: ContextPreflight,
         tavern,  # duck-typed: .chat_with_tools() 或类似接口
-        provider: str = "deepseek",
+        provider: str = "",
         config=None,
         bot_id: str = "",
     ) -> dict[str, str]:
@@ -488,10 +473,6 @@ class ContextGatherer:
             return await ContextGatherer._collect_web_search(
                 detail.get("query", ""),
             )
-        if tool_name == "check_lport_status":
-            return await ContextGatherer._collect_status()
-        if tool_name == "list_available_models":
-            return await ContextGatherer._collect_models()
         return None
 
     @staticmethod
@@ -543,27 +524,6 @@ class ContextGatherer:
                 return format_web_results(results, query)[:800]
         except Exception as e:
             logger.debug("Pre-flight 网页搜索失败: %s", e)
-        return None
-
-    @staticmethod
-    async def _collect_status() -> str | None:
-        """查询 L-Port 系统状态。"""
-        try:
-            from .tools import execute_health_check
-            return await execute_health_check({})
-        except Exception as e:
-            logger.debug("Pre-flight 状态查询失败: %s", e)
-        return None
-
-    @staticmethod
-    async def _collect_models() -> str | None:
-        """查询可用模型列表。"""
-        try:
-            from .tools import execute_list_models
-            result = await execute_list_models({"filter_type": "all"})
-            return result[:600] if result else None
-        except Exception as e:
-            logger.debug("Pre-flight 模型查询失败: %s", e)
         return None
 
     # ── 辅助方法 ───────────────────────────────────────
@@ -666,8 +626,6 @@ def format_collected_context(
             "describe_image": "🖼️ 图片分析",
             "get_memory": "📝 用户记忆",
             "web_search": "🌐 网页搜索",
-            "check_lport_status": "🔌 系统状态",
-            "list_available_models": "📦 可用模型",
         }.get(tool_name, f"🔧 {tool_name}")
         bg_lines.append(f"\n{label}:\n{result[:600]}")
 

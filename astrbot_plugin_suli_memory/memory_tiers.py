@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..config import Config
 
+from .user_memory import is_empty_memory_text
+
 logger = logging.getLogger(__name__)
 
 # ── 存储路径 ──────────────────────────────────────────────
@@ -186,6 +188,7 @@ class CoreMemoryStore:
                     "规则:\n"
                     "- 每条特征是一个简洁的判断句 (≤20字)\n"
                     "- 只提炼有长期价值的特征，忽略一次性话题\n"
+                    "- 关系评价类只存关系现状一句，带起止（如「曾被冷落，现已和好」），不存孤立的「好/坏」\n"
                     "- 不要把具体设备型号当作特征"
                     "（「使用RTX 4060」不是特征，"
                     "「PC游戏玩家，关注硬件」才是）\n"
@@ -216,16 +219,20 @@ class CoreMemoryStore:
         except Exception:
             logger.debug("MemoryTierManager: resolve_background_llm 失败", exc_info=True)
 
+        if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+            logger.warning("MemoryTierManager: 前端无可用 LLM 槽位，跳过蒸馏 (bot_id=%r)", self._bot_id)
+            return existing_facts
         try:
             result = await asyncio.wait_for(
                 tavern.chat(
                     distill_messages,
                     temperature=0.3,
                     max_tokens=256,
-                    model=_bg_llm.get("model", "deepseek-v4-flash"),
+                    model=_bg_llm.get("model", ""),
                     api_base=_bg_llm.get("api_base", ""),
                     api_key=_bg_llm.get("api_key", ""),
                     extra_params=_bg_llm.get("extra_params"),
+                    bot_id=self._bot_id or "",
                 ),
                 timeout=45,
             )
@@ -239,6 +246,9 @@ class CoreMemoryStore:
             for line in result.split("\n"):
                 line = line.strip().lstrip("- ").lstrip("-")
                 if not line or line == "无":
+                    continue
+                # 空值拦截: 哨兵 "(空回复)" 绝不落盘 (2026-10-11 教训)
+                if is_empty_memory_text(line):
                     continue
                 if len(line) < 3:
                     continue
@@ -273,6 +283,13 @@ class CoreMemoryStore:
 
         except TimeoutError:
             logger.warning("CoreMemoryStore.distill: LLM 调用超时 (45s) for user=%s", user_id[:8])
+            return existing_facts
+        except RuntimeError as _re:
+            # 上游空 output 重试耗尽（muse-spark incomplete 偶发）：后台蒸馏按“无新特征”静默跳过，不刷异常栈
+            if "空 output" in str(_re) or "空 content" in str(_re):
+                logger.debug("core 蒸馏空回复跳过: %s", user_id)
+                return existing_facts
+            logger.exception("core 蒸馏失败: %s", user_id)
             return existing_facts
         except Exception:
             logger.exception("core 蒸馏失败: %s", user_id)

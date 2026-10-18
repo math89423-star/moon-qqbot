@@ -141,6 +141,9 @@ class GroupSummarizer:
         except Exception:
             logger.warning("GroupSummarizer: resolve_background_llm 失败, fallback 默认", exc_info=True)
 
+        if not _bg_llm.get("model") or not _bg_llm.get("api_base") or not _bg_llm.get("api_key"):
+            logger.warning("GroupSummarizer: 前端无可用 LLM 槽位，跳过摘要 (bot_id=%r)", bot_id)
+            return None
         try:
             raw = await asyncio.wait_for(
                 tavern.chat(
@@ -150,10 +153,11 @@ class GroupSummarizer:
                     ],
                     temperature=0.3,
                     max_tokens=200,
-                    model=_bg_llm.get("model", "deepseek-v4-flash"),
+                    model=_bg_llm.get("model", ""),
                     api_base=_bg_llm.get("api_base", ""),
                     api_key=_bg_llm.get("api_key", ""),
                     extra_params=_bg_llm.get("extra_params"),
+                    bot_id=bot_id,
                 ),
                 timeout=30,
             )
@@ -173,10 +177,11 @@ class GroupSummarizer:
             group_id, len(summary_text),
         )
 
-        # ── 持久化 ──
+        # ── 持久化 (per-bot 隔离, 2026-09-08) ──
         await _save_summary(
             group_id, summary_text,
             msg_range_start, msg_range_end, now,
+            bot_id=str(bot_id or ""),
         )
 
         # ── 重置消息计数器 ──
@@ -194,13 +199,19 @@ async def _save_summary(
     msg_start: int,
     msg_end: int,
     timestamp: float,
+    bot_id: str = "",
 ) -> None:
-    """写入 JSON 文件 + SQLite。"""
+    """写入 JSON 文件 + SQLite。bot_id 非空时按 per-bot 路径/行存储。
+
+    历史遗留的无 bot 归属文件/行（bot_id=''）保留原位只读，不迁移
+    （作者不可考，强行归属即污染）。
+    """
 
     # 1. JSON 文件
     try:
-        _SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
-        path = _SUMMARY_DIR / f"{group_id}.json"
+        _bot_dir = _SUMMARY_DIR / (str(bot_id) if bot_id else "_shared")
+        _bot_dir.mkdir(parents=True, exist_ok=True)
+        path = _bot_dir / f"{group_id}.json"
 
         existing: dict = {}
         if path.exists():
@@ -237,9 +248,9 @@ async def _save_summary(
         db = get_bot_db()
         db.conn.execute(
             "INSERT INTO group_summaries "
-            "(group_id, summary_text, message_range_start, message_range_end, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (group_id, summary_text, msg_start, msg_end, timestamp),
+            "(group_id, summary_text, message_range_start, message_range_end, created_at, bot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (group_id, summary_text, msg_start, msg_end, timestamp, str(bot_id or "")),
         )
         db.conn.commit()
     except Exception:

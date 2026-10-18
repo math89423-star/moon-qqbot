@@ -1,7 +1,10 @@
 """GateResultProtocol — Gate 评估结果的结构类型契约。
 
-所有 FullGateResult 消费者（group_chat.py, prompt_builder.py 等）
-通过此协议只读访问 gate 输出，不依赖具体 dataclass。
+[历史] 此协议描述已删除的 FullGateResult 形状。现役 SlimGateResult
+只有 candidate_route/task_hint/group_context 等少量字段；此处保留协议
+名仅为兼容三个旧链消费点 (group_chat._fmt_gate/_log_handoff、
+prompt_builder._build_gate_directive、deep_qa.is_deep_question_via_gate) 的
+import 不炸。运行时 duck-typed，不做强制校验。新代码不要再依赖本协议。
 
 用法:
     from astrbot_plugin_suli_gate import GateResultProtocol
@@ -16,16 +19,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from .intent_gate import CrossBotAction, GroupContext, GroupSituation
+    from .intent_gate import GroupContext
+    from .opportunity import OpportunityScore
 
 
 class GateResultProtocol(Protocol):
-    """Gate 评估结果的结构类型契约。
+    """Gate 评估结果的结构类型契约 (历史遗留，描述已删除的 Full 形状)。
 
-    
-    保留旧字段名作为向后兼容 — 新代码应使用 task.* / tools.* / reply_baseline.*。
-
-    协议不要求继承——FullGateResult 通过结构子类型自然满足。
+    保留旧字段名仅为兼容旧链消费点的 import/注解 — 新代码不要再用。
     """
 
     # ── 四大职责 ──
@@ -34,8 +35,10 @@ class GateResultProtocol(Protocol):
     tools: object  # ToolDecision
     reply_baseline: object  # ReplyBaseline
 
+    # ── 机会评分 (LLM 输出) ──
+    llm_opportunity_score: OpportunityScore
+
     # ── 元数据 ──
-    cross_bot_action: CrossBotAction | None
     should_profile: bool
     reply_target_user_id: str
     reply_target_user_name: str
@@ -52,9 +55,7 @@ class GateResultProtocol(Protocol):
     social_suppress_tools: bool
 
     # ═════════════════════════════════════════════════════════
-    # ★ 向后兼容 property 别名 (已通过 FullGateResult property 实现)
-    # 以下通过 Protocol 的 structural typing 自然满足 —
-    # FullGateResult 的 property 别名使得旧代码仍能 work。
+    # ★ 历史 property 别名区 (随 Full 退役，仅留名兼容注解)
     # ═════════════════════════════════════════════════════════
 
     # -- Stage 1 dead fields (永远固定值) --
@@ -120,5 +121,3 @@ class GateResultProtocol(Protocol):
     def intent_reasoning(self) -> str: ...
     @intent_reasoning.setter
     def intent_reasoning(self, value: str) -> None: ...
-    @property
-    def group_situation(self) -> GroupSituation | None: ...

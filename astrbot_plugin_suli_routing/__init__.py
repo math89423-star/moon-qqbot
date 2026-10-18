@@ -24,7 +24,7 @@
       user_message=msg,
       ...
   )
-  route = ModelRouter.resolve(tier, default_provider="deepseek")
+  route = ModelRouter.resolve(tier, default_provider="")
 """
 
 from .router import ModelRouter, init_credential_provider, init_domain_awareness

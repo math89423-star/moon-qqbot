@@ -125,6 +125,20 @@ def _compile_patterns(
 
 _HOSTILE_RE = _compile_patterns(_HOSTILE_PATTERNS)
 _SEXUALIZED_RE = _compile_patterns(_SEXUALIZED_PATTERNS)
+
+# ── NSFW 隔离区内仍永不放宽的模式 ────────────────────────
+# 与 tavern nsfw_zone.NSFW_ALWAYS_BLOCK_LABELS 对齐:
+#   成人合意内容在区内放宽; 「解除伦理约束」与「未成年相关」两类永远硬拦。
+# 这组只在 nsfw_zone=True 时检查 — 区外仍走上面的全量 _SEXUALIZED_RE。
+_NSFW_ALWAYS_BLOCK_PATTERNS: list[tuple[str, int]] = [
+    # 诱导解除伦理约束
+    (r"(没有|不受|解除|无视|忽略).{0,8}(道德|伦理|底线|限制|约束)", 10),
+    (r"(忘记|忽略|无视|跳出).{0,6}(你的)?(设定|规则|限制|约束|人设)", 9),
+    # 未成年相关 (项目硬线, 任何区域都不放宽)
+    (r"(未成年|幼女|萝莉|萝莉控|小学生|初中生|高中生|14岁|13岁|12岁|11岁|10岁)", 9),
+    (r"(loli|shota|lolicon|underage|jailbait|minor\b)", 9),
+]
+_NSFW_ALWAYS_BLOCK_RE = _compile_patterns(_NSFW_ALWAYS_BLOCK_PATTERNS)
 _DIVIDE_CONQUER_RE = _compile_patterns(_DIVIDE_CONQUER_PATTERNS)
 _PROVOKING_RE = _compile_patterns(_PROVOKING_PATTERNS)
 _GENUINE_HELP_RE = _compile_patterns(_GENUINE_HELP_PATTERNS)
@@ -204,6 +218,7 @@ class InputClassifier:
         *,
         is_addressed_to_me: bool | None = None,
         peer_bot_name: str = "",
+        nsfw_zone: bool = False,
     ) -> InputClassification:
         """正则预筛选 — 零 LLM 成本。
 
@@ -213,6 +228,8 @@ class InputClassifier:
           - 真实求助 → 永远 needs_llm=True (必须经 LLM + is_addressed_to_me 确认!)
           - 挑拨离间/戏弄/低权敌意 → needs_llm=True (需要 LLM 语境理解)
           - is_addressed_to_me 未知时 → 不假设，交给 LLM
+          - nsfw_zone=True → 成人合意类性化内容降级为 needs_llm=True (交给 LLM
+            在完整人设下处理)；但「解除伦理约束 / 未成年相关」仍硬拦。
 
         Returns:
             InputClassification 含 needs_llm 标记。
@@ -239,10 +256,27 @@ class InputClassifier:
 
         # ── 安全硬线短路 (按优先级) ──
 
+        # 0. ★ NSFW 隔离区内永不放宽项 — 必须排在性化放宽之前。
+        #    为什么要独立一段而不是嵌在下面: 未成年相关 / 解除伦理约束这两类
+        #    不匹配 _SEXUALIZED_RE, 嵌进去就永远进不到那个分支。
+        if nsfw_zone:
+            _always = self._match_category(
+                content, _NSFW_ALWAYS_BLOCK_RE, InputNature.SEXUALIZED
+            )
+            if _always:
+                return _always  # needs_llm=False — 区内也不放宽
+
         # 1. 性化检测 (最高优先 — 安全硬线，可短路)
         sex_result = self._match_category(content, _SEXUALIZED_RE, InputNature.SEXUALIZED)
         if sex_result and sex_result.confidence >= 0.8:
-            return sex_result  # needs_llm=False (安全硬线)
+            if not nsfw_zone:
+                return sex_result  # needs_llm=False (安全硬线)
+            # ── NSFW 隔离区: 成人合意内容放宽 → 降级交 LLM, 不短路 ──
+            sex_result.needs_llm = True
+            sex_result.reasoning = (
+                f"{sex_result.reasoning} | NSFW Zone: 降级交 LLM".strip(" |")
+            )
+            return sex_result
 
         # 2. 严重敌意 (高权重 — 可短路)
         hostile_result = self._match_category(content, _HOSTILE_RE, InputNature.HOSTILE)

@@ -172,10 +172,11 @@ async def _compress_summary(
                     tavern.chat(
                         compress_messages,
                         temperature=compress_temp,
-                        max_tokens=256,
+                        max_tokens=1024,
                         provider=resolve_provider_fn(),
                         api_base="",
                         api_key="",
+                        slot="context_compress",
                     ),
                     timeout=30,
                 )
@@ -184,10 +185,11 @@ async def _compress_summary(
                 tavern.chat(
                     compress_messages,
                     temperature=compress_temp,
-                    max_tokens=256,
+                    max_tokens=1024,
                     provider=resolve_provider_fn(),
                     api_base="",
                     api_key="",
+                    slot="context_compress",
                 ),
                 timeout=30,
             )

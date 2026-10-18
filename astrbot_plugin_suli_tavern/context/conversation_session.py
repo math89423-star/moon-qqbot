@@ -28,6 +28,7 @@ LLM 角色反转: 只做罕见的归属歧义消解, 不可用时退回廉价信
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -59,7 +60,7 @@ class AttentionSlot:
     created_at: float = 0.0
     last_heated_at: float = 0.0
     anchor_messages: list[dict] = field(default_factory=list)
-    thread_summary: str = ""  # LLM 产出的对话脉络摘要 (1-2句结论, 挂在槽上, 随槽生命周期自动清理)
+    thread_summary: str = ""  # LLM 产出的对话脉络摘要 (覆盖范围+结论+关键证据，≤1000字，挂在槽上，随槽生命周期自动清理)
     state: str = "active"  # active | fading | cooling
 
     def __post_init__(self) -> None:
@@ -124,6 +125,10 @@ class AttentionSlotManager:
         self._archived_slot_ids: set[int] = set()
         # 情节记忆存储 (惰性注入，由 group_chat.py 初始化时调用 set_episodic_store)
         self._episodic_store: object | None = None
+        # 落盘 DB (惰性注入，set_db；无则纯内存行为不变)
+        self._db: object | None = None
+        # 启动恢复只做一次 (多 bot 初始化会重复调用)
+        self._restored: bool = False
 
     # ── Key ───────────────────────────────────────────────
 
@@ -133,9 +138,133 @@ class AttentionSlotManager:
 
     # ── 情节记忆归档 ───────────────────────────────────────
 
-    def set_episodic_store(self, store: object) -> None:
+    def set_episodic_store(self, store: object | None) -> None:
         """注入情节记忆存储实例 (由 group_chat.py 初始化时调用)。"""
         self._episodic_store = store
+
+    # ── 落盘持久化 (重启不失忆) ───────────────────────────
+    # DB: BotDatabase (duck-typed, 需 .conn)。整键 REPLACE 写，
+    # 恢复时按硬超时过滤 + tick 归一化。锁外调用方保证串行
+    # (heat/tick/cleanup 持 asyncio 锁；set/try_revive 为事件循环单线程)。
+
+    def set_db(self, db: object | None) -> None:
+        """注入 BotDatabase (由 group_chat.py 初始化时调用)。"""
+        self._db = db
+
+    def _persist_key(self, bot_id: str, group_id: int) -> None:
+        """落盘整键槽列表 (REPLACE)。无 db/空键静默跳过。"""
+        if getattr(self, "_db", None) is None or not bot_id or not group_id:
+            return
+        try:
+            conn = self._db.conn
+            key = self._key(bot_id, group_id)
+            slots = self._stores.get(key, [])
+            conn.execute(
+                "DELETE FROM attention_slots WHERE bot_id=? AND group_id=?",
+                (bot_id, int(group_id)),
+            )
+            now = time.time()
+            for s in slots:
+                anchors = [
+                    {"user_name": str(m.get("user_name", ""))[:20],
+                     "content": str(m.get("content", ""))[:100]}
+                    for m in (s.anchor_messages or [])[-3:]
+                    if isinstance(m, dict)
+                ]
+                conn.execute(
+                    "INSERT OR REPLACE INTO attention_slots "
+                    "(bot_id, group_id, topic_anchor, participants, energy, "
+                    " created_at, last_heated_at, anchor_messages, "
+                    " thread_summary, state, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (bot_id, int(group_id), s.topic_anchor or "",
+                     json.dumps(sorted(s.participants), ensure_ascii=False),
+                     float(s.energy), float(s.created_at), float(s.last_heated_at),
+                     json.dumps(anchors, ensure_ascii=False),
+                     s.thread_summary or "", s.state or "active", now),
+                )
+            conn.commit()
+        except Exception:
+            logger.debug("关注槽落盘失败", exc_info=True)
+
+    def restore_all(self) -> int:
+        """启动恢复: 读全表 → 按硬超时过滤 → tick 归一化 → 装载。
+
+        Returns:
+            恢复的槽数。_restored 标志保证只执行一次，重复调用直接返回 0。
+        """
+        if getattr(self, "_db", None) is None or self._restored:
+            return 0
+        self._restored = True
+        try:
+            rows = self._db.conn.execute(
+                "SELECT bot_id, group_id, topic_anchor, participants, energy, "
+                " created_at, last_heated_at, anchor_messages, thread_summary, state "
+                "FROM attention_slots",
+            ).fetchall()
+        except Exception:
+            logger.debug("关注槽恢复读取失败", exc_info=True)
+            return 0
+        now = time.time()
+        # 顺手清过期行 (超寿命即无意义)
+        try:
+            self._db.conn.execute(
+                "DELETE FROM attention_slots WHERE last_heated_at < ?",
+                (now - self.MAX_LIFETIME,),
+            )
+            self._db.conn.commit()
+        except Exception:
+            logger.debug("关注槽过期行清理失败", exc_info=True)
+        grouped: dict[str, list[AttentionSlot]] = {}
+        for r in rows:
+            try:
+                idle = now - float(r["last_heated_at"] or 0)
+                age = now - float(r["created_at"] or 0)
+                if idle > self.IDLE_TTL or age > self.MAX_LIFETIME:
+                    continue
+                state = str(r["state"] or "active")
+                if state == "cooling" and idle > self.COOLING_TTL:
+                    continue
+                try:
+                    participants = set(json.loads(r["participants"] or "[]"))
+                except Exception:
+                    participants = set()
+                try:
+                    anchors = json.loads(r["anchor_messages"] or "[]")
+                    if not isinstance(anchors, list):
+                        anchors = []
+                except Exception:
+                    anchors = []
+                slot = AttentionSlot(
+                    bot_id=str(r["bot_id"]), group_id=int(r["group_id"]),
+                    topic_anchor=str(r["topic_anchor"] or ""),
+                    participants={str(p) for p in participants},
+                    energy=float(r["energy"] or 0),
+                    created_at=float(r["created_at"] or now),
+                    last_heated_at=float(r["last_heated_at"] or now),
+                    anchor_messages=[m for m in anchors if isinstance(m, dict)][:3],
+                    thread_summary=str(r["thread_summary"] or ""),
+                    state=state if state in ("active", "fading", "cooling") else "active",
+                )
+                grouped.setdefault(self._key(slot.bot_id, slot.group_id), []).append(slot)
+            except Exception:
+                continue
+        restored = 0
+        for key, _key_slots in grouped.items():
+            _key_slots.sort(key=lambda s: s.energy, reverse=True)
+            _, remaining = self._tick_slots(_key_slots[: self.MAX_SLOTS], now)
+            if remaining:
+                self._stores[key] = remaining
+                restored += len(remaining)
+        # 恢复后立即落盘一次 (清掉 tick 掉的过期行)
+        try:
+            for key in list(grouped.keys()):
+                bot_id, _, group_id = key.partition(":")
+                self._persist_key(bot_id, int(group_id or 0))
+        except Exception:
+            logger.debug("关注槽恢复后回写失败", exc_info=True)
+        logger.info("关注槽启动恢复: %d 个 (raw=%d)", restored, len(rows))
+        return restored
 
     async def _archive_slot(self, slot: AttentionSlot) -> None:
         """槽离开时归档 thread_summary 为情节记忆 (零新增 LLM 调用)。
@@ -467,6 +596,7 @@ class AttentionSlotManager:
                     bot_id, group_id, existing.topic_anchor, existing.energy, heat_amount,
                 )
                 self._stores[key] = slots
+                self._persist_key(bot_id, group_id)
                 return existing
 
             # ── 槽未满: 新建 ──
@@ -485,6 +615,7 @@ class AttentionSlotManager:
                 )
                 slots.append(new_slot)
                 self._stores[key] = slots
+                self._persist_key(bot_id, group_id)
                 logger.info(
                     "关注槽新建: bot=%s group=%s anchor=%.40s energy=%.2f (slot %d/%d)",
                     bot_id, group_id, topic_anchor, heat_amount, active_count + 1, self.MAX_SLOTS,
@@ -503,6 +634,7 @@ class AttentionSlotManager:
                     "关注槽全在余温期，新事件被推开: bot=%s group=%s anchor=%.30s",
                     bot_id, group_id, topic_anchor,
                 )
+                self._persist_key(bot_id, group_id)
                 return None
 
             if heat_amount > coldest.energy:
@@ -527,6 +659,7 @@ class AttentionSlotManager:
                 )
                 slots.append(new_slot)
                 self._stores[key] = slots
+                self._persist_key(bot_id, group_id)
                 return new_slot
 
             # 新事件不够热 → 被推开
@@ -534,6 +667,7 @@ class AttentionSlotManager:
                 "关注槽已满，新事件被推开: bot=%s group=%s new=%.30s (%.2f) < coldest=%.30s (%.3f)",
                 bot_id, group_id, topic_anchor, heat_amount, coldest.topic_anchor, coldest.energy,
             )
+            self._persist_key(bot_id, group_id)
             return None
 
     # ── Query ─────────────────────────────────────────────
@@ -636,7 +770,8 @@ class AttentionSlotManager:
                     best_energy = energy
                     best = slot
         if best and best_energy >= self.FADING_THRESHOLD:
-            # 净化: 折叠换行 + 截断 (thread_summary 最长 300 字符, 容纳覆盖范围+边界+结论)
+            # 净化: 折叠换行 + 截断 (thread_summary 最长 1000 字符，容纳覆盖范围+证据URL+结论；
+            # 追问常问细节/链接，300 字会被截掉关键信息)
             clean = summary.replace("\r", " ").replace("\n", " ")
             # 移除标签残留 (防 LLM 吐出 <thread_summary> 标签本身)
             clean = clean.replace("<thread_summary>", "").replace("</thread_summary>", "")
@@ -653,14 +788,15 @@ class AttentionSlotManager:
             for _pat in _injection_patterns:
                 clean = _re_clean.sub(_pat, "[FILTERED]", clean)
             clean = " ".join(clean.split())  # 折叠连续空格
-            if len(clean) > 300:
-                clean = clean[:297] + "..."
+            if len(clean) > 1000:
+                clean = clean[:997] + "..."
             if clean:
                 best.thread_summary = clean
                 logger.info(
                     "关注槽脉络更新: bot=%s group=%s anchor=%.40s summary=%.80s",
                     bot_id, group_id, best.topic_anchor, clean,
                 )
+                self._persist_key(bot_id, group_id)
                 return True
         return False
 
@@ -719,9 +855,72 @@ class AttentionSlotManager:
                         "关注槽余温恢复: bot=%s group=%s anchor=%.40s energy=%.3f",
                         bot_id, group_id, slot.topic_anchor, slot.energy,
                     )
+                    self._persist_key(bot_id, group_id)
                     return slot
 
         return None
+
+    def revive_user_slot(
+        self,
+        bot_id: str,
+        group_id: int,
+        user_id: str,
+        topic_anchor: str = "",
+        summary: str = "",
+    ) -> bool:
+        """派单续命 (2026-10-15): 用户隔几分钟回来确认/追问, 槽已凉但事没完。
+
+        按人找槽 (含 cooling/fading, 移除的没有) → active + 加热到 1.0 +
+        续参与; 无此人槽且有空位 → 新建; 满员 → 借最热槽挂名 (不断别人的题)。
+        summary 非空则经 set_thread_summary 落槽 (走注入净化)。
+        纯同步, 失败只记 debug 不抛。行为锁死在 test_order_memory.py。
+        """
+        try:
+            if not bot_id or not group_id or not user_id:
+                return False
+            slots = self._get_slots(bot_id, group_id)
+            now = time.time()
+            target = None
+            for s in slots:
+                if user_id in (s.participants or set()):
+                    target = s
+                    break
+            if target is None:
+                if len(slots) >= self.MAX_SLOTS:
+                    pool = [s for s in slots if s.state != "cooling"] or slots
+                    target = max(pool, key=lambda s: self._decayed_energy(s, now))
+                else:
+                    target = AttentionSlot(
+                        bot_id=str(bot_id), group_id=int(group_id),
+                        topic_anchor=(topic_anchor or "派单续办")[:60],
+                        energy=1.0,
+                    )
+                    slots.append(target)
+            target.state = "active"
+            try:
+                target.energy = max(float(target.energy or 0.0), 1.0)
+            except Exception:
+                target.energy = 1.0
+            target.last_heated_at = now
+            try:
+                target.add_participant(user_id)
+            except Exception:
+                pass
+            if topic_anchor:
+                target.topic_anchor = str(topic_anchor)[:60]
+            if summary and summary.strip():
+                try:
+                    self.set_thread_summary(bot_id, group_id, user_id, summary)
+                except Exception:
+                    pass
+            try:
+                self._persist_key(bot_id, group_id)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            logger.debug("revive_user_slot 失败 (不断主流程)", exc_info=True)
+            return False
 
     # ── Maintenance ───────────────────────────────────────
 
@@ -738,6 +937,7 @@ class AttentionSlotManager:
             slots = self._get_slots(bot_id, group_id)
             evicted, remaining = self._tick_slots(slots)
             self._stores[key] = remaining
+            self._persist_key(bot_id, group_id)
             return evicted
 
     async def cleanup_expired(self) -> int:
@@ -752,6 +952,11 @@ class AttentionSlotManager:
                 total += removed
                 if not remaining:
                     del self._stores[key]
+                try:
+                    bot_id, _, group_id = key.partition(":")
+                    self._persist_key(bot_id, int(group_id or 0))
+                except Exception:
+                    logger.debug("关注槽清理落盘失败", exc_info=True)
         return total
 
     @property
