@@ -396,7 +396,7 @@ onMounted(() => {
             <div class="form-grid">
               <div class="form-field">
                 <label>QQ 号 <span class="req">*</span></label>
-                <input v-model="botForm.bot_id" class="input" placeholder="3581173900" :disabled="!!botEditing" />
+                <input v-model="botForm.bot_id" class="input" placeholder="100000001" :disabled="!!botEditing" />
               </div>
               <div class="form-field">
                 <label>名称 <span class="req">*</span></label>
@@ -460,7 +460,7 @@ onMounted(() => {
               </div>
               <div class="form-field" style="grid-column: 1 / -1">
                 <label>Peer Bot QQ (逗号分隔)</label>
-                <input v-model="botForm.peer_bot_ids" class="input" placeholder="3969478803" />
+                <input v-model="botForm.peer_bot_ids" class="input" placeholder="100000002" />
               </div>
               <div class="form-field" style="grid-column: 1 / -1">
                 <label>头像 (上传图片或填写 URL)</label>

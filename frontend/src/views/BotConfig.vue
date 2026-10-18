@@ -811,7 +811,7 @@ function slotLabel(slotKey: string, tab: string): string {
           <Shield :size="14" />
           <span>管理员 QQ</span>
         </label>
-        <input class="input admin-input" type="text" v-model="settings.owner_qq" placeholder="824941143"
+        <input class="input admin-input" type="text" v-model="settings.owner_qq" placeholder="100000005"
           @blur="saveOwnerQQ" @keyup.enter="($event.target as HTMLInputElement).blur()" />
         <p class="field-hint">主人鉴权唯一依据——显示名可伪造，QQ 号不可。</p>
       </div>

@@ -516,9 +516,7 @@ _IDENTITY_CHALLENGE_PATTERNS: list[str] = [
     "你是不是bot", "你是不是机器人", "你是不是ai",
     "你是不是人机", "你是不是入机",
     "你是不是程序", "你是不是脚本", "你是不是大模型",
-    # 以下为示例模式 — 实际部署时 bot 名称应从 config nicknames 动态填充
-    "洛普特.*bot", "洛普特.*机器人", "洛普特.*ai", "洛普特.*人机",
-    "loput.*bot", "loput.*ai",
+    # 注: "<bot名>.*bot/机器人/ai" 这类模式不内置 — 部署时按 config nicknames 动态拼接
     # "这个/那个 bot"
     "这个bot", "这bot", "那个bot",
     "这个机器人", "这个人机", "这个ai",
@@ -557,9 +555,6 @@ def _detect_identity_challenge(content: str, user_id: str, user_name: str) -> bo
             # 没有 @bot 但模式明确指向对话对象:
             #   "你是X"/"你是不是X" → 天然指向本bot
             if pat.startswith("你是") or pat.startswith("你是不是"):
-                return True
-            #   模式包含 bot 特定名称 (如 洛普特/loput) → 直接点名本bot
-            if "洛普特" in pat or "loput" in pat:
                 return True
             #   "这个/那个 bot/机器人/人机/ai" → 大概率指本bot
             if pat.startswith("这个") or pat.startswith("那个") or pat.startswith("这bot"):

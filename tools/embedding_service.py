@@ -15,7 +15,7 @@
 配置 (环境变量):
   EMBEDDING_HOST=0.0.0.0
   EMBEDDING_PORT=8880
-  EMBEDDING_MODEL_PATH=/mnt/d/BaiduNetdiskDownload/model/hub/...
+  EMBEDDING_MODEL_PATH=/path/to/models--BAAI--bge-m3/snapshots/<hash>
   EMBEDDING_BATCH_SIZE=16
 """
 
@@ -26,6 +26,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -35,11 +36,8 @@ logger = logging.getLogger("embedding_service")
 
 # ── 配置 (环境变量) ──────────────────────────────────────────
 
-_BGE_M3_PATH = os.environ.get(
-    "EMBEDDING_MODEL_PATH",
-    "/mnt/d/BaiduNetdiskDownload/model/hub/"
-    "models--BAAI--bge-m3/snapshots/"
-    "5617a9f61b028005a4858fdac845db406aefb181",
+_BGE_M3_PATH = os.environ.get("EMBEDDING_MODEL_PATH", "") or str(
+    Path(__file__).resolve().parents[1] / "models" / "bge-m3"
 )
 _HOST = os.environ.get("EMBEDDING_HOST", "0.0.0.0")
 _PORT = int(os.environ.get("EMBEDDING_PORT", "8880"))

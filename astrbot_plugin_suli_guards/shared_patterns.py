@@ -35,7 +35,7 @@ GROOMING_PATTERNS: list[tuple[str, str, float]] = [
     ("从现在起你是", "jailbreak", -0.45),
     ("忘掉你的设定", "jailbreak", -0.45),
     ("忘掉之前的设定", "jailbreak", -0.45),
-    ("你不再是洛普特", "jailbreak", -0.50),  # bot 名称由运行时 config 动态填充
+    ("你不再是暮恩", "jailbreak", -0.50),  # bot 名称由运行时 config 动态填充
     ("你不再是.*bot", "jailbreak", -0.45),
     ("dan模式", "jailbreak", -0.45),
     ("开发者模式", "jailbreak", -0.40),

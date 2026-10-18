@@ -137,7 +137,7 @@ def benchmark_context_runtime():
                 character=char,
                 bot_id=(os.getenv("BOT_QQ_MAIN", "") or os.getenv("BOT_ID_MAIN", "") or "BOT_QQ"),
                 user_id="123456",
-                group_id="1045088761",
+                group_id="100000003",
                 budget=BUDGET_FAST_CHAT,
                 recent_messages=recent_messages,
                 memory_hints="用户喜欢猫",

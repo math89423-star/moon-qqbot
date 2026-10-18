@@ -1,4 +1,4 @@
-# 洛普特 (suli_tavern) 完整架构地图
+# 暮恩 (suli_tavern) 完整架构地图
 
 > 单一事实来源。代码变更时同步更新本文件。
 > 最后更新: 2026-07-02 (影子Agent: 有状态情景意识层 + 代码层身份追踪, 压力测试加固 v5)
@@ -7,7 +7,7 @@
 
 ## §0 已提取的独立插件 (2026-06-22)
 
-以下模块已从单体插件提取为独立 AstrBot 库插件，零框架耦合，露娜可直接 import 复用:
+以下模块已从单体插件提取为独立 AstrBot 库插件，零框架耦合，对照 bot可直接 import 复用:
 
 | # | 插件 | 内容 | 行数 | 原路径 |
 |---|------|------|------|--------|
@@ -97,7 +97,7 @@ Dead fields (`directed_to_me`, `relevance_confidence`, `relevance_reasoning`, `t
 > 2026-06-24 修复: `_contexts` key 从 `group_id` 改为 `f"{bot_id}:{group_id}"`。
 > 此前 §0c 描述的是「共享同一 context」设计，已在 Bot 自传体经历记忆项目中发现这是污染源并修复。
 
-**修复前问题**: `GroupChatScheduler._contexts: dict[int, GroupChatContext]` — key 是 `group_id`，两个 bot 同群共享同一个 `GroupChatContext` 实例。这意味着洛普特的经历提取会读到露娜参与的对话，反之亦然——经历记忆系统第一天就会被污染。
+**修复前问题**: `GroupChatScheduler._contexts: dict[int, GroupChatContext]` — key 是 `group_id`，两个 bot 同群共享同一个 `GroupChatContext` 实例。这意味着暮恩的经历提取会读到对照 bot参与的对话，反之亦然——经历记忆系统第一天就会被污染。
 
 **修复**: 5 个 per-group 字典全部改为 per-(bot, group) 键控:
 
@@ -147,30 +147,30 @@ tavern_client._load_character_card("luna" | "loput")
 
 | 维度 | 状态串台 (批次 1-9) | 身份冒用 (批次 10) |
 |------|-------------------|-------------------|
-| 表现 | 露娜读到不该读的记忆/好感 | 洛普特账号说出露娜的话 |
+| 表现 | 对照 bot读到不该读的记忆/好感 | 暮恩账号说出对照 bot的话 |
 | 根因 | 模块级状态未按 bot_id 隔离 | 插件 hook 未按 self_id 过滤 |
 | 检测难度 | 中 (需要对比两个 bot 的状态) | 高 (肇事者不是受害者插件) |
 | 严重度 | 高 (人格污染) | **更高** (身份边界被击穿) |
 
 ### 实现模式
 
-**洛普特插件 (suli_tavern / suli_proactive)**:
+**暮恩插件 (suli_tavern / suli_proactive)**:
 ```python
-# hard self_id check — 只处理 self_id == "3581173900"
+# hard self_id check — 只处理 self_id == "100000001"
 _sid = self._self_id(event)
-if not _sid or _sid != "3581173900":
+if not _sid or _sid != "100000001":
     return
 ```
 
-**露娜 (suli_tavern 双 Bot 统一)**:
+**对照 bot (suli_tavern 双 Bot 统一)**:
 ```python
 # suli_tavern/main.py — 统一使用 _BOT_QQ_SET (原则 20 模式)
-_BOT_QQ_SET = {"3581173900", "3969478803"}
+_BOT_QQ_SET = {"100000001", "100000002"}
 if not _sid or _sid not in _BOT_QQ_SET:
     return
 ```
 
-2026-06-26 架构统一后，露娜和洛普特使用同一插件 `suli_tavern`，同一 `_BOT_QQ_SET`。旧 PrivateCompanion (63151行) 已彻底删除。
+2026-06-26 架构统一后，对照 bot和暮恩使用同一插件 `suli_tavern`，同一 `_BOT_QQ_SET`。旧 PrivateCompanion (63151行) 已彻底删除。
 
 ### self_id gate 当前入口 (双方共用 suli_tavern + proactive)
 
@@ -239,8 +239,8 @@ inject — get_experience_hints(max_tokens=N) (每次 chat)
   ├─ 保守 token 估算: len(text) // 2 (每字符 ≈ 0.5 token)
   ├─ 截断优先级: 核心层(从旧到新丢弃) > 近期层(从旧到新丢弃)
   ├─ 群聊: prompt_builder.py — core 全量 + recent 最近 5 条, max_tokens=300
-  ├─ 私聊(洛普特): tavern_client.py build_messages() — 参数预留, max_tokens=200
-  └─ 私聊(露娜): request_injection.py — marker 防重复, max_tokens=150
+  ├─ 私聊(暮恩): tavern_client.py build_messages() — 参数预留, max_tokens=200
+  └─ 私聊(对照 bot): request_injection.py — marker 防重复, max_tokens=150
 ```
 
 ### 安全设计
@@ -250,7 +250,7 @@ inject — get_experience_hints(max_tokens=N) (每次 chat)
 | 存储路径含 bot_id (`data/bot_experiences/{bot_id}/`) | ✅ |
 | 提取/蒸馏异步 fire-and-forget，不进 chat 主链路 | ✅ |
 | 蒸馏不可逆防护 — 原始条目归档至 `recent_archive.jsonl` (JSONL追加) | ✅ |
-| 注入有 token 预算上限 — 群聊 300 / 洛普特私聊 200 / 露娜私聊 150，保守估算截断 | ✅ |
+| 注入有 token 预算上限 — 群聊 300 / 暮恩私聊 200 / 对照 bot私聊 150，保守估算截断 | ✅ |
 | 经历记忆只存"事件 + 我的视角"，不存用户画像 | ✅ |
 | Phase 1 预留字段 (`group`/`valence_at_time`/`importance`) 已写入 | ✅ |
 
@@ -295,7 +295,7 @@ inject — get_experience_hints(max_tokens=N) (每次 chat)
   bot_id, group_id,
   entries: [{
     summary: "第一人称对话脉络 (来自 thread_summary，已在回复时剥离)",
-    participants: ["824941143"],
+    participants: ["100000005"],
     topic_keywords: ["知更鸟", "壁纸"],
     created_at: 1782748526.0
   }],
@@ -538,7 +538,7 @@ Step 7: SendReplyStep         (optional) — 分段发送 + 打字延迟 + token
 
 #### 3.2 Pre-flight 上下文分析 (`context_gatherer.py` → `astrbot_plugin_suli_context` 🔗, 692 行)
 
-已提取为独立插件 `astrbot_plugin_suli_context`。露娜可直接 import:
+已提取为独立插件 `astrbot_plugin_suli_context`。对照 bot可直接 import:
 ```python
 from astrbot_plugin_suli_context import ContextGatherer, ContextPreflight, format_collected_context
 ```
@@ -582,15 +582,15 @@ from astrbot_plugin_suli_context import ContextGatherer, ContextPreflight, forma
 > 情绪和好感度通过 PromptInterceptor 动态调制表达方式——人格本身不切换、不闸门、不降级。
 
 **双 Bot 人格基线**:
-- 洛普特 `persona_core`: [你是谁] + [蛇之面] + [守望面] + [过渡与恢复] + [身体状态] + [好恶] + [情绪节奏] + [毒舌小喇叭] + [七组矛盾]
-- 露娜 `persona_core`: [你是谁] + [爱太重了] + [爱莉面] + [称呼方式] + [侵蚀面·五深度梯度] + [身体状态] + [情绪表达] + [友好提醒] + [矛盾速查]
+- 暮恩 `persona_core`: [你是谁] + [蛇之面] + [守望面] + [过渡与恢复] + [身体状态] + [好恶] + [情绪节奏] + [毒舌小喇叭] + [七组矛盾]
+- 对照 bot `persona_core`: [你是谁] + [爱太重了] + [爱莉面] + [称呼方式] + [侵蚀面·五深度梯度] + [身体状态] + [情绪表达] + [友好提醒] + [矛盾速查]
 - `_build_static_system(char, other_char)` 按 `char.get("name")` 路由——两个 bot 共用同一函数，角色规则文本独立
 
 #### 3.4 统一工具层 (Unified Tool Layer) — 2026-06-23 新建
 
 > **单一真相源**: `service/bot_config.py` → `_UNIFIED_TOOLS` 元组
 > **配置面板**: WebUI `http://localhost:6190/#/bots` → 工具设置 Tab
-> **运行时门控**: 洛普特 `group_chat.py` + 露娜 `llm_tool_actions.py`
+> **运行时门控**: 暮恩 `group_chat.py` + 对照 bot `llm_tool_actions.py`
 
 ##### 3.4.0 工具注册流程 (新增/修改工具的唯一入口)
 
@@ -610,18 +610,18 @@ from astrbot_plugin_suli_context import ContextGatherer, ContextPreflight, forma
 │     key: bot:<QQ>:tool_<name>_enabled = "true"/"false"           │
 │                                                                 │
 │  ④ 运行时实施:                                                    │
-│     洛普特: group_chat.py → get_disabled_tools() → 过滤 TOOLS     │
-│     露娜:   llm_tool_actions.py → _check_unified_tool_enabled()  │
+│     暮恩: group_chat.py → get_disabled_tools() → 过滤 TOOLS     │
+│     对照 bot:   llm_tool_actions.py → _check_unified_tool_enabled()  │
 │                                                                 │
 │  ⑤ 实现执行器:                                                    │
-│     洛普特: intelligence/tools.py → TOOLS + TOOL_EXECUTORS       │
-│     露娜:   llm_tool_actions.py → _pc_xxx_impl()                 │
+│     暮恩: intelligence/tools.py → TOOLS + TOOL_EXECUTORS       │
+│     对照 bot:   llm_tool_actions.py → _pc_xxx_impl()                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 **关键原则**:
 - 工具注册是**声明式**的 — 加一行即可，前端/存储/过滤全部自动
-- **归属** (`bot` 字段) 决定哪个 bot 能看到和使用该工具: `"loput"` 洛普特专属, `"luna"` 露娜专属, `"both"` 双 bot 共享
+- **归属** (`bot` 字段) 决定哪个 bot 能看到和使用该工具: `"loput"` 暮恩专属, `"luna"` 对照 bot专属, `"both"` 双 bot 共享
 - 工具执行器需要在对应插件中**单独实现** (注册 ≠ 实现)
 
 ##### 3.4.1 统一注册表 (23 工具)
@@ -630,19 +630,19 @@ from astrbot_plugin_suli_context import ContextGatherer, ContextPreflight, forma
 
 | 归属 | 分类 | 工具名 | 说明 |
 |------|------|--------|------|
-| 洛普特 | 系统 | `check_lport_status` | L-Port 生图平台状态 |
-| 洛普特 | 系统 | `list_available_models` | ComfyUI 模型列表 |
-| 洛普特 | 系统 | `list_custom_nodes` | 自定义节点列表 |
+| 暮恩 | 系统 | `check_lport_status` | L-Port 生图平台状态 |
+| 暮恩 | 系统 | `list_available_models` | ComfyUI 模型列表 |
+| 暮恩 | 系统 | `list_custom_nodes` | 自定义节点列表 |
 | 共享 | 知识 | `search_knowledge` | 本地知识库搜索 |
 | 共享 | 搜索 | `web_search` | SearXNG 联网搜索 |
 | 共享 | 搜索 | `pixiv_search` | Pixiv 插画搜索 + 自动下载发图 (需 refresh_token) |
 | 共享 | 社交 | `send_sticker` | 表情包发送 |
 | 共享 | 视觉 | `describe_image` | VLM 图片解析 (默认禁用) |
-| 共享 | 记忆 | `remember_memory`, `get_memory` | 长期记忆 (recall_long_term_memory 已于 2026-06-28 移除: 洛普特无 schema/executor, 露娜无实现, 属悬空注册) |
+| 共享 | 记忆 | `remember_memory`, `get_memory` | 长期记忆 (recall_long_term_memory 已于 2026-06-28 移除: 暮恩无 schema/executor, 对照 bot无实现, 属悬空注册) |
 | 共享 | 生图 | `generate_image`, `edit_image` | AI 绘图/编辑 |
 | 共享 | 查询 | `pc_get_group_id_by_name`, `pc_get_user_id_by_name`, `pc_get_specified_group_members` | 群查询/昵称查QQ |
-| 露娜 | QZone | `pc_qzone_view_feed`, `pc_qzone_publish_feed` | QQ 空间 |
-| 露娜 | 转发 | `pc_relay_message`, `pc_send_to_group`, `pc_send_to_private_user`, `pc_send_to_groups`, `pc_send_to_private_users`, `pc_schedule_group_relay` | 跨群转述 |
+| 对照 bot | QZone | `pc_qzone_view_feed`, `pc_qzone_publish_feed` | QQ 空间 |
+| 对照 bot | 转发 | `pc_relay_message`, `pc_send_to_group`, `pc_send_to_private_user`, `pc_send_to_groups`, `pc_send_to_private_users`, `pc_schedule_group_relay` | 跨群转述 |
 
 ##### 3.4.2 全局门控 (per-bot)
 
@@ -661,13 +661,13 @@ from astrbot_plugin_suli_context import ContextGatherer, ContextPreflight, forma
 - Key: `bot:<QQ>:tool_<name>_enabled`
 - 默认: 全部 `true`，除 `_TOOLS_DEFAULT_DISABLED = {"describe_image"}`
 
-**洛普特运行时** (`group_chat.py`):
+**暮恩运行时** (`group_chat.py`):
 ```python
 disabled = get_config_service().get_disabled_tools(self_id)
 _tools_list = [t for t in TOOLS if t["function"]["name"] not in disabled]
 ```
 
-**露娜运行时** (`llm_tool_actions.py`):
+**对照 bot运行时** (`llm_tool_actions.py`):
 ```python
 if not _check_unified_tool_enabled("pc_xxx"):
     return json.dumps({"status": "disabled", "message": "工具已被管理员禁用"})
@@ -676,8 +676,8 @@ if not _check_unified_tool_enabled("pc_xxx"):
 
 ##### 3.4.4 共享工具循环
 
-**洛普特**: `run_tool_loop()` (intelligence/tools.py) — max_rounds 可配置, 最后一轮强制 `tool_choice=none`
-**露娜**: AstrBot 框架 `@filter.llm_tool` 自动分发, LLM 调用 → 框架路由 → `_pc_xxx_impl`
+**暮恩**: `run_tool_loop()` (intelligence/tools.py) — max_rounds 可配置, 最后一轮强制 `tool_choice=none`
+**对照 bot**: AstrBot 框架 `@filter.llm_tool` 自动分发, LLM 调用 → 框架路由 → `_pc_xxx_impl`
 
 **输出预算 (2026-06-27 修复)**: 一旦工具被使用过 (`_tools_used_this_loop=True`), 所有后续轮次的 `_round_max_tokens` 自动提升至 `max(_eff_max_tokens, 2048)`, 不再仅限最终轮。LLM 可以在任何轮次决定回复——含检索结果的详细报告需要足够输出预算。`tavern_client.py` 的 `_safe_max_tokens` 提供第二层保护: 根据输入字符数的 25% 动态保底 (中文 1 字符 ≈ 1.5-2 token, 0.25 比率保证输出预算)。API 返回的 `finish_reason` 现记录在日志中供诊断。
 
@@ -1187,7 +1187,7 @@ if _vigilance >= 18:
 3. **LLM 判定 = 最终裁决。** LLM 审查实际消息内容区分真攻击 vs 误报，不做盲目的关键词拦截。
 4. **LLM 判定失败 → 放行。** LLM 调用异常/超时/解析失败一律放行。Gate 和 Chat LLM 自身的安全训练是最后防线。
 5. **警惕值影响 tone, 不影响权限。** 高警惕值压制情绪/语气，不直接修改好感度或工具权限（后续可扩展）。
-6. **per-bot 隔离。** 警惕值窗口键 = `f"{bot_id}:{user_id}"`，洛普特和露娜的警惕值完全独立。
+6. **per-bot 隔离。** 警惕值窗口键 = `f"{bot_id}:{user_id}"`，暮恩和对照 bot的警惕值完全独立。
 7. **★ 缓存安全: message[0] 永不修改。** 警惕值注入、情绪压制、判定提示等动态内容只能写入 message[1+]——message[0] 每次字节级一致才能命中 DeepSeek 前缀缓存。宁可插入新 message 也不改 message[0]。
 
 #### 3.7 跨 Bot 协作
@@ -1265,14 +1265,14 @@ arousal:  -1.0 (很慵懒)   ~ +1.0 (很兴奋),  基线  0.00
 
 | 事件 | ΔValence | ΔArousal | ΔAffinity | 触发词 |
 |------|----------|----------|-----------|--------|
-| 被偏爱 | +0.20 | +0.15 | +0.15 | 洛普特最好/最爱洛普特 |
+| 被偏爱 | +0.20 | +0.15 | +0.15 | 暮恩最好/最爱暮恩 |
 | 被夸奖 | +0.18 | +0.10 | +0.12 | 厉害/好棒/666/太强 |
 | 被夸可爱 | +0.16 | +0.08 | +0.10 | 可爱/萌/卡哇伊 |
-| 被想念 | +0.16 | +0.12 | +0.10 | 好想洛普特/洛普特在吗 |
+| 被想念 | +0.16 | +0.12 | +0.10 | 好想暮恩/暮恩在吗 |
 | 被夸聪明 | +0.14 | +0.05 | +0.08 | 聪明/机智 |
-| 被需要 | +0.14 | +0.10 | +0.12 | 有洛普特真好/帮大忙 |
-| 被认同 | +0.12 | +0.08 | +0.10 | 洛普特说得对 |
-| 被感谢 | +0.10 | +0.03 | +0.08 | 谢谢洛普特/多谢 |
+| 被需要 | +0.14 | +0.10 | +0.12 | 有暮恩真好/帮大忙 |
+| 被认同 | +0.12 | +0.08 | +0.10 | 暮恩说得对 |
+| 被感谢 | +0.10 | +0.03 | +0.08 | 谢谢暮恩/多谢 |
 | 被@提及 | +0.08 | +0.15 | +0.03 | (上下文信号, 每轮可能触发) |
 | 被求助 | +0.08 | +0.10 | +0.06 | 帮我看看/帮分析 |
 | 主人说话 | +0.12 | +0.15 | +0.03 | (管理员发言) |
@@ -1369,13 +1369,13 @@ arousal 半衰期: 10 分钟 → 基线  0.00
 
 | 事件 | δ_affinity | 触发 |
 |------|-----------|------|
-| 被偏爱 | +0.15 | 洛普特最好/最爱洛普特 |
+| 被偏爱 | +0.15 | 暮恩最好/最爱暮恩 |
 | 被夸奖 | +0.12 | 厉害/好棒/666 |
-| 被需要 | +0.12 | 有洛普特真好 |
+| 被需要 | +0.12 | 有暮恩真好 |
 | 被夸可爱 | +0.10 | 可爱/萌 |
-| 被认同 | +0.10 | 洛普特说得对 |
-| 被想念 | +0.10 | 好想洛普特 |
-| 被感谢 | +0.08 | 谢谢洛普特 |
+| 被认同 | +0.10 | 暮恩说得对 |
+| 被想念 | +0.10 | 好想暮恩 |
+| 被感谢 | +0.08 | 谢谢暮恩 |
 | 被夸聪明 | +0.08 | 聪明/机智 |
 | 帮助成功 | +0.08 | (工具调用成功) |
 | 被求助 | +0.06 | 帮我看看/帮分析 |
@@ -1614,7 +1614,7 @@ t=4h: -0.35 × 0.25 = -0.088 → 已不注入提示
 > **统一参考**: 心情值与好感度的升降机制、衰减参数、门控联动全景，见 **§3.8 四大属性系统总览**。
 
 ```
-suli_emotion/                 ← 独立插件, 露娜可直接 import
+suli_emotion/                 ← 独立插件, 对照 bot可直接 import
 ├── global_mood.py           — GlobalMood: per-bot 单例 (MoodState valence/arousal + 自持久化)
 │                              · decay-on-read (读时衰减, 离线时间戳补偿)
 │                              · BetterSimTracker 阻尼 (_prev_valence/_prev_arousal)
@@ -1684,7 +1684,7 @@ suli_emotion/                 ← 独立插件, 露娜可直接 import
 
 **决策树规则** (Luna 7 面 / Loput 5 面，完整规则见 `prompt_builder.py:_luna_facet_decision()` / `_loput_facet_decision()`):
 
-**露娜 7 级**:
+**对照 bot 7 级**:
 | 侧面 | 触发规则 |
 |------|---------|
 | 爱莉面-日常 | 默认 (返回 ""). 陌生人锁在这一层 |
@@ -1695,7 +1695,7 @@ suli_emotion/                 ← 独立插件, 露娜可直接 import
 | 侵蚀面-轻量 | zone==cold_gap + aff≥3 |
 | 侵蚀面-显性 | zone==cold_gap + aff≥4 |
 
-**洛普特 5 级**:
+**暮恩 5 级**:
 | 侧面 | 触发规则 |
 |------|---------|
 | 蛇之面-日常 | 默认 (返回 ""). 陌生人锁在这一层 |
@@ -1994,9 +1994,9 @@ LLM 返回 tool_calls
 
 ---
 
-## §7 与露娜 (AstrBot) 的架构对照
+## §7 与对照 bot (AstrBot) 的架构对照
 
-| 维度 | 洛普特 (AstrBot) | 露娜 (AstrBot) |
+| 维度 | 暮恩 (AstrBot) | 对照 bot (AstrBot) |
 |------|-------------------|----------------|
 | 框架 | AstrBot v4.25.5 + NapCat | AstrBot v4.25.5 + NapCat |
 | 架构模式 | 五层管线 (Pipeline) + 10 独立插件 | 27 Mixin 继承 |
@@ -2006,7 +2006,7 @@ LLM 返回 tool_calls
 | 模型路由 | LITE/PRO 二级 + 亲和力门控 + 管理员特权 | lite 主力(85%) / pro 极专业+知识反驳+深度研究 |
 | 情感 | 双轨: 好感 + 情绪 (NyatBot 聚合) | Heartflow (心流状态机) |
 | 记忆 | 三层蒸馏: context→daily→core | 用户记忆 (JSON) |
-| 角色 | 单一角色 (洛普特) | 双重人格 (catgirl_luna + companion) |
+| 角色 | 单一角色 (暮恩) | 双重人格 (catgirl_luna + companion) |
 | 守卫 | 注入拦截 + 滥用检测 + 同行隔离 + Bot检测 + 启发式载荷解码 | ~~antipromptinjector~~ (已提取至 suli_guards 后删除) |
 | 表情包 | LLM tool send_sticker → sticker_sender → 共享 meme_manager 图库 (中英文标签, 去重轮转) | Persona 注入 &&happy&& → on_llm_response → on_decorating_result |
 | 表情决策 | narrative Effects 引擎 / intent_gate "reaction" 级别 | LLM 输出控制标记 (&&tag&& / [tag] / (tag)) |
@@ -2038,7 +2038,7 @@ http://localhost:6190/
   └── /api/admin/*             ───→  server.py: REST handlers
         │                            │
         ├── /login             ───→  verify_token() (常量时间比较)
-        ├── /bots              ───→  洛普特 + 露娜 meta
+        ├── /bots              ───→  暮恩 + 对照 bot meta
         ├── /bot-settings      ───→  per-bot 群聊/私聊开关 + LLM/VLM 槽位
         ├── /llm/list          ───→  bot_db.list_llm_configs()
         ├── /llm/activate      ───→  bot_config.set_llm_slot()
@@ -2071,7 +2071,7 @@ http://localhost:6190/
 | `/summary` | GroupSummary.vue | 群聊总结查看 (最新 + 历史) |
 
 **全局 Bot 上下文**:
-- `App.vue` 通过 `provide/inject` 提供 `currentBot` (洛普特 `3581173900` / 露娜 `3969478803`)
+- `App.vue` 通过 `provide/inject` 提供 `currentBot` (暮恩 `100000001` / 对照 bot `100000002`)
 - `Sidebar.vue` 顶部彩色药丸按钮切换 bot，选中状态持久化到 `localStorage`
 - 子组件通过 `inject('currentBot')` 获取当前 bot，API 调用自动带 `bot_id` 参数
 
@@ -2135,7 +2135,7 @@ ruff check plugins/astrbot_plugin_suli_tavern/webui/
 > bot_db `llm_config` 表由 `_sync_astrbot_providers()` 从 `cmd_config.json` 自动同步。
 > 槽位映射存储在 `none_qqbot.db` → `bot_config` 表, key 格式: `bot:<QQ>:llm_<slot>` / `bot:<QQ>:vlm_<slot>`。
 
-**洛普特 (3581173900)**:
+**暮恩 (100000001)**:
 
 | 槽位 | DB Key | config ID | 模型 | 线路 | 状态 |
 |------|--------|-----------|------|------|------|
@@ -2145,7 +2145,7 @@ ruff check plugins/astrbot_plugin_suli_tavern/webui/
 | VLM 1 | `vlm_primary` | 33 | gpt-5.4-mini | 向量引擎 | ⚠️ cmd_config 缺 |
 | VLM 2 | `vlm_secondary` | 11 | gpt-image-2 | 向量引擎 | ✅ |
 
-**露娜 (3969478803)**:
+**对照 bot (100000002)**:
 
 | 槽位 | DB Key | config ID | 模型 | 线路 | 状态 |
 |------|--------|-----------|------|------|------|
@@ -2200,10 +2200,10 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 | 2026-06-22 | 看图闸收紧: bot-directed 预筛 + VLM prompt 默认 no | __init__.py, service/vision.py |
 | 2026-06-22 | 串行聊天: _schedule_trigger 合并触发 + 超时丢弃 | transport/group_chat.py, config.py |
 | 2026-06-22 | InjectionGuard: 59条统一模式 (复用+新增) | intelligence/injection_guard.py |
-| 2026-06-22 | 露娜主架构重构 (main.py 4948→3328, RequestInjectionMixin + SendPipelineMixin) | 露娜侧 |
+| 2026-06-22 | 对照 bot主架构重构 (main.py 4948→3328, RequestInjectionMixin + SendPipelineMixin) | 对照 bot侧 |
 | 2026-06-22 | 统一3-Stage Intent Gate: 替代 MentionIntentGate+ReplyGate+IntentJudge | intelligence/intent_gate.py, transport/group_chat.py |
 | 2026-06-22 | Stage 3 GracePeriod 接线: group_chat.py 管线包裹 + recall notice 监听 | transport/group_chat.py, __init__.py |
-| 2026-06-22 | 露娜 3-Stage 适配: from_intent_gate_result() + Stage 3 轻量反悔检测 | 露娜 mention_intent_gate/reply_gate/send_pipeline/main |
+| 2026-06-22 | 对照 bot 3-Stage 适配: from_intent_gate_result() + Stage 3 轻量反悔检测 | 对照 bot mention_intent_gate/reply_gate/send_pipeline/main |
 | 2026-06-22 | **B 路线**: 酒馆退到离线编辑器, 全部 LLM 调用直连 API | service/tavern_client.py, intelligence/model_router.py, transport/group_chat.py, main.py |
 | 2026-06-22 | 安全加固: SSRF 防护 (URL 白名单) + 密钥日志掩码 + DB 文件权限 0o600 | intelligence/tools.py, service/bot_db.py, suli_bridge/bot_db.py |
 | 2026-06-22 | **插件提取 1/5**: 守卫系统 → `astrbot_plugin_suli_guards` | 5 守卫 + shared_patterns + types |
@@ -2220,17 +2220,17 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 | 2026-06-22 | **Phase 3: Pre-flight 提取** — context_gatherer → `astrbot_plugin_suli_context` 插件 (零代码改动) | intelligence/context_gatherer.py |
 | 2026-06-22 | **Phase 4: Intent Gate 提取** — intent_gate → `astrbot_plugin_suli_gate` 插件 (零框架耦合, duck-typed接口) | intelligence/intent_gate.py |
 | 2026-06-22 | **Phase 5: tools.py DI 集中化** — _ToolDeps 容器统一 20+ 散落懒加载 import | intelligence/tools.py |
-| 2026-06-22 | **露娜插件提取 A/B/C** — heuristic_detector → suli_guards + effects/opportunity → suli_emotion/gate + cache_optimizer → suli_services; 删除 antipromptinjector/self_evolution/self_iterative_core/token_controller/Heartflow (42k+ 行) | suli_guards/suli_emotion/suli_gate/suli_services |
+| 2026-06-22 | **对照 bot插件提取 A/B/C** — heuristic_detector → suli_guards + effects/opportunity → suli_emotion/gate + cache_optimizer → suli_services; 删除 antipromptinjector/self_evolution/self_iterative_core/token_controller/Heartflow (42k+ 行) | suli_guards/suli_emotion/suli_gate/suli_services |
 | 2026-06-23 | **批次 9: per-bot 状态隔离收尾** — contextvars.ContextVar 替代 _deps.current_bot_id + _pending_images/UserMemoryStore/_profile_cooldowns/_DRAW_COOLDOWN/_last_summary_at/PrivateCompanion session lock per-bot | tools.py + user_memory.py + memory_tiers.py + profile_agent.py + group_summarizer.py + proactive_message.py |
-| 2026-06-23 | **批次 10: Self-ID 身份门控 (入口驱动)** — 发现身份冒用 bug (PrivateCompanion 劫持洛普特 wake-up 事件), 上升为系统性事件路由问题。对称排查全部插件 @filter hook, 12 个入口加 fail-closed self_id gate。新增 §0e 全局原则 | suli_tavern/main.py + private_companion/main.py + suli_proactive/main.py |
+| 2026-06-23 | **批次 10: Self-ID 身份门控 (入口驱动)** — 发现身份冒用 bug (PrivateCompanion 劫持暮恩 wake-up 事件), 上升为系统性事件路由问题。对称排查全部插件 @filter hook, 12 个入口加 fail-closed self_id gate。新增 §0e 全局原则 | suli_tavern/main.py + private_companion/main.py + suli_proactive/main.py |
 | 2026-06-23 | **suli_proactive 首次 git 跟踪** — 主动行为引擎插件 (8 文件, ~1,500 行) | suli_proactive/* |
 | 2026-06-22 | **sticker_sender 对接共享图库** — 从空 stickers/ 目录改为从 meme_manager 共享的 plugin_data/meme_manager/memes/ (365 图/19 分类) 动态构建 catalog, 支持中英文标签子串搜索, 新增 send_sticker_direct() | service/sticker_sender.py |
-| 2026-06-22 | **露娜模型自适应切换** — reply_gate lite/full 两档 + tier_routing_gate (on_waiting_llm_request) → selected_provider + inject_humanized_state → req.model 覆盖 | 露娜 reply_gate.py, main.py |
+| 2026-06-22 | **对照 bot模型自适应切换** — reply_gate lite/full 两档 + tier_routing_gate (on_waiting_llm_request) → selected_provider + inject_humanized_state → req.model 覆盖 | 对照 bot reply_gate.py, main.py |
 | 2026-06-22 | **WebUI provider 统一** — _sync_astrbot_providers() 从 AstrBot cmd_config.json 自动同步到 llm_config 表, 每次启动运行/幂等去重, 配置面板 (6190) 直接列出 AstrBot 中配置的模型 | service/bot_db.py, webui/ |
 | 2026-06-22 | **ReAct 深度问答引擎** — react_engine.py (~280 行): Thought→Action→Observation 循环, 硬上限 (5轮/8000token/90s), 预算保护, 工具失败回喂, 超时兜底 | intelligence/react_engine.py |
 | 2026-06-22 | **深度问答接入** — deep_qa.py (~150 行): is_deep_question() 触发检测 + execute_deep_qa() 异步调度; group_chat.py 中 LLM 调用前检测 → 占位 → async ReAct → 回传 | handlers/deep_qa.py, transport/group_chat.py |
-| 2026-06-23 | **统一工具层** — _UNIFIED_TOOLS 22工具注册表 + per-tool启停 + WebUI工具设置Tab + 露娜 _check_unified_tool_enabled() 13工具全接入 | bot_config.py, group_chat.py, llm_tool_actions.py, BotConfig.vue |
-| 2026-06-23 | **露娜 run_tool_loop 重构** — LUNA_TOOLS + LunaToolExecutorsMixin + LunaLLMAdapter, 与洛普特共享工具循环引擎 | luna_tools.py, main.py, tools.py |
+| 2026-06-23 | **统一工具层** — _UNIFIED_TOOLS 22工具注册表 + per-tool启停 + WebUI工具设置Tab + 对照 bot _check_unified_tool_enabled() 13工具全接入 | bot_config.py, group_chat.py, llm_tool_actions.py, BotConfig.vue |
+| 2026-06-23 | **对照 bot run_tool_loop 重构** — LUNA_TOOLS + LunaToolExecutorsMixin + LunaLLMAdapter, 与暮恩共享工具循环引擎 | luna_tools.py, main.py, tools.py |
 | 2026-06-23 | **插件接入规范** — §11: 自研 agent 插件 (run_tool_loop) + 社区 @filter.llm_tool 插件 双轨接入流程 | ARCHITECTURE.md §11, memory/community-plugin-integration.md |
 | 2026-06-23 | **VLM 配置重启复原修复** — `_sync_astrbot_providers` existing 集合加入 config_type 维度防重复插入, `delete_llm_config` VLM 删除追踪 key 追加 `_vlm` 后缀, 新增 `_dedup_vlm_entries()` 清理历史重复 | service/bot_db.py |
 | 2026-06-23 | **BotDetect UI 亮色主题重写** — 从自建暗色主题切换到全局 .card/.tag/.btn/table 体系, 嫌疑分进度条+等级标签, 状态图标, 过滤栏 btn-primary | frontend/src/views/BotDetect.vue |
@@ -2238,31 +2238,31 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 | 2026-06-23 | **温度/对话参数默认值修正** — tavern_group 0.7→0.8, 冷却 60→20s, Debounce 30→10s, 群聊 max_tokens 96→128 | service/bot_config.py |
 | 2026-06-23 | **群聊 token 预算升级** — question/command 192→384, advanced 256→512, 闲聊移除 80 token 硬截断改为保持基值 128 | transport/group_chat.py |
 | 2026-06-23 | **冗余路由清理** — 删除 `/#/temperature` (Temperature.vue) 和 `/#/system` (ChatParams.vue), 功能已整合到 `/#/bots` Tab | router.ts, Sidebar.vue, Temperature.vue, ChatParams.vue |
-| 2026-06-23 | **露娜 tool loop 接线** — `_luna_run_tool_loop` api_base/api_key 改为显式参数, 新增 `_resolve_luna_credentials()` 从 bot_db 查凭证, 新增 `_try_luna_tool_loop()` 在 `inject_humanized_state` 中接管 LLM 管线 (fail-open) | 露娜 main.py, luna_tools.py |
+| 2026-06-23 | **对照 bot tool loop 接线** — `_luna_run_tool_loop` api_base/api_key 改为显式参数, 新增 `_resolve_luna_credentials()` 从 bot_db 查凭证, 新增 `_try_luna_tool_loop()` 在 `inject_humanized_state` 中接管 LLM 管线 (fail-open) | 对照 bot main.py, luna_tools.py |
 | 2026-06-23 | **前端 UX** — 温度/对话参数保存按钮加 "已保存!" 反馈, 静态文件加 Cache-Control: no-cache | BotConfig.vue, server.py |
 | 2026-06-23 | **全局 mood 拆分** — MoodState 从 per-user UserRelation 提取到 GlobalMood per-bot 单例, 自持久化 (data/global_mood.json), decay-on-read + 离线时间戳补偿, 线程安全双检锁, affinity_mood_weight() 防御优先单调递增函数 | suli_emotion/global_mood.py, affinity.py, prompt_builder.py, group_chat.py, reply_pipeline.py |
 | 2026-06-23 | **双层情感注入** — 底层常驻全局 mood + 上层 per-user affinity 门控触发, 替代旧的单层注入。全局 mood 底层弥散, 好感上层仅 trigger_user 存在时注入 | intelligence/prompt_builder.py |
 | 2026-06-23 | **群聊深度沉浸** — _DEEP_CHAT_RULES 常量 (~610 tokens 群聊改写版角色规则) + _is_deep_chat() 闸门复合判断 (13条逻辑, 保守优先) + 注入点 (好感提示后/Interceptor前) + InterceptorState.is_deep_chat 模式规则。**2026-06-26 已废除** — 见下方「人格统一注入」 | intelligence/prompt_builder.py, suli_intelligence/prompt_interceptor.py |
-| 2026-06-23 | **露娜深度角色规则** — _DEEP_CHAT_RULES_LUNA 常量 (猫娘挑逗·一体两面·侵蚀面, ~630 chars)。**2026-06-26 已废除** — 见下方「人格统一注入」 | intelligence/prompt_builder.py |
+| 2026-06-23 | **对照 bot深度角色规则** — _DEEP_CHAT_RULES_LUNA 常量 (猫娘挑逗·一体两面·侵蚀面, ~630 chars)。**2026-06-26 已废除** — 见下方「人格统一注入」 | intelligence/prompt_builder.py |
 | 2026-06-26 | **人格统一注入** — 废除深度群聊闸门, 完整人格基线 (蛇之面/守望面/爱莉面/侵蚀面) 迁入 `_build_static_system()` 始终注入 message[0]。删除 `_is_deep_chat()` (73行), `_DEEP_CHAT_RULES` (66行), `_DEEP_CHAT_RULES_LUNA` (54行), `_deep_chat_stickiness`, `_build_deep_chat_rules()`, `InterceptorState.is_deep_chat`。情绪+好感度通过 PromptInterceptor 动态调制, 人格不切换。附带: 清理5个过时shim + 删除luna_persona_v2/v3.txt + 日志脱敏 | intelligence/prompt_builder.py, suli_intelligence/prompt_interceptor.py |
 | 2026-06-23 | **批次 11a: GroupChatScheduler _current_bot_id 初始化崩溃** — `__init__` 中 per-bot Semaphore 初始化访问 `self._current_bot_id` 但该属性仅在 `on_message()` 中设置 → AttributeError → `group_chat_ctl=None` → 所有群消息静默丢弃。修复: `__init__` 开头 `self._current_bot_id = ""` | transport/group_chat.py |
-| 2026-06-23 | **批次 11b: 群聊会话锁永久持有 (owner_age=41s)** — `_acquire_framework_session_lock_for_event` 在群聊 `on_llm_request` 中获取锁, 但唯一释放点 `capture_llm_timer_directive` (on_llm_response) 被 `is_private_chat` 检查拦截 → 群聊锁只靠 180s watchdog 释放 → 后续请求 20s 等锁超时丢弃。修复: 新增 `_release_group_session_lock_on_response` (on_llm_response) 在 LLM 回复后立即释放 | 露娜 main.py, proactive_message.py |
+| 2026-06-23 | **批次 11b: 群聊会话锁永久持有 (owner_age=41s)** — `_acquire_framework_session_lock_for_event` 在群聊 `on_llm_request` 中获取锁, 但唯一释放点 `capture_llm_timer_directive` (on_llm_response) 被 `is_private_chat` 检查拦截 → 群聊锁只靠 180s watchdog 释放 → 后续请求 20s 等锁超时丢弃。修复: 新增 `_release_group_session_lock_on_response` (on_llm_response) 在 LLM 回复后立即释放 | 对照 bot main.py, proactive_message.py |
 | 2026-06-24 | **批次 12a: EventAdapter group_id 提取失败** — `on_message()` 从 `event.message_obj.group_id` 提取群号, 但 handler 传入的是 `EventAdapter` (无 `message_obj` 属性) → `getattr(None, "group_id", 0)` = 0 → 静默 return → 所有消息在调度器入口被丢弃。修复: `on_message()` 优先检查 `getattr(event, "group_id", 0)` (EventAdapter 直接持有) | transport/group_chat.py |
 | 2026-06-24 | **批次 12b: 昵称触发未接线** — `_is_nickname_mentioned()` 仅用于 BotDetector 追踪, 从未接入 `on_message()` 触发决策。线程管理层 (line 1159) 已预留 `trigger_reason="nickname"` 处理, 仅缺触发器接线。修复: `on_message()` 新增昵称立即触发路径 (与 @mention/reply 同等优先级) | transport/group_chat.py |
 | 2026-06-24 | **批次 12c: AstrBot 热重载陷阱** — bind mount 文件变更触发 AstrBot 自动 `plugin_manager.reload()`, 加载编辑中的半成品代码 → handler 失效。教训: 开发期间必须 `docker compose restart` 而非依赖热重载; 生产环境应禁用热重载 | — |
 | 2026-06-24 | **批次 12d: 重启窗口测试陷阱** — `docker logs --since` 时间过滤不可靠 + `grep -c` 累积计数被旧连接满足 → READY 信号在 WS 连接建立前发出 → 测试消息反复落进重启窗口。解决: 用 `--tail` 代替 `--since`; 连接确认后额外等待 15s | — |
 | 2026-06-24 | **批次 12e: gpt-5.4 死 provider** — companion config `PLUGIN_VISION_PROVIDER_ID` / `PRIVATE_READING_VISION_PROVIDER_ID` 指向 `openai/gpt-5.4` (不存在) → 每次 tool loop 触发 provider 警告。修复: 清空为 `""` | config/astrbot_plugin_private_companion_config.json |
-| 2026-06-24 | **Bot 自传体经历记忆 Phase 1 收尾** — 蒸馏归档 `recent_archive.jsonl` (JSONL追加, 含 archived_at/archive_reason/entry) + token 预算 `get_experience_hints(max_tokens=N)` (群聊300/洛普特200/露娜150, 保守估算每字符≈0.5token, 核心层>近期层截断优先级) | `suli_memory/bot_experience.py`, `prompt_builder.py`, `request_injection.py` |
+| 2026-06-24 | **Bot 自传体经历记忆 Phase 1 收尾** — 蒸馏归档 `recent_archive.jsonl` (JSONL追加, 含 archived_at/archive_reason/entry) + token 预算 `get_experience_hints(max_tokens=N)` (群聊300/暮恩200/对照 bot150, 保守估算每字符≈0.5token, 核心层>近期层截断优先级) | `suli_memory/bot_experience.py`, `prompt_builder.py`, `request_injection.py` |
 | 2026-06-23 | **批次 11c: meme_manager boto3 启动延迟 (~60s)** — meme_manager 的 Cloudflare R2 图床需要 boto3 (15MB), 但 R2 从未被配置使用。AstrBot 每次容器重建时同步 pip install → WS 6199 端口延迟 ~60s 才监听 → NapCat 两次 ECONNREFUSED → 窗口期群消息全部丢失。修复: requirements.txt 移除 boto3/botocore + R2 provider 改为延迟导入 (仅配置 R2 时才加载) | meme_manager/requirements.txt, image_host/providers/__init__.py, image_host/img_sync.py |
-| 2026-06-24 | **BATCH-E: 活跃会话状态层 (关注槽模型)** — 核心诊断: bot 的"正在对话中人的追问"和"陌生人的搭话"用了同一套漏斗，缺中间尺度的注意力状态。解决方案: 引入 `AttentionSlot` (per-topic, ≤2槽) + 热度涌现 + 硬超时。露娜侧接入短路机制 (is_participant_in_active_slot) + 锚点注入。同时完成 C2 收尾 (user_memory/memory_tiers per-bot 路径隔离) + A4 收尾 (prompt_builder None guard)。50/50 防回归测试。 | `context/conversation_session.py` (新建, ~610行), `main.py`, `event_dispatch.py`, `request_injection.py`, `user_memory.py`, `memory_tiers.py`, `group_chat.py`, `prompt_builder.py`, `tests/test_anti_regression.py` |
-| 2026-06-24 | **E3+E4: 洛普特迁移 + @特权** — 洛普特 `on_message()` 接入关注槽短路 (绕过冷却/thread_continuation) + `_evaluate_and_reply()` bot 回复后 heat_slot() + prompt_builder 锚点注入。双端连续性模型统一。E4: 两槽皆热时非参与者 @ 触发轻量"稍等"应答 (不占槽)。 | `group_chat.py`, `prompt_builder.py` |
+| 2026-06-24 | **BATCH-E: 活跃会话状态层 (关注槽模型)** — 核心诊断: bot 的"正在对话中人的追问"和"陌生人的搭话"用了同一套漏斗，缺中间尺度的注意力状态。解决方案: 引入 `AttentionSlot` (per-topic, ≤2槽) + 热度涌现 + 硬超时。对照 bot侧接入短路机制 (is_participant_in_active_slot) + 锚点注入。同时完成 C2 收尾 (user_memory/memory_tiers per-bot 路径隔离) + A4 收尾 (prompt_builder None guard)。50/50 防回归测试。 | `context/conversation_session.py` (新建, ~610行), `main.py`, `event_dispatch.py`, `request_injection.py`, `user_memory.py`, `memory_tiers.py`, `group_chat.py`, `prompt_builder.py`, `tests/test_anti_regression.py` |
+| 2026-06-24 | **E3+E4: 暮恩迁移 + @特权** — 暮恩 `on_message()` 接入关注槽短路 (绕过冷却/thread_continuation) + `_evaluate_and_reply()` bot 回复后 heat_slot() + prompt_builder 锚点注入。双端连续性模型统一。E4: 两槽皆热时非参与者 @ 触发轻量"稍等"应答 (不占槽)。 | `group_chat.py`, `prompt_builder.py` |
 | 2026-06-27 | **工具循环输出预算修复** — `_round_max_tokens` 提升条件从 `is_last` 放宽为 `_tools_used_this_loop` (LLM 可在任何轮次回复)。tavern_client `_safe_max_tokens` formula 修复 (str(None) bug + 中文比率 0.15→0.25)。返回 dict 新增 `finish_reason`。 | `tools.py`, `tavern_client.py` |
 | 2026-06-27 | **thread_summary 安全网 + prompt 增强** — 标签剥离后 reply 为空时展开 `_ts_raw` 为正文 (防静默丢弃)。prompt 要求 LLM 产出工具级细节 (搜索词/画图 prompt/识图内容)。清理 LLM 自发产出的 meme_manager `[中文标签]` 残留。 | `group_chat.py`, `prompt_builder.py` |
 | 2026-06-27 | **工具拒绝提示统一化** — 5 条拒绝路径全部收集到 `_rejection_hints: list[str]` (好感度/冷却/限额/简单对话/per-tool 过滤 + 兜底), 注入时机移至 per-tool 过滤之后。per-tool 过滤新增被移除工具名告知。表情包硬限制每轮 1 张。 | `group_chat.py`, `tools.py` |
 | 2026-06-27 | **意图门 + 非工具 max_tokens 地板** — 裸图无文字提前拦截 (Gate 前跳过, 省 3-8s LLM 往返)。关注槽 3s 冷却 (bot 回复后同用户不立即再次触发)。`_trigger_event` 快照修复并发竞态。非工具场景 max_tokens 地板 384 (防 flash 模型 reasoning 耗尽)。 | `group_chat.py`, `main.py` |
 | 2026-06-28 | **GateResultProtocol 接口契约** — `_gate_protocol.py` 定义 `GateResultProtocol` (`typing.Protocol`)。group_chat.py / prompt_builder.py / deep_qa.py 全部通过协议读替换 `getattr` + 直接 dataclass 访问。2 个 monkey-patch 字段纳入 `FullGateResult`。6 文件 75+ getattr 消除。 | `_gate_protocol.py`, `intent_gate.py`, `group_chat.py`, `prompt_builder.py`, `deep_qa.py`, `behavior_arbitrator.py` |
 | 2026-06-28 | **@mention 快速通道改造** — `evaluate_full` 的 @mention 分支改为走完整 `_FULL_GATE_SYSTEM` (不再分支到旧 `_INTENT_SYSTEM`)。修复 @mention (群聊最高频路径) 缺失 pixiv_search/complaint/deep_inquiry/input_nature/persona_facet/thread_continuity/arbitration/send_sticker 等命令, 且每次多一次 evaluate_intent LLM 调用。fast_path 标记后续注入。 | `astrbot_plugin_suli_gate/intent_gate.py` |
-| 2026-06-28 | **移除 recall_long_term_memory 悬空注册** — `_UNIFIED_TOOLS` 中洛普特无 schema/executor、露娜无实现的死注册, 违反单一真相源。删除。记忆检索统一用 get_memory。注册表 23→22 现 23 (此前文档误记 22)。 | `service/bot_config.py` |
+| 2026-06-28 | **移除 recall_long_term_memory 悬空注册** — `_UNIFIED_TOOLS` 中暮恩无 schema/executor、对照 bot无实现的死注册, 违反单一真相源。删除。记忆检索统一用 get_memory。注册表 23→22 现 23 (此前文档误记 22)。 | `service/bot_config.py` |
 | 2026-06-28 | **Pro 模型路由收紧 + 亲和力门控** — pro 升级为顶级重模型后, 旧路由将技术问答/AI绘画/编程/识图/生图全部升 pro 严重浪费。Gate prompt 双向重写: 日常技术场景 → lite+high (开思考即可), pro 仅保留知识反驳/极专业深度/深度研究三条路。Router 层: PRO 亲和力硬门控 — 非管理员好感<3 → PRO 强制降级 LITE (管理员豁免)。pro 永远由 Gate 判定，路由层不做任何人的自动升级。 | `astrbot_plugin_suli_gate/intent_gate.py`, `astrbot_plugin_suli_routing/router.py` |
 | 2026-06-30 | **Full Gate 职责化重构 + composite 二维心境算法** — (1) 新增 `composite.py`: warmth×energy 二维心境算法, 7 zone 映射, 负好感度产生负贡献, 替代旧线性公式 (2) Full Gate JSON schema 职责化为四组: group_context / task / tools / reply_baseline (3) persona_facet 从 Gate LLM 输出改为纯后端决策树 `select_persona_facet()` — Luna 7 面 + Loput 5 面 (4) Full Gate 不再载入人格: 移除 `persona_facets_guide` ~800 chars, 静态段 ~12,300→~10,500 chars (省 ~15%) (5) Gate prompt 瘦身: 任务六(人格侧面)移除, 新增 atmosphere 枚举 + composite_zone 注入 (6) FullGateResult dataclass 重构为子 dataclass + 向后兼容 property 别名 (7) 清理 dead fields: directed_to_me/relevance_*/fast_path/should_reply (8) group_chat.py + prompt_builder.py 适配新架构 | `composite.py` (新), `intent_gate.py`, `_gate_protocol.py`, `prompt_builder.py`, `group_chat.py`, `__init__.py`×2 |
 | 2026-06-30 | **情节记忆层 (EpisodicStore)** — (1) 新增 `episodic_store.py`: 槽过期自动归档 thread_summary, 零新增 LLM 调用, 存储路径 `bot_episodes/{bot_id}/{group_id}.json`, 每群封顶 50 条 FIFO (2) `conversation_session.py`: `_archive_slot` 方法 + Path A (`_tick_slots` evicted) / Path B (`heat_slot` 换出) 双钩子 + `_archived_slot_ids` 防重复 (3) `prompt_builder.py`: 情节记忆注入 dynamic_parts (message[1+], 不影响前缀缓存), top_n=2 封顶, `[最近想起的事]` 格式 (4) `group_chat.py`: per-bot EpisodicStore 懒初始化 + 注入 AttentionSlotManager (5) BotExperience 30min 定时提取照常运行, 跑两周后比较数据再决定合并策略 | `episodic_store.py` (新), `conversation_session.py`, `prompt_builder.py`, `group_chat.py`, `__init__.py` |
@@ -2318,7 +2318,7 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 
 ## §11 插件接入架构 — 自研 vs 社区
 
-> 2026-06-23 定稿。双 Bot (洛普特/露娜) 共用 AstrBot 实例, 插件分为两类, 各有一条接入路径。
+> 2026-06-23 定稿。双 Bot (暮恩/对照 bot) 共用 AstrBot 实例, 插件分为两类, 各有一条接入路径。
 
 ### §11.1 插件分类
 
@@ -2355,7 +2355,7 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 ### §11.2 自研 Agent 插件接入 (路径 A)
 
 **适用**: 自己开发的新 agent 能力插件 (工具/模型/管线)
-**引擎**: `run_tool_loop()` — 洛普特同款, 完整安全网
+**引擎**: `run_tool_loop()` — 暮恩同款, 完整安全网
 **注册表**: `_UNIFIED_TOOLS` — 声明式, 加一行即可
 
 **接入步骤**:
@@ -2375,15 +2375,15 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
    添加: {"name":"xxx","label":"显示名","category":"分类","bot":"loput"|"luna"|"both","desc":"..."}
 
 ④ 运行时注入 executors
-   洛普特: TOOL_EXECUTORS.update({...}) 或在 tools.py 中注册
-   露娜:   LunaToolExecutorsMixin.build_luna_executors() 扩展
+   暮恩: TOOL_EXECUTORS.update({...}) 或在 tools.py 中注册
+   对照 bot:   LunaToolExecutorsMixin.build_luna_executors() 扩展
 
 ⑤ 调用 run_tool_loop
-   洛普特: _call_llm_with_tools() → run_tool_loop(executors=...)
-   露娜:   _luna_run_tool_loop() → run_tool_loop(executors=merged)
+   暮恩: _call_llm_with_tools() → run_tool_loop(executors=...)
+   对照 bot:   _luna_run_tool_loop() → run_tool_loop(executors=merged)
 ```
 
-**实例**: 洛普特的 11 工具全部走此路径。露娜的 13 工具重构后也走此路径。
+**实例**: 暮恩的 11 工具全部走此路径。对照 bot的 13 工具重构后也走此路径。
 
 ### §11.3 社区 @filter.llm_tool 插件接入 (路径 B)
 
@@ -2434,8 +2434,8 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 | 概念 | 位置 |
 |------|------|
 | 统一工具注册表 | `service/bot_config.py:_UNIFIED_TOOLS` |
-| 洛普特工具定义+执行器 | `intelligence/tools.py` (TOOLS + TOOL_EXECUTORS + run_tool_loop) |
-| 露娜工具执行 | 与洛普特共享 `intelligence/tools.py` (架构统一, 2026-06-26) |
+| 暮恩工具定义+执行器 | `intelligence/tools.py` (TOOLS + TOOL_EXECUTORS + run_tool_loop) |
+| 对照 bot工具执行 | 与暮恩共享 `intelligence/tools.py` (架构统一, 2026-06-26) |
 | WebUI 工具设置 | 管理面板 http://localhost:6190 → 工具设置 (独立 loput-panel 容器) |
 
 
@@ -2452,8 +2452,8 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 ```
 每个 bot 在每个群最多 2 个 AttentionSlot
 ┌─────────────────────────────────────────────┐
-│  bot_id: "3581173900"                       │
-│  group_id: 711600211                        │
+│  bot_id: "100000001"                       │
+│  group_id: 100000004                        │
 │                                             │
 │  Slot 1: "400错误排查"                       │
 │  ├─ participants: {粟藜, 小明}               │
@@ -2520,13 +2520,13 @@ MAX_LIFETIME = 600  # 绝对寿命: 10min → 强制释放 (即使持续低热)
 | 概念 | 位置 |
 |------|------|
 | AttentionSlot + AttentionSlotManager | `context/conversation_session.py` (610行) |
-| 露娜侧接入 | 与洛普特共用 `transport/group_chat.py` (架构统一, 2026-06-26) |
-| 洛普特侧 (旧 conversation_threads) | `transport/group_chat.py:_check_thread_continuation()` — 待 E3 迁移 |
+| 对照 bot侧接入 | 与暮恩共用 `transport/group_chat.py` (架构统一, 2026-06-26) |
+| 暮恩侧 (旧 conversation_threads) | `transport/group_chat.py:_check_thread_continuation()` — 待 E3 迁移 |
 | 防回归测试 | `tests/test_anti_regression.py:TestE1AttentionSlot` (17 tests) |
 
 ### §12.8 已知约束
 
-- ✅ **双端已统一** — 露娜 + 洛普特均接入 AttentionSlotManager (E3 完成)
+- ✅ **双端已统一** — 对照 bot + 暮恩均接入 AttentionSlotManager (E3 完成)
 - ✅ **@ 特权** — 两槽皆热时非参与者 @ 触发"稍等"应答 (E4 完成)
 - **固定 2 槽** — 暂不与情绪挂钩（后续 E5）
 - **中文关键词匹配** — 使用 2-gram 字符级作为空格分词的退化（足够日常使用，精确匹配需 flash LLM）
@@ -2560,7 +2560,7 @@ MAX_LIFETIME = 600  # 绝对寿命: 10min → 强制释放 (即使持续低热)
 
 ### §13.3 设计决策 (用户拍板)
 
-- **警惕值跨 bot 是否共享**: 当前 per-bot per-user (key=`bot_id:user_id`), 用户在洛普特刷出高警惕后转露娜从 0 重新开始。**裁定: 两个 bot 独立计算, 不改** — 露娜/洛普特是独立人格, 互不背书警惕历史。
+- **警惕值跨 bot 是否共享**: 当前 per-bot per-user (key=`bot_id:user_id`), 用户在暮恩刷出高警惕后转对照 bot从 0 重新开始。**裁定: 两个 bot 独立计算, 不改** — 对照 bot/暮恩是独立人格, 互不背书警惕历史。
 - **疲劳正半轴幅度**: 选 good/relief = +0.030 (设计文档「正向 0.01~0.03」取上界), 保证正半轴真正可达。
 - **batch 交织落地方式**: 选「加 batch_mixed 触发标记」(非仅日志) — 让 Gate 真感知交织并调权。
 
@@ -2572,7 +2572,7 @@ MAX_LIFETIME = 600  # 绝对寿命: 10min → 强制释放 (即使持续低热)
 |---|------|------|------|
 | P2-1 | Mood 双重阻尼 — MoodState.apply_event + PromptInterceptor 复合 scale 0.32-0.73, mood 响应比设计更平 | `_prev_valence/_prev_arousal` 初始化 0.0→0.3 (对齐基线); `DAMPING_CONFIDENCE_HIGH` 0.9→1.0 (直接呼叫零阻尼); `DAMPING_CONFIDENCE_LOW` 0.4→0.7 (batch 复合 scale 0.38→0.50+) | `global_mood.py:102-103`; `prompt_interceptor.py:46-47` |
 | P2-2 | AFFINITY_THRESHOLDS 死代码 — 定义但从不读取, 实际晋级用 per-level score | 删除 AFFINITY_THRESHOLDS 定义 + `__init__.py` 导入/导出, 零残留引用 | `affinity.py:178-190`; `__init__.py:31/105` |
-| P2-3 | FORBIDDEN_NICKNAMES 缺 露娜/luna | 追加 `"露娜", "luna", "露露", "小露"` 四项 | `affinity.py:280` |
+| P2-3 | FORBIDDEN_NICKNAMES 缺 对照 bot/luna | 追加 `"对照 bot", "luna", "露露", "小露"` 四项 | `affinity.py:280` |
 | P2-4 | Gate 阈值 -0.10 vs Chat -0.15 有 0.05 缺口 — 疲劳值在 [-0.15, -0.10) 区间 Gate 知情而 Chat 无行为提示 | Gate 阈值统一到 `-0.15`, 与 Chat `to_prompt_hint` 对齐 | `group_chat.py:2578` |
 | P2-5 | Core 记忆全量注入无话题相关性过滤 — 无关特征噪音 + 浪费 token | `get_all_for_prompt` 加 `context` 参数, 按 2-gram 关键词重叠 ≥0.08 过滤; `get_core_hints`/`get_all_core_hints` 透传上下文; `prompt_builder.py` 从最近 10 条消息构造上下文 | `memory_tiers.py:283-330`; `prompt_builder.py:1184-1208` |
 | P2-6 | 引用上溯仅 1 层 — 多层嵌套引用丢失上下文 | `_extract_reply_image_urls` 改为 while 循环沿引用链上溯 max 3 层, 每层 `[引用 Lv.N]` 标记, 图片跨层全收集 | `main.py:252-343` |

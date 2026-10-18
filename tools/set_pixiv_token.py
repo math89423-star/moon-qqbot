@@ -1,9 +1,13 @@
 """从 pixiv_refresh_token.txt 读取 token 写入共享 bot_config。"""
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB = "/home/administrator/suli_qqbot/runtime/shared/db/none_qqbot.db"
+# 共享 DB 路径: 环境变量优先, 缺省按仓库布局推导 (AstrBot/data/shared_db/)
+DB = os.environ.get("QQBOT_DB", "") or str(
+    Path(__file__).resolve().parents[1] / "AstrBot" / "data" / "shared_db" / "none_qqbot.db"
+)
 TOKEN_FILE = Path(__file__).parent / "pixiv_refresh_token.txt"
 
 if not TOKEN_FILE.exists():

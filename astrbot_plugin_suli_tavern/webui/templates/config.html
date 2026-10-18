@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>配置面板 — 洛普特 &amp; 露娜</title>
+<title>配置面板 — 暮恩 &amp; 对照 bot</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.slate.min.css">
 <style>
   :root {
@@ -137,13 +137,13 @@
   <h1>配置面板</h1>
   <span class="subtitle">LLM / VLM / 参数 / 用量</span>
   <div class="bot-switch" id="bot-switch">
-    <button class="active loput" data-bot="3581173900">
+    <button class="active loput" data-bot="100000001">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><path d="M12 8v5M9 21c0-2 1.5-5 3-5s3 3 3 5"/></svg>
-      洛普特
+      暮恩
     </button>
-    <button class="luna" data-bot="3969478803">
+    <button class="luna" data-bot="100000002">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2c-1 4-1 8 0 12s4 6 8 0c-3 1-6 0-8-4s-2.5-8 0-12Z"/></svg>
-      露娜
+      对照 bot
     </button>
   </div>
 </header>
@@ -162,8 +162,8 @@
   <div class="panel active" id="panel-llm">
     <article id="bot-status-card">
       <div class="bot-status-row">
-        <strong id="bot-status-name">洛普特</strong>
-        <small style="color:var(--pico-muted-color)" id="bot-status-qq">3581173900</small>
+        <strong id="bot-status-name">暮恩</strong>
+        <small style="color:var(--pico-muted-color)" id="bot-status-qq">100000001</small>
         <div class="toggle-row">
           <label><input type="checkbox" id="toggle-group-chat" onchange="saveBotToggle('group_chat_enabled',this.checked)"> 群聊</label>
           <label><input type="checkbox" id="toggle-private-chat" onchange="saveBotToggle('private_chat_enabled',this.checked)"> 私聊</label>
@@ -231,12 +231,12 @@
       </hgroup>
       <div class="stats-grid" style="grid-template-columns:1fr 1fr">
         <fieldset style="border-color:var(--bot-loput)">
-          <legend style="color:var(--bot-loput);font-weight:600">🟢 洛普特</legend>
+          <legend style="color:var(--bot-loput);font-weight:600">🟢 暮恩</legend>
           <label>硬上限 <input type="number" id="loput-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
           <label>软上限 <input type="number" id="loput-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
         </fieldset>
         <fieldset style="border-color:var(--bot-luna)">
-          <legend style="color:var(--bot-luna);font-weight:600">🔴 露娜</legend>
+          <legend style="color:var(--bot-luna);font-weight:600">🔴 对照 bot</legend>
           <label>硬上限 <input type="number" id="luna-hard-m" step="0.5" min="0.5" style="width:6em"> M</label>
           <label>软上限 <input type="number" id="luna-soft-m" step="0.5" min="0.5" style="width:6em"> M</label>
         </fieldset>
@@ -317,10 +317,10 @@
 const API = '/api/config';
 
 const BOTS = {
-  '3581173900': { name: '洛普特', cssClass: 'loput' },
-  '3969478803': { name: '露娜', cssClass: 'luna' },
+  '100000001': { name: '暮恩', cssClass: 'loput' },
+  '100000002': { name: '对照 bot', cssClass: 'luna' },
 };
-let CURRENT_BOT = sessionStorage.getItem('selected_bot') || '3581173900';
+let CURRENT_BOT = sessionStorage.getItem('selected_bot') || '100000001';
 
 // ── Auth ─────────────────────────────────────────────────
 
@@ -418,7 +418,7 @@ function switchBot(id) {
   });
   document.getElementById('bot-status-name').textContent = meta.name;
   document.getElementById('bot-status-qq').textContent = id;
-  document.getElementById('bot-status-card').style.borderLeft = '3px solid ' + (id==='3581173900'?'var(--bot-loput)':'var(--bot-luna)');
+  document.getElementById('bot-status-card').style.borderLeft = '3px solid ' + (id==='100000001'?'var(--bot-loput)':'var(--bot-luna)');
   loadBotSettings();
   loadLLM(); loadVLM();
 }
@@ -790,10 +790,10 @@ async function loadTokens() {
     // Per-bot 消耗卡片
     const bots = s.by_bot || [];
     const botCards = bots.length ? bots.map(b => {
-      const name = b.bot_id === '3581173900' ? '洛普特' : b.bot_id === '3969478803' ? '露娜' : b.bot_id;
-      const cssColor = b.bot_id === '3581173900' ? 'var(--bot-loput)' : 'var(--bot-luna)';
+      const name = b.bot_id === '100000001' ? '暮恩' : b.bot_id === '100000002' ? '对照 bot' : b.bot_id;
+      const cssColor = b.bot_id === '100000001' ? 'var(--bot-loput)' : 'var(--bot-luna)';
       const total = (b.input_tokens||0) + (b.output_tokens||0);
-      const hardKey = b.bot_id === '3581173900' ? 'loput_hard_limit_m' : 'luna_hard_limit_m';
+      const hardKey = b.bot_id === '100000001' ? 'loput_hard_limit_m' : 'luna_hard_limit_m';
       const limitM = budget[hardKey] || 3;
       const pct = limitM > 0 ? Math.round(total / (limitM * 1e6) * 100) : 0;
       const barColor = pct > 90 ? 'var(--bot-luna)' : pct > 70 ? '#f0ad4e' : 'var(--bot-loput)';

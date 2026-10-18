@@ -111,7 +111,7 @@ from .service.forward_cache import cache_forward_content, get_cached_forward
 # Patch 2: WebSocketReverseApi.call_action 需要 self_id 才能路由到正确的 NapCat;
 #          框架的 _dispatch_send 把 self_id 丢了 → 注入。
 # Patch 3: 回执异常自愈 — ActionFailed retcode=1200 + EventChecker/1006514「网络连接异常」
-#          实测 (13:35:09 群 1045088761) NapCat 侧「发送 ->」正常, 异常来自 QQ 内核
+#          实测 (13:35:09 群 100000003) NapCat 侧「发送 ->」正常, 异常来自 QQ 内核
 #          回执层 → 属于「已送达但回执失败」。按致命错处理会丢上下文/自反馈/连发补充。
 def _install_send_healer() -> None:
     # ── Patch 2: inject self_id into API calls ──
@@ -165,7 +165,7 @@ def _install_send_healer() -> None:
 
     # ── Patch 3: 发送回执异常自愈 (2026-10-10) ──
     # 症状: ActionFailed retcode=1200 + EventChecker Failed / result 1006514「网络连接异常」。
-    # 实测 (13:35:09 群 1045088761): NapCat 侧日志显示「发送 -> 群聊」正常,
+    # 实测 (13:35:09 群 100000003): NapCat 侧日志显示「发送 -> 群聊」正常,
     # 异常来自 QQ 内核的事件回执层 —— 即「已送达但回执失败」。
     # 若按致命错误处理, 后果是: 该轮回复不进上下文 / 不记自反馈 / 丢掉连发补充。
     # 策略: 先查历史确认是否已送达 (避免重发造成重复), 未送达才去引用重发一次;

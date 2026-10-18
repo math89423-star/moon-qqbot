@@ -9,7 +9,7 @@
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONDA_ENV="/home/administrator/miniconda3/envs/qqbot"
+CONDA_ENV="${CONDA_ENV:-$HOME/miniconda3/envs/qqbot}"
 SERVICE_SCRIPT="$ROOT/tools/embedding_service.py"
 PIDFILE="/tmp/embedding_service.pid"
 LOGFILE="/tmp/embedding_service.log"

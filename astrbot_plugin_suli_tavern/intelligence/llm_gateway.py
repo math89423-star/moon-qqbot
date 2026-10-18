@@ -28,7 +28,7 @@
       input_tokens=1234, output_tokens=567,
       cache_hit_tokens=100, cache_miss_tokens=200,
       latency_ms=850, purpose="group_reply",
-      group_id="1045088761", user_id="123456",
+      group_id="100000003", user_id="123456",
   )
 """
 
