@@ -1,10 +1,10 @@
 name: astrbot_plugin_suli_services
-display_name: 粟藜 · 识图搜索与知识库
-author: 粟藜
+display_name: 暮恩 · 识图搜索与知识库
+author: math89423
 author_url: https://github.com/math89423-star
-description: 粟藜基础服务层 — VLM 识图 + SearXNG 联网搜索 + 本地知识库检索。纯库插件，供其他插件 import 使用。
+description: 暮恩基础服务层 — VLM 识图 + SearXNG 联网搜索 + 本地知识库检索。纯库插件，供其他插件 import 使用。
 desc: 服务层：VLM识图、联网搜索、知识库
-repo: https://github.com/math89423-star/suli_qqbot
+repo: https://github.com/math89423-star/moon-qqbot
 category: 基础设施
 tags:
   - VLM

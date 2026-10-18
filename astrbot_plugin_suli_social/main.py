@@ -7,7 +7,7 @@
 from astrbot.api.star import register, Star, Context
 
 
-@register("astrbot_plugin_suli_social", "粟藜", "社会性生存 — 压力感知/选择性静默 (纯库)", "1.0.0")
+@register("astrbot_plugin_suli_social", "math89423", "社会性生存 — 压力感知/选择性静默 (纯库)", "1.0.0")
 class PluginMain(Star):
     async def initialize(self) -> None:
         pass

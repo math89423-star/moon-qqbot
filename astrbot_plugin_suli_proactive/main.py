@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _KNOWN_BOT_IDS: set[str] = set()  # 运行时从 dual_bot 读取
 
 
-@register("astrbot_plugin_suli_proactive", "暮恩", "主动行为引擎 (双Bot通用)", "1.0.0")
+@register("astrbot_plugin_suli_proactive", "math89423", "主动行为引擎 (双Bot通用)", "1.0.0")
 class LoputProactivePlugin(Star):
     """主动行为引擎 — 私聊/群聊主动交互调度 (双 Bot 通用)。
 

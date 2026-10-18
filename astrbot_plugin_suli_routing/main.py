@@ -7,7 +7,7 @@
 from astrbot.api.star import register, Star, Context
 
 
-@register("astrbot_plugin_suli_routing", "L-Port", "暮恩子插件 (纯库)", "1.0.0")
+@register("astrbot_plugin_suli_routing", "math89423", "暮恩子插件 (纯库)", "1.0.0")
 class PluginMain(Star):
     async def initialize(self) -> None:
         pass

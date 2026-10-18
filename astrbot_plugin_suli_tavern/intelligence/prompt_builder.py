@@ -1402,8 +1402,8 @@ class GroupPromptBuilder:
             if uid:
                 name = f"{name}[QQ:{uid}]"
             # ── 主人标注: 改名而非加后缀——让 LLM 把群昵称和身份绑定为同一人 ──
-            #     旧格式: "粟藜 (20:01): xxx [主人]" → LLM 可能认为粟藜≠主人
-            #     新格式: "粟藜 [主人] (20:01): xxx" → LLM 看到粟藜就是主人
+            #     旧格式: "暮恩 (20:01): xxx [主人]" → LLM 可能认为暮恩≠主人
+            #     新格式: "暮恩 [主人] (20:01): xxx" → LLM 看到暮恩就是主人
             if uid and uid in _owner_qq_set:
                 name = f"{name} [主人]"
             if _peer_isolation and uid:

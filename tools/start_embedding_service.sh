@@ -1,5 +1,5 @@
 #!/bin/bash
-# suli_qqbot — BGE-M3 Embedding 服务管理 (WSL2 宿主机 GPU)
+# moon-qqbot — BGE-M3 Embedding 服务管理 (WSL2 宿主机 GPU)
 #
 # 用法: bash tools/start_embedding_service.sh [start|stop|restart|status]
 #

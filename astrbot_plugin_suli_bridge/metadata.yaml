@@ -1,10 +1,10 @@
 name: astrbot_plugin_suli_bridge
-display_name: 粟藜 · LLM 配置桥接
-author: 粟藜
+display_name: 暮恩 · LLM 配置桥接
+author: math89423
 author_url: https://github.com/math89423-star
 description: LLM 配置桥接插件 — 读取外部数据库中的 LLM 配置, 提供 /chat 对话命令。支持多模型切换、多轮会话、30min 自动清理。
 desc: "LLM 桥接: /chat 多轮对话, 模型切换, 外部配置只读"
-repo: https://github.com/math89423-star/suli_qqbot
+repo: https://github.com/math89423-star/moon-qqbot
 category: AI 增强
 tags:
   - LLM

@@ -749,7 +749,7 @@ async def run_brain_mouth(scheduler, ctx, batch, slim, image_description: str = 
         # 人格含成人层时, opencode 网关 longcat 上游按"输入违规"直接 400
         # (security_audit_fail), 整轮嘴失败 → 用户没回复。实测 glm-5.3/deepseek 不触审。
         # 2026-10-18: 优先用面板配的 NSFW 专属槽位 (命中时脑嘴已同源换 base/key/模型);
-        # 未配专属才回落 env 兜底 (SULI_NSFW_MODEL; 填 "-"/"none"/"off" 交回槽位配置)。
+        # 未配专属才回落 env 兜底 (MOON_NSFW_MODEL; 填 "-"/"none"/"off" 交回槽位配置)。
         _mouth_model = _model
         if _nsfw_on and not _nsfw_slot_hit:
             try:

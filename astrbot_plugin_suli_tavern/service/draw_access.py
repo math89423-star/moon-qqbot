@@ -41,12 +41,12 @@ DEFAULT_MASTER_MODEL = "nai-diffusion-5-full"
 DEFAULT_PUBLIC_MODEL = "nai-diffusion-4-5-full"
 
 # 计费后端名单 —— 花真钱/真额度的后端。默认只有 pixai。
-# 需要放宽/扩列时用 env 覆盖: SULI_DRAW_METERED_PROVIDERS="pixai,future_backend"
+# 需要放宽/扩列时用 env 覆盖: MOON_DRAW_METERED_PROVIDERS="pixai,future_backend"
 _DEFAULT_METERED = "pixai"
 
 
 def _metered_providers() -> frozenset[str]:
-    raw = (os.getenv("SULI_DRAW_METERED_PROVIDERS", "") or "").strip()
+    raw = (os.getenv("MOON_DRAW_METERED_PROVIDERS", "") or "").strip()
     if not raw:
         return frozenset({_DEFAULT_METERED})
     return frozenset(p.strip() for p in raw.replace(",", " ").split() if p.strip())

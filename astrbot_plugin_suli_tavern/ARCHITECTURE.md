@@ -2456,7 +2456,7 @@ pipeline.add_step(MyNewStep(), after="prompt_build")
 │  group_id: 100000004                        │
 │                                             │
 │  Slot 1: "400错误排查"                       │
-│  ├─ participants: {粟藜, 小明}               │
+│  ├─ participants: {暮恩, 小明}               │
 │  ├─ energy: 0.72 (active)                  │
 │  ├─ created_at: 17:44, last_heated: 17:46   │
 │  └─ topic_anchor: "QQ机器人400错误"          │

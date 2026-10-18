@@ -369,8 +369,8 @@ async def _spec_via_vlm(
 
         _cli = AsyncOpenAI(api_key=_slot.api_key, base_url=_base.rstrip("/"), timeout=timeout_s)
         _heads = {
-            "User-Agent": "suli-qqbot/1.0",
-            "x-opencode-session": "suli-qqbot-vlm",
+            "User-Agent": "moon-qqbot/1.0",
+            "x-opencode-session": "moon-qqbot-vlm",
         }
         _order = ["minimal", "low", "medium", "high", "xhigh", "max"]
         # ── 真关思考 (2026-10-17): off/none 此前打滑 —— none→无参裸调 (longcat 仍思考开),

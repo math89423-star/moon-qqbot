@@ -1,10 +1,10 @@
 name: astrbot_plugin_suli_guards
-display_name: 粟藜 · 注入拦截与滥用检测
-author: 粟藜
+display_name: 暮恩 · 注入拦截与滥用检测
+author: math89423
 author_url: https://github.com/math89423-star
-description: 粟藜安全守卫系统 — 预 LLM 注入拦截 + 滥用检测 + 恶意调教处置 + 同行隔离 + Bot 行为检测。纯库插件，供其他插件 import 使用。
+description: 暮恩安全守卫系统 — 预 LLM 注入拦截 + 滥用检测 + 恶意调教处置 + 同行隔离 + Bot 行为检测。纯库插件，供其他插件 import 使用。
 desc: 守卫系统：注入拦截、滥用检测、调教处置、同行隔离、Bot检测
-repo: https://github.com/math89423-star/suli_qqbot
+repo: https://github.com/math89423-star/moon-qqbot
 category: 安全
 tags:
   - 安全

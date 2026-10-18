@@ -472,7 +472,7 @@ NapCat WebUI 地址：`http://localhost:6099`（Token 在 `NapCatQQ\napcat\confi
     ╚══════════════════════════════════════════╝
 ```
 
-**Made with 🩸 by [粟藜](https://github.com/math89423-star)**  
+**Made with 🩸 by [math89423](https://github.com/math89423-star)**  
 Licensed under **MIT** — 自由使用，随心改造
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=29,13,29,16,29&height=100&section=footer" />

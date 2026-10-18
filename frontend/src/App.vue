@@ -43,7 +43,7 @@ onMounted(loadBots)
 
 const pageTitle = () => {
   const meta = route.meta as { title?: string }
-  return meta.title || 'Suli QQ管理面板'
+  return meta.title || '暮恩 管理面板'
 }
 </script>
 

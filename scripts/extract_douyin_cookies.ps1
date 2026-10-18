@@ -1,7 +1,7 @@
 # 从运行中的 Chrome 提取抖音 cookies (via DevTools Protocol)
 # 用法: powershell.exe -ExecutionPolicy Bypass -File extract_douyin_cookies.ps1
 param(
-    [string]$OutputFile = "C:\Users\Administrator\suli_qqbot\runtime\data-luna\douyin_cookies.txt"
+    [string]$OutputFile = "C:\Users\<你的用户名>\moon-qqbot\runtime\data-luna\douyin_cookies.txt"
 )
 
 $ErrorActionPreference = "Stop"

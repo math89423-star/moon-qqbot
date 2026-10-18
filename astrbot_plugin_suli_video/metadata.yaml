@@ -1,10 +1,10 @@
 name: astrbot_plugin_suli_video
-display_name: 粟藜 · 视频提取转发
-author: 粟藜
+display_name: 暮恩 · 视频提取转发
+author: math89423
 author_url: https://github.com/math89423-star
-description: 粟藜视频服务层 — B站/抖音视频链接解析 + 下载，供其他插件 import 使用。纯库插件。
+description: 暮恩视频服务层 — B站/抖音视频链接解析 + 下载，供其他插件 import 使用。纯库插件。
 desc: 视频提取：B站视频链接解析与下载
-repo: https://github.com/math89423-star/suli_qqbot
+repo: https://github.com/math89423-star/moon-qqbot
 category: 基础设施
 tags:
   - 视频

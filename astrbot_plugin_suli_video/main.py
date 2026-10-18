@@ -8,7 +8,7 @@
 from astrbot.api.star import Star, register
 
 
-@register("astrbot_plugin_suli_video", "L-Port", "粟藜 视频提取 (纯库)", "1.0.0")
+@register("astrbot_plugin_suli_video", "math89423", "暮恩 视频提取 (纯库)", "1.0.0")
 class PluginMain(Star):
     async def initialize(self) -> None:
         pass

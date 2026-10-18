@@ -444,8 +444,8 @@ class ShadowSession:
                     api_key=api_key,
                     timeout=45.0,
                     default_headers={
-                        "User-Agent": "suli-qqbot/1.0",
-                        "x-opencode-session": f"suli-qqbot-{self.bot_id}" if self.bot_id else "suli-qqbot-global",
+                        "User-Agent": "moon-qqbot/1.0",
+                        "x-opencode-session": f"moon-qqbot-{self.bot_id}" if self.bot_id else "moon-qqbot-global",
                     },
                 )
                 _create_kw: dict = {}

@@ -41,8 +41,8 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # VLM 槽位同样指向 zen/go 网关, 缺 x-opencode-session 会 400 MissingSessionID。
 # VLM 调用无 bot 上下文, 用稳定常量 session (网关仅要求稳定可路由, 非严格隔离)。
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
-_QQBOT_USER_AGENT = "suli-qqbot/1.0"
-_VLM_SESSION_ID = "suli-qqbot-vlm"
+_QQBOT_USER_AGENT = "moon-qqbot/1.0"
+_VLM_SESSION_ID = "moon-qqbot-vlm"
 
 # 图片下载最大尺寸 (bytes) — 5MB，超过自动 resize 压缩
 MAX_IMAGE_BYTES = 5 * 1024 * 1024

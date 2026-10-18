@@ -56,7 +56,7 @@ class SenderScopedSessionFilter(SessionFilter):
 
 
 @register(
-    "astrbot_plugin_suli_meme", "粟藜", "粟藜表情包插件 — 表情包发送 + 图床同步 + 类别管理", "1.0.0"
+    "astrbot_plugin_suli_meme", "math89423", "暮恩表情包插件 — 表情包发送 + 图床同步 + 类别管理", "1.0.0"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):

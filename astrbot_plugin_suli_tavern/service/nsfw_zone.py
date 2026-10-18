@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # 场景结束后 TTL 自然过期。只放行「已经判定过是 NSFW 的场景」, 不会把普通
 # 场景误锁进来。
 #
-# 关闭方式: SULI_NSFW_SCENE_TTL=0 (回到改动前的逐条判定行为)。
+# 关闭方式: MOON_NSFW_SCENE_TTL=0 (回到改动前的逐条判定行为)。
 
 _SCENE_TTL_DEFAULT = 1800.0  # 30 分钟
 _SCENE_LOCK: dict[tuple[str, str], float] = {}
@@ -49,8 +49,8 @@ _SCENE_LOCK_MAX = 512
 
 
 def scene_ttl() -> float:
-    """场景锁 TTL (秒)。env `SULI_NSFW_SCENE_TTL` 可覆盖, <=0 表示关闭场景锁。"""
-    raw = (os.getenv("SULI_NSFW_SCENE_TTL", "") or "").strip()
+    """场景锁 TTL (秒)。env `MOON_NSFW_SCENE_TTL` 可覆盖, <=0 表示关闭场景锁。"""
+    raw = (os.getenv("MOON_NSFW_SCENE_TTL", "") or "").strip()
     if not raw:
         return _SCENE_TTL_DEFAULT
     try:

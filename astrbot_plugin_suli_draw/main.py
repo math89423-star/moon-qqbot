@@ -7,7 +7,7 @@
 from astrbot.api.star import register, Star, Context
 
 
-@register("astrbot_plugin_suli_draw", "粟藜", "AI 绘图客户端 (纯库)", "1.0.0")
+@register("astrbot_plugin_suli_draw", "math89423", "AI 绘图客户端 (纯库)", "1.0.0")
 class PluginMain(Star):
     async def initialize(self) -> None:
         pass

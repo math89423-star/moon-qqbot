@@ -554,10 +554,10 @@ def _max_vibes() -> int:
     """单次参考图张数上限 (成本护栏)。
 
     2026-10-14 用户裁定：限定只能加 1 张。默认锁 1 张，确实需要更多时置
-    env SULI_NAI_MAX_VIBES=2..16 放宽 (官方上限 16，>4 张每次生成 (N-4)×2 Anlas)。
+    env MOON_NAI_MAX_VIBES=2..16 放宽 (官方上限 16，>4 张每次生成 (N-4)×2 Anlas)。
     """
     try:
-        n = int((os.getenv("SULI_NAI_MAX_VIBES", "") or "1").strip())
+        n = int((os.getenv("MOON_NAI_MAX_VIBES", "") or "1").strip())
     except Exception:
         n = 1
     return max(1, min(16, n))
@@ -3210,8 +3210,8 @@ async def _translate_draw_prompt(prompt: str, bot_id: str, *, nsfw: bool = False
             temperature=0.0,
             # opencode.ai 网关必需头 (与 vision.py 同源，缺之 400 MissingSessionID)
             extra_headers={
-                "User-Agent": "suli-qqbot/1.0",
-                "x-opencode-session": "suli-qqbot-vlm",
+                "User-Agent": "moon-qqbot/1.0",
+                "x-opencode-session": "moon-qqbot-vlm",
             },
         )
         out = (resp.choices[0].message.content or "").strip().split("\n")[0].strip("\"' ")
@@ -3512,8 +3512,8 @@ async def _extract_draw_character_query_llm(text: str, bot_id: str = "", *, nsfw
             max_tokens=60,
             temperature=0.0,
             extra_headers={
-                "User-Agent": "suli-qqbot/1.0",
-                "x-opencode-session": "suli-qqbot-vlm",
+                "User-Agent": "moon-qqbot/1.0",
+                "x-opencode-session": "moon-qqbot-vlm",
             },
         )
         out = ((resp.choices[0].message.content or "").strip().split("\n") or [""])[0]
@@ -3614,8 +3614,8 @@ async def _resolve_draw_character_via_web(query: str, bot_id: str, *, nsfw: bool
             temperature=0.0,
             # opencode.ai 网关必需头 (与 _translate_draw_prompt 同源，缺之 400 MissingSessionID)
             extra_headers={
-                "User-Agent": "suli-qqbot/1.0",
-                "x-opencode-session": "suli-qqbot-vlm",
+                "User-Agent": "moon-qqbot/1.0",
+                "x-opencode-session": "moon-qqbot-vlm",
             },
         )
         text = (resp.choices[0].message.content or "").strip()
@@ -4927,7 +4927,7 @@ async def _llm_extract_search_tags(
         "  hololive → ホロライブ\n"
         "\n"
         "Character names: prefer the official JP/EN name if you genuinely know it;\n"
-        "otherwise output the pinyin romanization of the Chinese text (e.g. 绯雪→Feixue, 粟藜→Suli)."
+        "otherwise output the pinyin romanization of the Chinese text (e.g. 绯雪→Feixue, 暮恩→Suli)."
     )
     user_prompt = f"Extract Pixiv tags from: {user_message}"
     _msgs = [
@@ -4978,8 +4978,8 @@ async def _llm_extract_search_tags(
             base_url=llm_cfg["api_base"],
             timeout=15.0,
             default_headers={
-                "User-Agent": "suli-qqbot/1.0",
-                "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                "User-Agent": "moon-qqbot/1.0",
+                "x-opencode-session": f"moon-qqbot-{bot_id}" if bot_id else "moon-qqbot-global",
             },
         )
         # 2026-10-17: 补 thinking 方言 (之前裸调 = longcat 思考裸奔, 15s 超时风险)
@@ -4994,8 +4994,8 @@ async def _llm_extract_search_tags(
             temperature=0.0,
             **({"extra_body": _tag_extra_body} if _tag_extra_body else {}),
             extra_headers={
-                "User-Agent": "suli-qqbot/1.0",
-                "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                "User-Agent": "moon-qqbot/1.0",
+                "x-opencode-session": f"moon-qqbot-{bot_id}" if bot_id else "moon-qqbot-global",
             },
         )
     except Exception:
@@ -5158,7 +5158,7 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
         cleaned = user_message
         for noise in (
             "去找一张", "找一张", "搜一张", "帮我找", "有没有",
-            "的图", "来一张", "暮恩", "moon", "搜图", "查图", "找图",
+            "的图", "来一张", "math89423", "moon", "搜图", "查图", "找图",
         ):
             cleaned = cleaned.replace(noise, " ")
         cleaned = cleaned.strip()
@@ -5241,8 +5241,8 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
                 base_url=llm_cfg["api_base"],
                 timeout=15.0,
                 default_headers={
-                    "User-Agent": "suli-qqbot/1.0",
-                    "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                    "User-Agent": "moon-qqbot/1.0",
+                    "x-opencode-session": f"moon-qqbot-{bot_id}" if bot_id else "moon-qqbot-global",
                 },
             )
 
@@ -5252,8 +5252,8 @@ async def _discover_pixiv_tags_via_web(user_message: str, bot_id: str) -> str | 
                 max_tokens=400,  # ★ 推理模型 CoT 吃 token, 150→400
                 temperature=0.0,
                 extra_headers={
-                    "User-Agent": "suli-qqbot/1.0",
-                    "x-opencode-session": f"suli-qqbot-{bot_id}" if bot_id else "suli-qqbot-global",
+                    "User-Agent": "moon-qqbot/1.0",
+                    "x-opencode-session": f"moon-qqbot-{bot_id}" if bot_id else "moon-qqbot-global",
                 },
             )
             tags = (resp.choices[0].message.content or "").strip()

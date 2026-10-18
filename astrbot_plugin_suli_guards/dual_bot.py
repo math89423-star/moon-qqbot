@@ -413,8 +413,8 @@ def _auto_discover_db_path() -> str:
         # 兼容旧路径: 单文件挂载 (WAL 文件不可见 → 分裂脑风险)
         str(_astrbot_data / db_name),
         # 宿主机路径
-        str(Path.home() / f"suli_qqbot/runtime/shared/db/{db_name}"),
-        str(Path.home() / f"suli_qqbot/runtime/shared/{db_name}"),
+        str(Path.home() / f"moon-qqbot/runtime/shared/db/{db_name}"),
+        str(Path.home() / f"moon-qqbot/runtime/shared/{db_name}"),
     ]
     for p in candidates:
         if Path(p).exists():

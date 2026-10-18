@@ -46,7 +46,7 @@ _DEFAULT_MAX_MB = 20
 # 下载超时 (秒)
 _DOWNLOAD_TIMEOUT = 120
 # 抖音 cookie 文件路径 (Netscape 格式, 由浏览器扩展导出, 挂在共享卷)
-# 宿主路径: runtime/data-luna/douyin_cookies.txt
+# 宿主路径: runtime/data/douyin_cookies.txt
 # 容器路径: /AstrBot/data/douyin_cookies.txt
 _DOUYIN_COOKIE_FILE = "/AstrBot/data/douyin_cookies.txt"
 

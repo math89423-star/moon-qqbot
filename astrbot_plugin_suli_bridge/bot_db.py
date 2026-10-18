@@ -1,6 +1,6 @@
 """本地 bot 数据库 — SQLite 持久化配置、用户记忆、知识库索引。
 
-与 L-Port DB 完全隔离，存储 suli_qqbot 自身的运行时数据：
+与 L-Port DB 完全隔离，存储 moon-qqbot 自身的运行时数据：
   - bot_config: 键值配置 (active_llm_id, temperature_*, admin_token, ...)
   - user_memories: 用户长期记忆 (从 JSON 迁移)
   - knowledge_sections: 知识库章节索引 (从 markdown 迁移)

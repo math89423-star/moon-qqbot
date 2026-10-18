@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 #   1. 必须随每请求发送稳定的 x-opencode-session (否则 400 MissingSessionID)
 #   2. User-Agent 必须标识自身客户端, 不能用 aiohttp/SDK 默认名
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
-_QQBOT_USER_AGENT = "suli-qqbot/1.0"
+_QQBOT_USER_AGENT = "moon-qqbot/1.0"
 
 
 def _build_direct_headers(api_key: str, bot_id: str = "", session_id: str = "") -> dict[str, str]:
@@ -36,7 +36,7 @@ def _build_direct_headers(api_key: str, bot_id: str = "", session_id: str = "") 
     """
     sid = (session_id or "").strip()
     if not sid:
-        sid = f"suli-qqbot-{bot_id.strip()}" if (bot_id or "").strip() else "suli-qqbot-global"
+        sid = f"moon-qqbot-{bot_id.strip()}" if (bot_id or "").strip() else "moon-qqbot-global"
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -61,8 +61,8 @@ _AUDIT_FALLBACK_MODEL: str = "deepseek-v4.1-flash"
 
 
 def audit_fallback_model(current: str = "") -> str:
-    """审计降级模型 (单模型, 非候选列表)。env SULI_AUDIT_FALLBACK_MODEL 可覆盖。"""
-    _m = (os.getenv("SULI_AUDIT_FALLBACK_MODEL", "") or "").strip() or _AUDIT_FALLBACK_MODEL
+    """审计降级模型 (单模型, 非候选列表)。env MOON_AUDIT_FALLBACK_MODEL 可覆盖。"""
+    _m = (os.getenv("MOON_AUDIT_FALLBACK_MODEL", "") or "").strip() or _AUDIT_FALLBACK_MODEL
     return "" if _m == current else _m
 
 
@@ -76,10 +76,10 @@ def is_audit_rejected(text: str) -> bool:
 def nsfw_safe_model(model: str = "") -> str:
     """NSFW 区用模型: 换实测不触审的模型 (人设含成人层, 审计会整轮打死)。
 
-    env SULI_NSFW_MODEL 覆盖: 留空/缺省 → deepseek-v4.1-flash;
+    env MOON_NSFW_MODEL 覆盖: 留空/缺省 → deepseek-v4.1-flash;
     填 "-" / "none" / "off" → 不换 (完全交回槽位配置)。
     """
-    raw = (os.getenv("SULI_NSFW_MODEL", "") or "").strip()
+    raw = (os.getenv("MOON_NSFW_MODEL", "") or "").strip()
     if raw.lower() in ("-", "none", "off"):
         return model
     if raw:
@@ -176,8 +176,8 @@ def _direct_req_timeout() -> "aiohttp.ClientTimeout":
 
 
 def _hedge_delay_secs() -> float:
-    """对冲延迟秒数。env `SULI_HEDGE_DELAY_SECONDS` 覆盖, ≤0 关闭对冲。"""
-    raw = (os.getenv("SULI_HEDGE_DELAY_SECONDS", "") or "").strip()
+    """对冲延迟秒数。env `MOON_HEDGE_DELAY_SECONDS` 覆盖, ≤0 关闭对冲。"""
+    raw = (os.getenv("MOON_HEDGE_DELAY_SECONDS", "") or "").strip()
     if not raw:
         return _HEDGE_DELAY_DEFAULT
     try:
@@ -383,12 +383,12 @@ def _dump_llm_exchange(
 ) -> None:
     """把一次 LLM 调用的请求体 + 原始响应落盘（排障用，默认关闭）。
 
-    置 `SULI_LLM_DUMP=/tmp/llmdump` 后每次调用写一对文件。
+    置 `MOON_LLM_DUMP=/tmp/llmdump` 后每次调用写一对文件。
     用途: 「网关返回空 output」这类事故只有原始报文能定性 —— 日志只能看到
     out_types，看不到 output 数组长什么样、reasoning 块里有什么。
     Authorization 头已掩码，不落 key。
     """
-    _dir = (_os.getenv("SULI_LLM_DUMP", "") or "").strip()
+    _dir = (_os.getenv("MOON_LLM_DUMP", "") or "").strip()
     if not _dir:
         # 开关文件: docker exec <容器> touch /tmp/.llm_dump_on 即开，无需改 env 重启
         try:
@@ -1246,7 +1246,7 @@ class TavernClient:
                     finish_reason,
                 )
                 # 开关文件开启时，成功调用也留档一对（供与空 output 对比定性）
-                if _os.getenv("SULI_LLM_DUMP", "") or Path("/tmp/.llm_dump_on").exists():
+                if _os.getenv("MOON_LLM_DUMP", "") or Path("/tmp/.llm_dump_on").exists():
                     _dump_llm_exchange(
                         "ok", url, {"payload": payload, "headers": headers}, data,
                     )
